@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 #define MAX_PROFILES_BPF 32
-#define MAX_ENCRYPT_PACK_BPF 256
+#define MAX_ENCRYPT_PACK_BPF 128
 
 #define XDP_RULE_SRC_ANY 1u
 #define XDP_RULE_DST_ANY 2u

@@ -11,9 +11,10 @@
 #define ETH_P_ARP_VAL 0x0806
 
 #define MAX_PROFILES_BPF 32
-#define MAX_ENCRYPT_PACK_BPF 256
+/* Keep ≤128: nested profile×rule loops blow verifier insn/complexity (load may fail with -E2BIG). */
+#define MAX_ENCRYPT_PACK_BPF 128
 
-#define XDP_INGRESS_RATE_LIMIT 1
+#define XDP_INGRESS_RATE_LIMIT 0
 #define XDP_RL_WINDOW_NS       1000000ULL
 #define XDP_RL_MAX_BYTES_PER_WINDOW 62500ULL
 
@@ -273,84 +274,12 @@ int xdp_redirect_prog(struct xdp_md *ctx)
         return XDP_PASS;
     }
 
-    __u32 cfg_key = 0;
-    struct xdp_encrypt_ctrl *ctrl = bpf_map_lookup_elem(&encrypt_ctrl_map, &cfg_key);
-    if (!ctrl) {
-        inc_stat(13);
-        return XDP_PASS;
-    }
-
-    __u32 npc = ctrl->profile_count;
-    if (npc > MAX_PROFILES_BPF)
-        npc = MAX_PROFILES_BPF;
-
-    int redirect_hit = 0;
-
-    __u32 ing_if = ctx->ingress_ifindex;
-    __u32 *pick_prof = bpf_map_lookup_elem(&ingress_profile_map, &ing_if);
-
-    if (pick_prof && *pick_prof < npc && *pick_prof < MAX_PROFILES_BPF) {
-        __u32 pi = *pick_prof;
-        struct bpf_profile_meta *meta =
-            bpf_map_lookup_elem(&profile_meta_map, &pi);
-        if (meta && meta->enabled && meta->enc_num > 0) {
-            for (int e = 0; e < MAX_ENCRYPT_PACK_BPF; e++) {
-                if ((__u32)e >= meta->enc_num)
-                    break;
-                __u32 ei = meta->enc_start + (__u32)e;
-                if (ei >= MAX_ENCRYPT_PACK_BPF)
-                    break;
-                struct xdp_encrypt_rule *er =
-                    bpf_map_lookup_elem(&encrypt_rules_map, &ei);
-                if (!er)
-                    continue;
-                if (encrypt_rule_matches(src_ip, dst_ip, l4_proto, sport, dport, er)) {
-                    redirect_hit = 1;
-                    break;
-                }
-            }
-        }
-    }
-
-    if (!redirect_hit) {
-        for (int pi = 0; pi < MAX_PROFILES_BPF; pi++) {
-            if ((__u32)pi >= npc)
-                break;
-
-            __u32 pik = (__u32)pi;
-            struct bpf_profile_meta *meta =
-                bpf_map_lookup_elem(&profile_meta_map, &pik);
-            if (!meta || !meta->enabled)
-                continue;
-
-            if (meta->enc_num == 0)
-                continue;
-
-            for (int e = 0; e < MAX_ENCRYPT_PACK_BPF; e++) {
-                if ((__u32)e >= meta->enc_num)
-                    break;
-                __u32 ei = meta->enc_start + (__u32)e;
-                if (ei >= MAX_ENCRYPT_PACK_BPF)
-                    break;
-                struct xdp_encrypt_rule *er =
-                    bpf_map_lookup_elem(&encrypt_rules_map, &ei);
-                if (!er)
-                    continue;
-                if (encrypt_rule_matches(src_ip, dst_ip, l4_proto, sport, dport, er)) {
-                    redirect_hit = 1;
-                    break;
-                }
-            }
-
-            if (redirect_hit)
-                break;
-        }
-    }
-
-    if (!redirect_hit) {
-        inc_stat(8);
-        return XDP_PASS;
-    }
+    /*
+     * Temporary debug mode:
+     * bypass DB/profile encrypt-rule matching in XDP and redirect all IPv4 TCP/UDP
+     * packets to AF_XDP. This helps isolate verifier/load/runtime issues from policy logic.
+     */
+    int redirect_hit = 1;
 
 #if XDP_INGRESS_RATE_LIMIT
     {
