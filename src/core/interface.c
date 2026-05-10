@@ -414,7 +414,15 @@ int interface_init_local(struct xsk_interface *iface,
 
     ret = bpf_object__load(bpf_obj);
     if (ret) {
-        fprintf(stderr, "Failed to load BPF object\n");
+        fprintf(stderr,
+                "[XDP] bpf_object__load failed path=%s ret=%d%s%s\n",
+                bpf_file,
+                ret,
+                (ret < 0) ? " errno=" : "",
+                (ret < 0) ? strerror(-ret) : " (see dmesg for verifier/libbpf details)");
+        fprintf(stderr,
+                "[XDP] hint: rebuild bpf/xdp_redirect.o on this machine (clang -target bpf); "
+                "ensure kernel supports loaded BPF maps/program\n");
         bpf_object__close(bpf_obj);
         bpf_obj = NULL;
         return -1;
@@ -680,7 +688,12 @@ int interface_init_wan_rx(struct xsk_interface *iface,
 
     ret = bpf_object__load(wan_bpf_obj);
     if (ret) {
-        fprintf(stderr, "Failed to load WAN BPF object\n");
+        fprintf(stderr,
+                "[XDP] bpf_object__load (WAN) failed path=%s ret=%d%s%s\n",
+                bpf_file,
+                ret,
+                (ret < 0) ? " errno=" : "",
+                (ret < 0) ? strerror(-ret) : " (see dmesg)");
         bpf_object__close(wan_bpf_obj);
         return -1;
     }
