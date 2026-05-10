@@ -22,6 +22,11 @@ static unsigned int encrypt_bundle_ifindex[MAX_INTERFACES];
 static int encrypt_bundle_count = 0;
 
 void interface_reset_redirect_maps(void) {
+    memset(encrypt_ctrl_map_fds, -1, sizeof(encrypt_ctrl_map_fds));
+    memset(profile_meta_map_fds, -1, sizeof(profile_meta_map_fds));
+    memset(encrypt_pack_map_fds, -1, sizeof(encrypt_pack_map_fds));
+    memset(ingress_profile_map_fds, -1, sizeof(ingress_profile_map_fds));
+    memset(encrypt_bundle_ifindex, 0, sizeof(encrypt_bundle_ifindex));
     encrypt_bundle_count = 0;
 }
 
@@ -48,6 +53,47 @@ static int crypto_policy_is_encrypt_action(const struct crypto_policy *cp)
            cp->action == POLICY_ACTION_ENCRYPT_L4;
 }
 
+static int cfg_has_encrypt_policies(const struct app_config *cfg)
+{
+    if (!cfg)
+        return 0;
+    for (int pi = 0; pi < cfg->profile_count && pi < MAX_PROFILES; pi++) {
+        const struct profile_config *p = &cfg->profiles[pi];
+        for (int j = 0; j < p->policy_count; j++) {
+            int pix = p->policy_indices[j];
+            if (pix < 0 || pix >= cfg->policy_count)
+                continue;
+            if (crypto_policy_is_encrypt_action(&cfg->policies[pix]))
+                return 1;
+        }
+    }
+    return 0;
+}
+
+static void interface_xdp_try_detach(int ifindex, const char *ifname);
+
+void interface_xdp_detach_all_from_config(const struct app_config *cfg)
+{
+    if (!cfg)
+        return;
+
+    for (int i = 0; i < cfg->local_count && i < MAX_INTERFACES; i++) {
+        const char *name = cfg->locals[i].ifname;
+        if (!name || name[0] == '\0')
+            continue;
+        unsigned ix = if_nametoindex(name);
+        if (ix)
+            interface_xdp_try_detach((int)ix, name);
+    }
+    for (int i = 0; i < cfg->wan_count && i < MAX_INTERFACES; i++) {
+        const char *name = cfg->wans[i].ifname;
+        if (!name || name[0] == '\0')
+            continue;
+        unsigned ix = if_nametoindex(name);
+        if (ix)
+            interface_xdp_try_detach((int)ix, name);
+    }
+}
 
 static void interface_xdp_try_detach(int ifindex, const char *ifname) {
     static const int modes[] = {
@@ -73,8 +119,15 @@ int interface_push_encrypt_filters(const struct app_config *cfg)
         return -1;
     }
 
-    if (encrypt_bundle_count <= 0)
+    if (encrypt_bundle_count <= 0) {
+        if (cfg_has_encrypt_policies(cfg)) {
+            fprintf(stderr,
+                    "[XDP] WARN: no encrypt map bundle registered (encrypt_ctrl/profile_meta/"
+                    "encrypt_rules missing or stale bpf/xdp_redirect.o). "
+                    "Kernel maps stay default → XDP_PASS for IPv4 TCP/UDP.\n");
+        }
         return 0;
+    }
 
     int require_filter = 0;
     for (int pi = 0; pi < cfg->profile_count && pi < MAX_PROFILES; pi++) {

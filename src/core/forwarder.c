@@ -1691,6 +1691,8 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg) {
     memset(fwd, 0, sizeof(*fwd));
     fwd->cfg = cfg;
     g_cfg_ptr = cfg;
+
+    interface_xdp_detach_all_from_config(cfg);
     interface_reset_redirect_maps();
 
     /* Single-queue per iface: matches single-core scheduling (FORWARDER_CPU_CORE). */

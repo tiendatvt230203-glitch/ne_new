@@ -113,6 +113,8 @@ int interface_send_to_local_batch_queue(struct xsk_interface *iface,
 int interface_push_encrypt_filters(const struct app_config *cfg);
 void interface_reset_redirect_maps(void);
 
+void interface_xdp_detach_all_from_config(const struct app_config *cfg);
+
 
 void interface_send_flush(struct xsk_interface *iface);
 

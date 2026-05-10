@@ -177,12 +177,21 @@ static void log_wan_l2_resolution_plan(struct app_config *cfg) {
     if (!cfg) return;
     for (int i = 0; i < cfg->wan_count; i++) {
         struct wan_config *w = &cfg->wans[i];
+        char ipbuf[INET_ADDRSTRLEN] = {0};
+        if (w->dst_ip)
+            inet_ntop(AF_INET, &(struct in_addr){ .s_addr = w->dst_ip }, ipbuf, sizeof(ipbuf));
+        else
+            strncpy(ipbuf, "(none)", sizeof(ipbuf) - 1);
+        int mac_zero = !(w->dst_mac[0] | w->dst_mac[1] | w->dst_mac[2] |
+                         w->dst_mac[3] | w->dst_mac[4] | w->dst_mac[5]);
         fprintf(stderr,
-                "[WAN CFG] if=%s peer_dst_ip=%u (ARP->dest MAC Sep) static_mac=%02x:%02x:%02x:%02x:%02x:%02x\n",
+                "[WAN CFG] if=%s peer_next_hop=%s dst_mac_from_db=%02x:%02x:%02x:%02x:%02x:%02x%s\n",
                 w->ifname,
-                (unsigned)ntohl(w->dst_ip),
+                ipbuf,
                 w->dst_mac[0], w->dst_mac[1], w->dst_mac[2],
-                w->dst_mac[3], w->dst_mac[4], w->dst_mac[5]);
+                w->dst_mac[3], w->dst_mac[4], w->dst_mac[5],
+                mac_zero ? " (zeros OK: MAC filled via ARP — watch [WAN ARP] after start)"
+                         : "");
     }
 }
 

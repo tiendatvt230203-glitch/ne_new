@@ -168,6 +168,28 @@ static __always_inline int ip_in_net(__u32 ip, __u32 net, __u32 mask)
     return (ip & mask) == (net & mask);
 }
 
+/*
+ * Detaching/replacing DB-driven setup is done in userspace: bpf_xdp_detach() on each
+ * local/WAN ifindex — see interface_xdp_detach_all_from_config() before reloading cfg.
+ *
+ * stats_map (debug, bpftool map dump name stats_map):
+ *   [0] packets entered program
+ *   [1] bad/eth short / not IPv4 after ethernet header
+ *   [4] ICMP → PASS
+ *   [7] ARP → PASS
+ *   [8] no encrypt_rule_matches → PASS (tuple không khớp encrypt_rules_map hoặc profile enc_num=0)
+ *  [10] TCP/UDP port parse failed → PASS
+ *  [13] encrypt_ctrl_map missing → PASS
+ *  [12] rate-limit maps missing after match → PASS
+ *  [11] rate-limit DROP after match
+ *   [5] xsks_map missing FD after match → PASS (rule khớp nhưng chưa bind AF_XDP socket)
+ *   [6] redirect to AF_XDP OK
+ *
+ * DB/userspace: interface_push_encrypt_filters fills encrypt_ctrl_map (profile_count),
+ * profile_meta_map (per-profile enc_start/enc_num), encrypt_rules_map (flattened rules),
+ * ingress_profile_map (ifindex → profile index, optional).
+ */
+
 static __always_inline int encrypt_rule_matches(__u32 sip, __u32 dip,
                                                  __u8 pkt_proto,
                                                  __u16 sport, __u16 dport,

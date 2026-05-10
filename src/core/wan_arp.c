@@ -296,7 +296,7 @@ void wan_log_peer_mac(struct arp_cache *wan_cache,
     for (int tries = 0; tries < 10; tries++) {
         if (arp_cache_lookup(wan_cache, wan_cfg->dst_ip, mac)) {
             fprintf(stderr,
-                    "[WAN ARP] if=%s local_ip=%u peer_ip=%s dest_mac=%02x:%02x:%02x:%02x:%02x:%02x (Sep device)\n",
+                    "[WAN ARP] if=%s local_ip=%u peer_ip=%s dest_mac=%02x:%02x:%02x:%02x:%02x:%02x (peer resolved)\n",
                     ifname,
                     (unsigned)ntohl(wan_cache->if_ip),
                     ipbuf,
@@ -307,7 +307,7 @@ void wan_log_peer_mac(struct arp_cache *wan_cache,
         usleep(100000);
     }
     fprintf(stderr,
-            "[WAN ARP] if=%s local_ip=%u peer_ip=%s dest_mac=UNRESOLVED (Sep / dst_ip not on L2 segment?)\n",
+            "[WAN ARP] if=%s local_ip=%u peer_ip=%s dest_mac=UNRESOLVED (check L2 reachability / dst_ip / firewall)\n",
             ifname,
             (unsigned)ntohl(wan_cache->if_ip),
             ipbuf);
