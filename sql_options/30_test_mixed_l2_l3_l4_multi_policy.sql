@@ -28,6 +28,14 @@ SELECT p.id, 'enp6s0', 100
 FROM xdp_profiles p
 WHERE p.config_id = 30 AND p.profile_name = 'wan_enp6s0_single';
 
+/* Bypass UDP 5203 — một policy / profile, priority thấp hơn encrypt để áp trước */
+INSERT INTO xdp_profile_crypto_policies (
+    id, profile_id, priority, action, protocol,
+    crypto_mode, aes_bits, nonce_size, crypto_key
+)
+SELECT 299, p.id, 50, 'bypass', 'UDP', 'gcm', 128, 12, '00000000000000000000000000000000'
+FROM xdp_profiles p WHERE p.config_id = 30;
+
 INSERT INTO xdp_profile_crypto_policies (
     id, profile_id, priority, action, protocol,
     crypto_mode, aes_bits, nonce_size, crypto_key
@@ -71,6 +79,8 @@ SELECT 305, p.id, 112, 'encrypt_l4', 'UDP', 'gcm', 128, 12, '0123456789abcdef012
 FROM xdp_profiles p WHERE p.config_id = 30 AND p.profile_name = 'wan_enp6s0_single';
 
 INSERT INTO xdp_profile_crypto_policy_matches (policy_id, src_cidr, src_port, dst_cidr, dst_port) VALUES
+(299, 'ANY', 'Any', 'ANY', '5203'),
+(299, 'ANY', '5203', 'ANY', 'Any'),
 (300, '192.168.9.2/32', 'Any', '192.168.182.2/32', '443'),
 (301, '192.168.9.2/32', 'Any', '192.168.182.2/32', '22'),
 (302, '192.168.9.2/32', 'Any', '192.168.182.2/32', '8080'),

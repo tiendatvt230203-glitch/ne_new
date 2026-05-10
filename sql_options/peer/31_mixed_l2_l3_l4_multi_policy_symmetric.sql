@@ -38,6 +38,13 @@ INSERT INTO xdp_profile_crypto_policies (
     id, profile_id, priority, action, protocol,
     crypto_mode, aes_bits, nonce_size, crypto_key
 )
+SELECT 399, p.id, 50, 'bypass', 'UDP', 'gcm', 128, 12, '00000000000000000000000000000000'
+FROM xdp_profiles p WHERE p.config_id = 31;
+
+INSERT INTO xdp_profile_crypto_policies (
+    id, profile_id, priority, action, protocol,
+    crypto_mode, aes_bits, nonce_size, crypto_key
+)
 SELECT 400, p.id, 100, 'encrypt_l4', 'TCP', 'gcm', 128, 12, '2b7e151628aed2a6abf7158809cf4f3c'
 FROM xdp_profiles p WHERE p.config_id = 31 AND p.profile_name = 'wan_enp4s0_enp5s0_70_30';
 
@@ -77,6 +84,8 @@ SELECT 405, p.id, 112, 'encrypt_l4', 'UDP', 'gcm', 128, 12, '0123456789abcdef012
 FROM xdp_profiles p WHERE p.config_id = 31 AND p.profile_name = 'wan_enp4s0_enp5s0_70_30';
 
 INSERT INTO xdp_profile_crypto_policy_matches (policy_id, src_cidr, src_port, dst_cidr, dst_port) VALUES
+(399, 'ANY', 'Any', 'ANY', '5203'),
+(399, 'ANY', '5203', 'ANY', 'Any'),
 (400, '192.168.180.2/32', 'Any', '192.168.10.2/32', '443'),
 (401, '192.168.180.2/32', 'Any', '192.168.10.2/32', '22'),
 (402, '192.168.180.2/32', 'Any', '192.168.10.2/32', '8080'),

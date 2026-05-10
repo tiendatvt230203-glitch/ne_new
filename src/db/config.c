@@ -308,6 +308,25 @@ static int crypto_policy_candidate_preferred(const struct crypto_policy *a, int 
     return a_pi < b_pi;
 }
 
+static int crypto_policy_match_flow(const struct crypto_policy *cp,
+                                    uint32_t src_ip, uint32_t dst_ip,
+                                    uint16_t src_port, uint16_t dst_port) {
+    if (!cidr_match_with_negate(cp->src_any, cp->src_negate, src_ip, cp->src_net, cp->src_mask))
+        return 0;
+    if (!cidr_match_with_negate(cp->dst_any, cp->dst_negate, dst_ip, cp->dst_net, cp->dst_mask))
+        return 0;
+
+    if (cp->src_port_from >= 0 && cp->src_port_to >= 0) {
+        if ((int)src_port < cp->src_port_from || (int)src_port > cp->src_port_to)
+            return 0;
+    }
+    if (cp->dst_port_from >= 0 && cp->dst_port_to >= 0) {
+        if ((int)dst_port < cp->dst_port_from || (int)dst_port > cp->dst_port_to)
+            return 0;
+    }
+    return 1;
+}
+
 const struct crypto_policy *config_select_crypto_policy(struct app_config *cfg, int profile_idx,
                                                         uint32_t src_ip, uint32_t dst_ip,
                                                         uint16_t src_port, uint16_t dst_port,
@@ -337,19 +356,12 @@ const struct crypto_policy *config_select_crypto_policy(struct app_config *cfg, 
                 if (cp->protocol != POLICY_PROTO_ANY)
                     continue;
             }
-            if (!cidr_match_with_negate(cp->src_any, cp->src_negate, src_ip, cp->src_net, cp->src_mask))
-                continue;
-            if (!cidr_match_with_negate(cp->dst_any, cp->dst_negate, dst_ip, cp->dst_net, cp->dst_mask))
-                continue;
-
-            if (cp->src_port_from >= 0 && cp->src_port_to >= 0) {
-                if ((int)src_port < cp->src_port_from || (int)src_port > cp->src_port_to)
-                    continue;
+            int matched = crypto_policy_match_flow(cp, src_ip, dst_ip, src_port, dst_port);
+            if (!matched) {
+                matched = crypto_policy_match_flow(cp, dst_ip, src_ip, dst_port, src_port);
             }
-            if (cp->dst_port_from >= 0 && cp->dst_port_to >= 0) {
-                if ((int)dst_port < cp->dst_port_from || (int)dst_port > cp->dst_port_to)
-                    continue;
-            }
+            if (!matched)
+                continue;
             if (crypto_policy_candidate_preferred(cp, pi, best, best_pi)) {
                 best = cp;
                 best_pi = pi;
