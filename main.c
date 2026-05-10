@@ -51,6 +51,11 @@ static void *forwarder_thread_main(void *arg) {
         rt->running = 0;
         return NULL;
     }
+    fprintf(stderr,
+            "[RUNTIME] forwarder_init OK — locals=%d wans=%d (XDP attach runs inside init; "
+            "if locals>0 and no prog on LAN iface, check journal for bpf/XSK errors above)\n",
+            rt->fwd.local_count,
+            rt->fwd.wan_count);
     rt->running = 1;
     forwarder_run(&rt->fwd);
     forwarder_cleanup(&rt->fwd);
@@ -241,7 +246,10 @@ int main(int argc, char **argv) {
                     if (runtime_start(&rt, &merged_cfg) != 0) {
                         fprintf(stderr, "[FATAL] failed to start merged runtime\n");
                     } else {
-                        fprintf(stderr, "[OK] Applied merged runtime with %d active config(s)\n", active_id_count);
+                        fprintf(stderr,
+                                "[OK] NOTIFY handled; forwarder thread started (%d active config(s)) — "
+                                "init finishes asynchronously; confirm \"[RUNTIME] forwarder_init OK\"\n",
+                                active_id_count);
                     }
                 } else {
                     int next_slot = 1 - rt.active_slot;
