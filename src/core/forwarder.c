@@ -28,6 +28,7 @@
 #include <net/if_arp.h>
 #include <netinet/if_ether.h>
 #include <arpa/inet.h>
+#include <stdlib.h>
 #include <stdatomic.h>
 
 void forwarder_pin_cpu(void) {
@@ -294,6 +295,246 @@ static void compute_profile_weighted_wan_windows(const struct app_config *cfg,
     }
 }
 
+#define TCP_POLICY_PIN_TIMEOUT_SEC 120
+
+struct tcp_policy_pin_entry {
+    uint32_t src_ip;
+    uint32_t dst_ip;
+    uint16_t src_port;
+    uint16_t dst_port;
+    int policy_pi;
+    uint64_t last_seen_sec;
+    struct tcp_policy_pin_entry *next;
+};
+
+static struct tcp_policy_pin_entry *g_tcp_policy_pins[FLOW_TABLE_SIZE];
+static pthread_mutex_t g_tcp_policy_pin_locks[FLOW_TABLE_SIZE];
+static int g_tcp_policy_pin_inited;
+
+static uint64_t tcp_policy_pin_now_sec(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return 0;
+    return (uint64_t)ts.tv_sec;
+}
+
+static void tcp_policy_pin_normalize_tuple(uint32_t *src_ip, uint32_t *dst_ip,
+                                           uint16_t *src_port, uint16_t *dst_port) {
+    if (!src_ip || !dst_ip || !src_port || !dst_port)
+        return;
+    uint32_t a = ntohl(*src_ip);
+    uint32_t b = ntohl(*dst_ip);
+    if (a > b || (a == b && *src_port > *dst_port)) {
+        uint32_t t_ip = *src_ip;
+        *src_ip = *dst_ip;
+        *dst_ip = t_ip;
+        uint16_t t_p = *src_port;
+        *src_port = *dst_port;
+        *dst_port = t_p;
+    }
+}
+
+static uint32_t tcp_policy_pin_hash(uint32_t src_ip, uint32_t dst_ip,
+                                    uint16_t src_port, uint16_t dst_port) {
+    uint32_t hash = src_ip ^ dst_ip;
+    hash ^= ((uint32_t)src_port << 16) | dst_port;
+    hash ^= (uint32_t)IPPROTO_TCP;
+    hash ^= (hash >> 16);
+    hash *= 0x85ebca6bU;
+    hash ^= (hash >> 13);
+    hash *= 0xc2b2ae35U;
+    hash ^= (hash >> 16);
+    return hash % FLOW_TABLE_SIZE;
+}
+
+static void tcp_policy_pin_init(void) {
+    if (g_tcp_policy_pin_inited)
+        return;
+    memset(g_tcp_policy_pins, 0, sizeof(g_tcp_policy_pins));
+    for (int i = 0; i < FLOW_TABLE_SIZE; i++)
+        pthread_mutex_init(&g_tcp_policy_pin_locks[i], NULL);
+    g_tcp_policy_pin_inited = 1;
+}
+
+static void tcp_policy_pin_free_bucket_unlocked(struct tcp_policy_pin_entry **head) {
+    while (*head) {
+        struct tcp_policy_pin_entry *n = (*head)->next;
+        free(*head);
+        *head = n;
+    }
+}
+
+static void tcp_policy_pin_cleanup(void) {
+    if (!g_tcp_policy_pin_inited)
+        return;
+    for (int i = 0; i < FLOW_TABLE_SIZE; i++) {
+        pthread_mutex_lock(&g_tcp_policy_pin_locks[i]);
+        tcp_policy_pin_free_bucket_unlocked(&g_tcp_policy_pins[i]);
+        pthread_mutex_unlock(&g_tcp_policy_pin_locks[i]);
+        pthread_mutex_destroy(&g_tcp_policy_pin_locks[i]);
+    }
+    memset(g_tcp_policy_pin_locks, 0, sizeof(g_tcp_policy_pin_locks));
+    g_tcp_policy_pin_inited = 0;
+}
+
+static void tcp_policy_pin_clear_all(void) {
+    if (!g_tcp_policy_pin_inited)
+        return;
+    for (int i = 0; i < FLOW_TABLE_SIZE; i++) {
+        pthread_mutex_lock(&g_tcp_policy_pin_locks[i]);
+        tcp_policy_pin_free_bucket_unlocked(&g_tcp_policy_pins[i]);
+        pthread_mutex_unlock(&g_tcp_policy_pin_locks[i]);
+    }
+}
+
+static void tcp_policy_pin_gc(void) {
+    if (!g_tcp_policy_pin_inited || !crypto_enabled)
+        return;
+    uint64_t now = tcp_policy_pin_now_sec();
+    if (now == 0)
+        return;
+    for (int i = 0; i < FLOW_TABLE_SIZE; i++) {
+        pthread_mutex_lock(&g_tcp_policy_pin_locks[i]);
+        struct tcp_policy_pin_entry **pp = &g_tcp_policy_pins[i];
+        while (*pp) {
+            struct tcp_policy_pin_entry *e = *pp;
+            if (now - e->last_seen_sec > (uint64_t)TCP_POLICY_PIN_TIMEOUT_SEC) {
+                *pp = e->next;
+                free(e);
+            } else {
+                pp = &e->next;
+            }
+        }
+        pthread_mutex_unlock(&g_tcp_policy_pin_locks[i]);
+    }
+}
+
+static void tcp_policy_pin_set(uint32_t src_ip, uint32_t dst_ip,
+                               uint16_t src_port, uint16_t dst_port, int policy_pi) {
+    if (!crypto_enabled || !g_tcp_policy_pin_inited)
+        return;
+    if (policy_pi < 0 || policy_pi >= MAX_CRYPTO_POLICIES)
+        return;
+
+    uint32_t a = src_ip, b = dst_ip;
+    uint16_t sp = src_port, dp = dst_port;
+    tcp_policy_pin_normalize_tuple(&a, &b, &sp, &dp);
+    uint32_t idx = tcp_policy_pin_hash(a, b, sp, dp);
+    uint64_t now = tcp_policy_pin_now_sec();
+
+    pthread_mutex_lock(&g_tcp_policy_pin_locks[idx]);
+    struct tcp_policy_pin_entry *e = g_tcp_policy_pins[idx];
+    while (e) {
+        if (e->src_ip == a && e->dst_ip == b && e->src_port == sp && e->dst_port == dp) {
+            e->policy_pi = policy_pi;
+            e->last_seen_sec = now;
+            pthread_mutex_unlock(&g_tcp_policy_pin_locks[idx]);
+            return;
+        }
+        e = e->next;
+    }
+
+    struct tcp_policy_pin_entry *ne =
+        (struct tcp_policy_pin_entry *)calloc(1, sizeof(struct tcp_policy_pin_entry));
+    if (!ne) {
+        pthread_mutex_unlock(&g_tcp_policy_pin_locks[idx]);
+        return;
+    }
+    ne->src_ip = a;
+    ne->dst_ip = b;
+    ne->src_port = sp;
+    ne->dst_port = dp;
+    ne->policy_pi = policy_pi;
+    ne->last_seen_sec = now;
+    ne->next = g_tcp_policy_pins[idx];
+    g_tcp_policy_pins[idx] = ne;
+    pthread_mutex_unlock(&g_tcp_policy_pin_locks[idx]);
+}
+
+static void tcp_policy_pin_remove(uint32_t src_ip, uint32_t dst_ip,
+                                  uint16_t src_port, uint16_t dst_port) {
+    if (!crypto_enabled || !g_tcp_policy_pin_inited)
+        return;
+
+    uint32_t a = src_ip, b = dst_ip;
+    uint16_t sp = src_port, dp = dst_port;
+    tcp_policy_pin_normalize_tuple(&a, &b, &sp, &dp);
+    uint32_t idx = tcp_policy_pin_hash(a, b, sp, dp);
+
+    pthread_mutex_lock(&g_tcp_policy_pin_locks[idx]);
+    struct tcp_policy_pin_entry **pp = &g_tcp_policy_pins[idx];
+    while (*pp) {
+        struct tcp_policy_pin_entry *e = *pp;
+        if (e->src_ip == a && e->dst_ip == b && e->src_port == sp && e->dst_port == dp) {
+            *pp = e->next;
+            free(e);
+            break;
+        }
+        pp = &e->next;
+    }
+    pthread_mutex_unlock(&g_tcp_policy_pin_locks[idx]);
+}
+
+static const struct crypto_policy *tcp_policy_pin_lookup(struct forwarder *fwd,
+                                                         uint32_t src_ip, uint32_t dst_ip,
+                                                         uint16_t src_port, uint16_t dst_port) {
+    if (!crypto_enabled || !fwd || !fwd->cfg || !g_tcp_policy_pin_inited)
+        return NULL;
+
+    uint32_t a = src_ip, b = dst_ip;
+    uint16_t sp = src_port, dp = dst_port;
+    tcp_policy_pin_normalize_tuple(&a, &b, &sp, &dp);
+    uint32_t idx = tcp_policy_pin_hash(a, b, sp, dp);
+    uint64_t now = tcp_policy_pin_now_sec();
+
+    pthread_mutex_lock(&g_tcp_policy_pin_locks[idx]);
+    struct tcp_policy_pin_entry **pp = &g_tcp_policy_pins[idx];
+    while (*pp) {
+        struct tcp_policy_pin_entry *e = *pp;
+        if (e->src_ip == a && e->dst_ip == b && e->src_port == sp && e->dst_port == dp) {
+            int pi = e->policy_pi;
+            int ok = (pi >= 0 && pi < fwd->cfg->policy_count && pi < MAX_CRYPTO_POLICIES);
+            const struct crypto_policy *pol = ok ? &fwd->cfg->policies[pi] : NULL;
+            if (ok && pol->action != POLICY_ACTION_BYPASS && !g_policy_crypto_ctx_ready[pi])
+                ok = 0;
+
+            if (ok) {
+                e->last_seen_sec = now;
+                pthread_mutex_unlock(&g_tcp_policy_pin_locks[idx]);
+                return pol;
+            }
+
+            *pp = e->next;
+            free(e);
+            pthread_mutex_unlock(&g_tcp_policy_pin_locks[idx]);
+            return NULL;
+        }
+        pp = &e->next;
+    }
+    pthread_mutex_unlock(&g_tcp_policy_pin_locks[idx]);
+    return NULL;
+}
+
+static int tcp_ipv4_tcp_flags(void *pkt_data, uint32_t pkt_len, uint8_t *flags_out) {
+    if (!flags_out)
+        return -1;
+    uint8_t *pkt = (uint8_t *)pkt_data;
+    int l3_off = crypto_eth_ipv4_offset(pkt, pkt_len);
+    if (l3_off < 0 || pkt_len < (uint32_t)(l3_off + 20))
+        return -1;
+    struct iphdr *ip = (struct iphdr *)(pkt + l3_off);
+    if (ip->protocol != IPPROTO_TCP)
+        return -1;
+    int ip_hdr_len = ip->ihl * 4;
+    if (ip_hdr_len < 20)
+        return -1;
+    if (pkt_len < (uint32_t)(l3_off + ip_hdr_len + 14))
+        return -1;
+    uint8_t *th = pkt + l3_off + ip_hdr_len;
+    *flags_out = th[13];
+    return 0;
+}
+
 static int select_wan_idx_for_packet(struct forwarder *fwd,
                                      int local_idx,
                                      uint32_t src_ip, uint32_t dst_ip,
@@ -358,6 +599,21 @@ static const struct crypto_policy *select_crypto_policy_for_packet(struct forwar
                                            src_ip, dst_ip,
                                            src_port, dst_port,
                                            protocol);
+}
+
+static int policy_index_from_action_id_current(const struct forwarder *fwd,
+                                               int action_layer,
+                                               uint8_t policy_id) {
+    if (!fwd || !fwd->cfg)
+        return -1;
+    if (action_layer < 0 || action_layer > POLICY_ACTION_ENCRYPT_L4)
+        return -1;
+    int pi = g_policy_index_by_action_id[action_layer][policy_id];
+    if (pi < 0 || pi >= fwd->cfg->policy_count || pi >= MAX_CRYPTO_POLICIES)
+        return -1;
+    if (!g_policy_crypto_ctx_ready[pi])
+        return -1;
+    return pi;
 }
 
 static void apply_default_crypto_params(struct forwarder *fwd) {
@@ -661,6 +917,7 @@ static void *gc_thread(void *arg) {
     while (running) {
         sleep(60); 
         flow_table_gc(&g_flow_table);
+        tcp_policy_pin_gc();
         frag_table_gc(&g_wan_frag_l2);
         frag_table_gc(&g_wan_frag_l3);
         frag_table_gc(&g_wan_frag_l4);
@@ -1221,8 +1478,11 @@ static void *wan_queue_thread_l3l4(void *arg) {
         for (int i = 0; i < rcvd; i++) {
             uint8_t *pkt = (uint8_t *)pkt_ptrs[i];
             uint32_t pkt_len = pkt_lens[i];
+            uint8_t *wire_pkt = pkt;
+            uint32_t wire_len = pkt_len;
             uint8_t *final_pkt = pkt;
             uint32_t final_len = pkt_len;
+            int inbound_policy_pi = -1;
 
             (void)0;
 
@@ -1272,6 +1532,12 @@ static void *wan_queue_thread_l3l4(void *arg) {
                 uint16_t l3_frag_pid;
                 uint8_t l3_frag_idx;
                 if (frag_is_fragment(pkt, pkt_len, &l3_frag_pid, &l3_frag_idx)) {
+                    uint8_t l3_pid = 0;
+                    if (crypto_l3_extract_policy_id(pkt, pkt_len, &l3_pid) == 0) {
+                        int pi = policy_index_from_action_id_current(fwd, POLICY_ACTION_ENCRYPT_L3, l3_pid);
+                        if (pi >= 0)
+                            inbound_policy_pi = pi;
+                    }
                     struct packet_crypto_ctx *l3ctx = forwarder_resolve_l3_decrypt_ctx(fwd, pkt, pkt_len);
                     if (!l3ctx) {
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
@@ -1304,6 +1570,13 @@ static void *wan_queue_thread_l3l4(void *arg) {
                                                          sizeof(decrypt_scratch)) != 0) {
                     __sync_fetch_and_add(&fwd->total_dropped, 1);
                     continue;
+                } else {
+                    uint8_t l3_pid = 0;
+                    if (crypto_l3_extract_policy_id(wire_pkt, wire_len, &l3_pid) == 0) {
+                        int pi = policy_index_from_action_id_current(fwd, POLICY_ACTION_ENCRYPT_L3, l3_pid);
+                        if (pi >= 0)
+                            inbound_policy_pi = pi;
+                    }
                 }
 
                 uint16_t l4_frag_pid;
@@ -1341,11 +1614,27 @@ static void *wan_queue_thread_l3l4(void *arg) {
                                                            sizeof(decrypt_scratch)) != 0) {
                     __sync_fetch_and_add(&fwd->total_dropped, 1);
                     continue;
+                } else if (inbound_policy_pi < 0) {
+                    uint8_t l4_pid = 0;
+                    int l4_nonce = 0;
+                    if (crypto_l4_extract_policy_id_ipv4(wire_pkt, wire_len, &l4_pid, &l4_nonce) == 0) {
+                        int pi = policy_index_from_action_id_current(fwd, POLICY_ACTION_ENCRYPT_L4, l4_pid);
+                        if (pi >= 0)
+                            inbound_policy_pi = pi;
+                    }
                 }
             }
 
             final_pkt = pkt;
             final_len = pkt_len;
+
+            if (inbound_policy_pi >= 0) {
+                uint32_t fs = 0, fd = 0;
+                uint16_t fsp = 0, fdp = 0;
+                uint8_t fp = 0;
+                if (parse_flow(final_pkt, final_len, &fs, &fd, &fsp, &fdp, &fp) == 0 && fp == IPPROTO_TCP)
+                    tcp_policy_pin_set(fs, fd, fsp, fdp, inbound_policy_pi);
+            }
 
 
             uint32_t dest_ip = get_dest_ip(final_pkt, final_len);
@@ -1451,6 +1740,10 @@ static void *worker_thread(void *arg) {
 
         int flow_ok = (parse_flow(job.pkt_ptr, job.pkt_len,
                                   &src_ip, &dst_ip, &src_port, &dst_port, &protocol) == 0);
+        uint8_t tcp_flags = 0;
+        int tcp_flags_ok = 0;
+        if (flow_ok && protocol == IPPROTO_TCP)
+            tcp_flags_ok = (tcp_ipv4_tcp_flags(job.pkt_ptr, job.pkt_len, &tcp_flags) == 0);
         int profile_idx = -1;
         if (fwd->cfg && job.local_idx >= 0 && job.local_idx < fwd->cfg->local_count) {
             profile_idx = config_select_profile_for_local(fwd->cfg, job.local_idx);
@@ -1499,10 +1792,13 @@ static void *worker_thread(void *arg) {
             if (!flow_ok) {
                 bypass_crypto = 1;
             } else {
-                cp = select_crypto_policy_for_packet(fwd, job.local_idx,
-                                                     src_ip, dst_ip,
-                                                     src_port, dst_port,
-                                                     protocol);
+                if (protocol == IPPROTO_TCP)
+                    cp = tcp_policy_pin_lookup(fwd, src_ip, dst_ip, src_port, dst_port);
+                if (!cp)
+                    cp = select_crypto_policy_for_packet(fwd, job.local_idx,
+                                                         src_ip, dst_ip,
+                                                         src_port, dst_port,
+                                                         protocol);
                 if (cp) {
                     if (cp->action == POLICY_ACTION_BYPASS) {
                         bypass_crypto = 1;
@@ -1523,6 +1819,19 @@ static void *worker_thread(void *arg) {
                     }
                     bypass_crypto = 1;
                 }
+            }
+
+            if (crypto_enabled && protocol == IPPROTO_TCP && flow_ok && cp) {
+                int pin_pi = -1;
+                int pi = (int)(cp - fwd->cfg->policies);
+                if (pi >= 0 && pi < fwd->cfg->policy_count && pi < MAX_CRYPTO_POLICIES) {
+                    if (cp->action == POLICY_ACTION_BYPASS)
+                        pin_pi = pi;
+                    else if (!bypass_crypto && g_policy_crypto_ctx_ready[pi])
+                        pin_pi = pi;
+                }
+                if (pin_pi >= 0)
+                    tcp_policy_pin_set(src_ip, dst_ip, src_port, dst_port, pin_pi);
             }
 
             if (bypass_crypto) {
@@ -1669,6 +1978,10 @@ static void *worker_thread(void *arg) {
             }
         }
 
+        if (crypto_enabled && flow_ok && protocol == IPPROTO_TCP && tcp_flags_ok &&
+            (tcp_flags & (TH_FIN | TH_RST)))
+            tcp_policy_pin_remove(src_ip, dst_ip, src_port, dst_port);
+
 skip_encrypt_flush:
         for (int w = 0; w < fwd->wan_count; w++) {
             if (wan_used[w])
@@ -1766,6 +2079,7 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg) {
     frag_table_init(&g_wan_frag_l2);
     frag_table_init(&g_wan_frag_l3);
     frag_table_init(&g_wan_frag_l4);
+    tcp_policy_pin_init();
 
     int total_threads = 0;
     for (int i = 0; i < cfg->local_count; i++) {
@@ -1850,6 +2164,7 @@ err_locals:
     for (int j = 0; j < fwd->local_count; j++)
         interface_cleanup(&fwd->locals[j]);
     flow_table_cleanup(&g_flow_table);
+    tcp_policy_pin_cleanup();
     return -1;
 }
 
@@ -1894,6 +2209,7 @@ int forwarder_reload_config(struct forwarder *fwd, struct app_config *cfg) {
             packet_crypto_set_ethertype(cfg->fake_ethertype_ipv4, cfg->fake_ethertype_ipv6);
         if (cfg->encrypt_layer == 3)
             packet_crypto_set_fake_protocol(cfg->fake_protocol ? cfg->fake_protocol : 99);
+        tcp_policy_pin_clear_all();
     }
 
     atomic_store_explicit(&g_reload_pause, 0, memory_order_release);
@@ -1911,6 +2227,7 @@ void forwarder_cleanup(struct forwarder *fwd) {
     }
 
     flow_table_cleanup(&g_flow_table);
+    tcp_policy_pin_cleanup();
 
     for (int i = 0; i < fwd->local_count; i++)
         interface_cleanup(&fwd->locals[i]);
