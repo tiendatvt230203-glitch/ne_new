@@ -76,6 +76,9 @@ static int runtime_start(struct runtime_state *rt, const struct app_config *cfg)
 }
 
 int main(int argc, char **argv) {
+    /* systemd connects stderr to a pipe → libc may fully-buffer stderr; force immediate logs */
+    setbuf(stderr, NULL);
+
     load_env_from_file("/opt/db.env");
     const char *db_pass = resolve_db_password();
     const char *keywords[] = {"host", "port", "dbname", "user", "password", "connect_timeout", NULL};
