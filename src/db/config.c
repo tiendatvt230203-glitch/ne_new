@@ -235,6 +235,22 @@ int config_select_profile_for_local(const struct app_config *cfg, int local_idx)
     return -1;
 }
 
+int config_select_profile_for_wan(const struct app_config *cfg, int wan_idx) {
+    if (!cfg || wan_idx < 0 || wan_idx >= cfg->wan_count)
+        return -1;
+
+    for (int pi = 0; pi < cfg->profile_count; pi++) {
+        const struct profile_config *p = &cfg->profiles[pi];
+        if (!p->enabled)
+            continue;
+        for (int i = 0; i < p->wan_count; i++) {
+            if (p->wan_indices[i] == wan_idx)
+                return pi;
+        }
+    }
+    return -1;
+}
+
 static uint32_t flow_hash_u32(uint32_t src_ip, uint32_t dst_ip,
                               uint16_t src_port, uint16_t dst_port, uint8_t protocol) {
     uint32_t h = src_ip ^ dst_ip ^ ((uint32_t)src_port << 16) ^ dst_port ^ protocol;
@@ -316,6 +332,7 @@ static int crypto_policy_match_flow(const struct crypto_policy *cp,
     if (!cidr_match_with_negate(cp->dst_any, cp->dst_negate, dst_ip, cp->dst_net, cp->dst_mask))
         return 0;
 
+#if !CRYPTO_POLICY_MATCH_IP_ONLY
     if (cp->src_port_from >= 0 && cp->src_port_to >= 0) {
         if ((int)src_port < cp->src_port_from || (int)src_port > cp->src_port_to)
             return 0;
@@ -324,6 +341,7 @@ static int crypto_policy_match_flow(const struct crypto_policy *cp,
         if ((int)dst_port < cp->dst_port_from || (int)dst_port > cp->dst_port_to)
             return 0;
     }
+#endif
     return 1;
 }
 
@@ -337,6 +355,30 @@ const struct crypto_policy *config_select_crypto_policy(struct app_config *cfg, 
 
     const struct profile_config *p = &cfg->profiles[profile_idx];
 
+#if CRYPTO_POLICY_MATCH_IP_ONLY
+    {
+        const struct crypto_policy *best = NULL;
+        int best_pi = 0;
+
+        for (int i = 0; i < p->policy_count; i++) {
+            int pi = p->policy_indices[i];
+            if (pi < 0 || pi >= cfg->policy_count)
+                continue;
+
+            const struct crypto_policy *cp = &cfg->policies[pi];
+            int matched = crypto_policy_match_flow(cp, src_ip, dst_ip, src_port, dst_port);
+            if (!matched)
+                matched = crypto_policy_match_flow(cp, dst_ip, src_ip, dst_port, src_port);
+            if (!matched)
+                continue;
+            if (crypto_policy_candidate_preferred(cp, pi, best, best_pi)) {
+                best = cp;
+                best_pi = pi;
+            }
+        }
+        return best;
+    }
+#else
     for (int pass = 0; pass < 2; pass++) {
         const struct crypto_policy *best = NULL;
         int best_pi = 0;
@@ -371,6 +413,7 @@ const struct crypto_policy *config_select_crypto_policy(struct app_config *cfg, 
             return best;
     }
     return NULL;
+#endif
 }
 
 int parse_ip_cidr_pub(const char *str, uint32_t *ip, uint32_t *netmask, uint32_t *network) {

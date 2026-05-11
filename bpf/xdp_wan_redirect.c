@@ -5,7 +5,6 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
-/* Must match FORWARDER_XSK_QUEUE_ID in inc/config.h (single RX queue). */
 #define NE_XSK_QUEUE_ID 0
 
 struct {

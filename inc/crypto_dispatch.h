@@ -32,6 +32,7 @@ int crypto_l4_extract_policy_id_ipv4(uint8_t *pkt,
                                       uint8_t *policy_id_out,
                                       int *nonce_size_out);
 
+/* WAN decrypt: AES ctx is chosen from the policy id embedded at encrypt time, not from IP tuple. */
 
 int crypto_decrypt_packet_auto_by_action(
     int crypto_enabled,

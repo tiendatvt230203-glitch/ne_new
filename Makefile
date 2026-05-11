@@ -48,4 +48,4 @@ clean:
 	rm -rf $(BIN_DIR) src/*.o src/core/*.o src/crypto/*.o src/db/*.o *.o $(BPF_OBJ)
 
 run:
-	sudo DB_URL="host=localhost user=postgres dbname=xdpdb" $(TARGET) -id 1
+	sudo DB_URL="host=localhost user=postgres dbname=xdpdb" $(TARGET) -id 30

@@ -238,16 +238,24 @@ have_enc:
 
         int ip_fd = ingress_profile_map_fds[mi];
         unsigned int ifix = encrypt_bundle_ifindex[mi];
-        if (ip_fd >= 0 && ifix != 0 && cfg->local_count > 0) {
-            int li = -1;
+        if (ip_fd >= 0 && ifix != 0) {
+            int prof = -1;
             for (int j = 0; j < cfg->local_count; j++) {
                 unsigned int ix = if_nametoindex(cfg->locals[j].ifname);
                 if (ix == ifix) {
-                    li = j;
+                    prof = config_select_profile_for_local(cfg, j);
                     break;
                 }
             }
-            int prof = (li >= 0) ? config_select_profile_for_local(cfg, li) : -1;
+            if (prof < 0) {
+                for (int j = 0; j < cfg->wan_count; j++) {
+                    unsigned int ix = if_nametoindex(cfg->wans[j].ifname);
+                    if (ix == ifix) {
+                        prof = config_select_profile_for_wan(cfg, j);
+                        break;
+                    }
+                }
+            }
             if (prof >= 0 && prof < (int)npc) {
                 unsigned int pv = (unsigned int)prof;
                 if (bpf_map_update_elem(ip_fd, &ifix, &pv, 0) != 0)
@@ -657,7 +665,10 @@ int interface_init_wan_rx(struct xsk_interface *iface,
     struct bpf_object *wan_bpf_obj = NULL;
     struct bpf_program *prog;
     struct bpf_map *map;
-    int prog_fd, wan_xsk_map_fd;
+    int prog_fd, xsk_map_fd = -1;
+
+    (void)fake_ethertype_ipv4;
+    (void)fake_ethertype_ipv6;
 
     memset(iface, 0, sizeof(*iface));
     iface->ifindex = if_nametoindex(wan_cfg->ifname);
@@ -698,31 +709,37 @@ int interface_init_wan_rx(struct xsk_interface *iface,
         return -1;
     }
 
-    prog = bpf_object__find_program_by_name(wan_bpf_obj, "xdp_wan_redirect_prog");
+    prog = bpf_object__find_program_by_name(wan_bpf_obj, "xdp_redirect_prog");
     if (!prog) {
-        fprintf(stderr, "WAN XDP program not found\n");
+        fprintf(stderr, "WAN XDP program xdp_redirect_prog not found in %s\n", bpf_file);
         bpf_object__close(wan_bpf_obj);
         return -1;
     }
     prog_fd = bpf_program__fd(prog);
 
-    map = bpf_object__find_map_by_name(wan_bpf_obj, "wan_xsks_map");
+    map = bpf_object__find_map_by_name(wan_bpf_obj, "xsks_map");
     if (!map) {
-        fprintf(stderr, "wan_xsks_map not found\n");
+        fprintf(stderr, "WAN xsks_map not found\n");
         bpf_object__close(wan_bpf_obj);
         return -1;
     }
-    wan_xsk_map_fd = bpf_map__fd(map);
+    xsk_map_fd = bpf_map__fd(map);
 
-    map = bpf_object__find_map_by_name(wan_bpf_obj, "wan_config_map");
-    if (map) {
-        int cfg_fd = bpf_map__fd(map);
-        int key0 = 0, key1 = 1;
-        uint16_t fake4_net = htons(fake_ethertype_ipv4);
-        uint16_t fake6_net = htons(fake_ethertype_ipv6);
-        bpf_map_update_elem(cfg_fd, &key0, &fake4_net, 0);
-        bpf_map_update_elem(cfg_fd, &key1, &fake6_net, 0);
-    }
+    map = bpf_object__find_map_by_name(wan_bpf_obj, "encrypt_ctrl_map");
+    int enc_ctrl_fd = map ? bpf_map__fd(map) : -1;
+    map = bpf_object__find_map_by_name(wan_bpf_obj, "profile_meta_map");
+    int pm_fd = map ? bpf_map__fd(map) : -1;
+    map = bpf_object__find_map_by_name(wan_bpf_obj, "encrypt_rules_map");
+    int ep_fd = map ? bpf_map__fd(map) : -1;
+    map = bpf_object__find_map_by_name(wan_bpf_obj, "ingress_profile_map");
+    int ip_fd = map ? bpf_map__fd(map) : -1;
+    if (enc_ctrl_fd >= 0 && pm_fd >= 0 && ep_fd >= 0)
+        register_encrypt_bundle(enc_ctrl_fd, pm_fd, ep_fd, ip_fd,
+                                iface->ifindex ? (unsigned int)iface->ifindex : 0U);
+    else if (enc_ctrl_fd >= 0 || pm_fd >= 0 || ep_fd >= 0)
+        fprintf(stderr,
+                "[XDP] WAN WARN: incomplete encrypt bundle (ctrl=%d meta=%d enc=%d)\n",
+                enc_ctrl_fd, pm_fd, ep_fd);
 
     size_t wan_umem_size = (size_t)wan_cfg->umem_mb * 1024 * 1024;
     iface->umem_size = wan_umem_size;
@@ -780,7 +797,7 @@ int interface_init_wan_rx(struct xsk_interface *iface,
 
         int fd = xsk_socket__fd(queue->xsk);
         int wan_map_q = FORWARDER_XSK_QUEUE_ID;
-        ret = bpf_map_update_elem(wan_xsk_map_fd, &wan_map_q, &fd, 0);
+        ret = bpf_map_update_elem(xsk_map_fd, &wan_map_q, &fd, 0);
         if (ret) {
             fprintf(stderr, "WAN Queue %d: bpf_map_update_elem failed\n", q);
             xsk_socket__delete(queue->xsk);
@@ -806,6 +823,8 @@ int interface_init_wan_rx(struct xsk_interface *iface,
         iface->queue_count++;
     }
 
+    prog = bpf_object__find_program_by_name(wan_bpf_obj, "xdp_redirect_prog");
+    prog_fd = bpf_program__fd(prog);
     ret = bpf_xdp_attach(iface->ifindex, prog_fd, XDP_FLAGS_SKB_MODE, NULL);
     if (ret) {
         fprintf(stderr, "WAN bpf_set_link_xdp_fd failed: %d\n", ret);

@@ -11,10 +11,6 @@
 #define XDP_RULE_SRC_NEG 4u
 #define XDP_RULE_DST_NEG 8u
 
-/*
- * Layout must match struct xdp_encrypt_rule in bpf/xdp_redirect.c exactly.
- * Mirrors crypto_policy IP/proto/port fields for encrypt policies only.
- */
 struct xdp_encrypt_rule_user {
     uint32_t src_net;
     uint32_t src_mask;

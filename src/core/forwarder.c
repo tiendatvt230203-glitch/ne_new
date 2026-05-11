@@ -684,6 +684,12 @@ struct queue_thread_args {
     int wan_worker_index;
 };
 
+/*
+ * Inbound WAN decrypt: pick AES ctx from policy id bytes inside the ciphertext
+ * (see decrypt_packet_auto_l2 / crypto_l3_extract_policy_id / crypto_l4_*), not
+ * from cleartext IP direction. Return-path IP swap does not change that id.
+ * Outbound encrypt policy match already tries both tuple orders in config_select_crypto_policy().
+ */
 static int decrypt_packet_auto_l2(struct forwarder *fwd,
                                   uint8_t *pkt, uint32_t *pkt_len,
                                   uint8_t *scratch, size_t scratch_sz) {
@@ -2124,7 +2130,7 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg) {
     for (int i = 0; i < cfg->wan_count; i++) {
         uint16_t wan_fake4 = (crypto_enabled && has_encrypt_l2) ? cfg->fake_ethertype_ipv4 : 0;
         uint16_t wan_fake6 = (crypto_enabled && has_encrypt_l2) ? cfg->fake_ethertype_ipv6 : 0;
-        if (interface_init_wan_rx(&fwd->wans[i], &cfg->wans[i], "bpf/xdp_wan_redirect.o", wan_fake4, wan_fake6) != 0) {
+        if (interface_init_wan_rx(&fwd->wans[i], &cfg->wans[i], cfg->bpf_file, wan_fake4, wan_fake6) != 0) {
             fprintf(stderr, "Failed to init WAN %s\n", cfg->wans[i].ifname);
             goto err_wans;
         }
