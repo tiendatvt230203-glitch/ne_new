@@ -44,8 +44,11 @@ int crypto_l3_extract_policy_id(uint8_t *pkt, uint32_t pkt_len, uint8_t *policy_
     int l3_off;
     int ip_hdr_len;
     uint8_t proto;
-    uint8_t marker = 99;
+    uint8_t marker = packet_crypto_get_fake_protocol();
+    if (marker == 0)
+        marker = 99;
     int nonce_size = packet_crypto_get_nonce_size();
+    int tunnel_hdr_size = packet_crypto_get_tunnel_hdr_size();
 
     if (ether_type == 0x0800) {
         l3_off = 14;
@@ -67,7 +70,8 @@ int crypto_l3_extract_policy_id(uint8_t *pkt, uint32_t pkt_len, uint8_t *policy_
         return -1;
 
     int tunnel_off = l3_off + ip_hdr_len;
-    if (tunnel_off + nonce_size >= (int)pkt_len)
+    /* Full tunnel header: nonce + policy_id + orig_proto (see crypto_write_l3_tunnel_header). */
+    if (pkt_len < (uint32_t)(tunnel_off + tunnel_hdr_size))
         return -1;
 
     *policy_id_out = pkt[tunnel_off + nonce_size];
@@ -175,7 +179,8 @@ int crypto_decrypt_packet_auto_by_action(
             const struct crypto_policy *cp = &dctx->policies[pi];
             crypto_apply_from_policy(cp);
             int new_len = crypto_layer3_decrypt(&dctx->per_policy_ctx[pi], pkt, *pkt_len);
-            if (new_len >= 0) {
+            /* layer3_decrypt returns unchanged pkt_len when not a tunnel; do not forward ciphertext. */
+            if (new_len >= 0 && new_len < (int)*pkt_len) {
                 *pkt_len = (uint32_t)new_len;
                 return 0;
             }
@@ -190,7 +195,7 @@ int crypto_decrypt_packet_auto_by_action(
                 const struct crypto_policy *cp_prev = &dctx->prev_policies[ppi];
                 crypto_apply_from_policy(cp_prev);
                 int new_len = crypto_layer3_decrypt(&dctx->prev_per_policy_ctx[ppi], pkt, *pkt_len);
-                if (new_len >= 0) {
+                if (new_len >= 0 && new_len < (int)*pkt_len) {
                     *pkt_len = (uint32_t)new_len;
                     return 0;
                 }
@@ -263,7 +268,11 @@ int crypto_decrypt_packet_auto_by_action(
                 }
             }
         }
-        return 0;
+        /*
+         * crypto_l4_extract_policy_id_ipv4 succeeded: frame looks like L4 ciphertext.
+         * Do not forward undecrypted payload to the stack (would break TCP); drop.
+         */
+        return -1;
     }
 
 
@@ -289,6 +298,12 @@ int crypto_decrypt_packet_auto_by_action(
         else if (action_layer == POLICY_ACTION_ENCRYPT_L4)
             new_len = crypto_layer4_decrypt(&dctx->per_policy_ctx[pi], pkt, *pkt_len);
         if (new_len < 0) {
+            if (scratch)
+                memcpy(pkt, scratch, *pkt_len);
+            continue;
+        }
+        /* L2/L3/L4 decrypt success always shrinks vs ciphertext; unchanged len = passthrough, try next. */
+        if (new_len >= (int)*pkt_len) {
             if (scratch)
                 memcpy(pkt, scratch, *pkt_len);
             continue;

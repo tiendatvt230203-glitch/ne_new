@@ -33,8 +33,10 @@ void crypto_apply_from_policy(const struct crypto_policy *cp) {
     else if (cp->action == POLICY_ACTION_ENCRYPT_L4)
         packet_crypto_set_encrypt_layer(4);
 
-    if (cp->action == POLICY_ACTION_ENCRYPT_L3)
-        packet_crypto_set_fake_protocol(99);
+    if (cp->action == POLICY_ACTION_ENCRYPT_L3) {
+        uint8_t fp = packet_crypto_get_fake_protocol();
+        packet_crypto_set_fake_protocol(fp ? fp : 99);
+    }
     packet_crypto_set_policy_id((uint8_t)cp->id);
 }
 
