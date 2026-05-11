@@ -202,6 +202,10 @@ static void profile_append_wans_from_rows(struct app_config *cfg,
             p->wan_bandwidth_weight[p->wan_count] =
                 (wcol >= 0) ? atoi(PQgetvalue(res, r, wcol)) : 0;
             p->wan_count++;
+        } else {
+            fprintf(stderr,
+                    "[DB] profile \"%s\": xdp_profile_wans.ifname=%s not in xdp_wan_configs — row skipped\n",
+                    p->name, ifname);
         }
     }
 }

@@ -40,6 +40,14 @@
 #define CRYPTO_POLICY_MATCH_IP_ONLY 1
 #endif
 
+/*
+ * When 1: flows that match no policy row are still forwarded to WAN (cleartext).
+ * When 0: those packets are dropped whenever policy_count > 0 (strict matrix).
+ */
+#ifndef CRYPTO_POLICY_PASS_UNMATCHED
+#define CRYPTO_POLICY_PASS_UNMATCHED 1
+#endif
+
 enum policy_action {
     POLICY_ACTION_BYPASS = 0,
     POLICY_ACTION_ENCRYPT_L2 = 2,

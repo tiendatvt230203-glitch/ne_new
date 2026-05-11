@@ -1,6 +1,8 @@
 #include "../../inc/crypto_dispatch.h"
 
 #include "../../inc/crypto_policy_utils.h"
+#include "../../inc/crypto_layer2.h"
+#include "../../inc/crypto_layer3.h"
 #include "../../inc/crypto_layer4.h"
 
 #include <string.h>
@@ -172,7 +174,7 @@ int crypto_decrypt_packet_auto_by_action(
         if (pi >= 0 && dctx->per_policy_ready && dctx->per_policy_ready[pi]) {
             const struct crypto_policy *cp = &dctx->policies[pi];
             crypto_apply_from_policy(cp);
-            int new_len = packet_decrypt(&dctx->per_policy_ctx[pi], pkt, *pkt_len);
+            int new_len = crypto_layer3_decrypt(&dctx->per_policy_ctx[pi], pkt, *pkt_len);
             if (new_len >= 0) {
                 *pkt_len = (uint32_t)new_len;
                 return 0;
@@ -187,7 +189,7 @@ int crypto_decrypt_packet_auto_by_action(
             if (ppi >= 0 && dctx->prev_per_policy_ready && dctx->prev_per_policy_ready[ppi]) {
                 const struct crypto_policy *cp_prev = &dctx->prev_policies[ppi];
                 crypto_apply_from_policy(cp_prev);
-                int new_len = packet_decrypt(&dctx->prev_per_policy_ctx[ppi], pkt, *pkt_len);
+                int new_len = crypto_layer3_decrypt(&dctx->prev_per_policy_ctx[ppi], pkt, *pkt_len);
                 if (new_len >= 0) {
                     *pkt_len = (uint32_t)new_len;
                     return 0;
@@ -236,7 +238,7 @@ int crypto_decrypt_packet_auto_by_action(
             const struct crypto_policy *cp = &dctx->policies[pi];
             if (cp->nonce_size > 0 && cp->nonce_size == nonce_size) {
                 crypto_apply_from_policy(cp);
-                int new_len = packet_decrypt(&dctx->per_policy_ctx[pi], pkt, *pkt_len);
+                int new_len = crypto_layer4_decrypt(&dctx->per_policy_ctx[pi], pkt, *pkt_len);
                 if (new_len >= 0) {
                     *pkt_len = (uint32_t)new_len;
                     return 0;
@@ -253,7 +255,7 @@ int crypto_decrypt_packet_auto_by_action(
                 const struct crypto_policy *cp_prev = &dctx->prev_policies[ppi];
                 if (cp_prev->nonce_size > 0 && cp_prev->nonce_size == nonce_size) {
                     crypto_apply_from_policy(cp_prev);
-                    int new_len = packet_decrypt(&dctx->prev_per_policy_ctx[ppi], pkt, *pkt_len);
+                    int new_len = crypto_layer4_decrypt(&dctx->prev_per_policy_ctx[ppi], pkt, *pkt_len);
                     if (new_len >= 0) {
                         *pkt_len = (uint32_t)new_len;
                         return 0;
@@ -279,7 +281,13 @@ int crypto_decrypt_packet_auto_by_action(
             memcpy(scratch, pkt, *pkt_len);
 
         crypto_apply_from_policy(cp);
-        int new_len = packet_decrypt(&dctx->per_policy_ctx[pi], pkt, *pkt_len);
+        int new_len = -1;
+        if (action_layer == POLICY_ACTION_ENCRYPT_L2)
+            new_len = crypto_layer2_decrypt(&dctx->per_policy_ctx[pi], pkt, *pkt_len);
+        else if (action_layer == POLICY_ACTION_ENCRYPT_L3)
+            new_len = crypto_layer3_decrypt(&dctx->per_policy_ctx[pi], pkt, *pkt_len);
+        else if (action_layer == POLICY_ACTION_ENCRYPT_L4)
+            new_len = crypto_layer4_decrypt(&dctx->per_policy_ctx[pi], pkt, *pkt_len);
         if (new_len < 0) {
             if (scratch)
                 memcpy(pkt, scratch, *pkt_len);

@@ -1190,7 +1190,11 @@ static void *local_queue_thread_l2(void *arg) {
                         apply_crypto_params_from_policy(cp);
                 }
             } else {
-                drop_unmatched = (fwd->cfg && fwd->cfg->policy_count > 0) ? 1 : 0;
+#if CRYPTO_POLICY_PASS_UNMATCHED
+                drop_unmatched = 0;
+#else
+                drop_unmatched = (flow_ok && fwd->cfg && fwd->cfg->policy_count > 0) ? 1 : 0;
+#endif
                 bypass_crypto = !drop_unmatched;
             }
 
@@ -1819,10 +1823,12 @@ static void *worker_thread(void *arg) {
                             apply_crypto_params_from_policy(cp);
                     }
                 } else {
+#if !CRYPTO_POLICY_PASS_UNMATCHED
                     if (fwd->cfg && fwd->cfg->policy_count > 0) {
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                         goto release_local;
                     }
+#endif
                     bypass_crypto = 1;
                 }
             }
