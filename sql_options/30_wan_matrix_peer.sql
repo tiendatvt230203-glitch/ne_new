@@ -14,7 +14,6 @@ INSERT INTO xdp_configs (id) VALUES (30);
 
 INSERT INTO xdp_local_configs (config_id, ifname) VALUES
 (30, 'eno2'),
-(30, 'eno3'),
 (30, 'enp7s0');
 
 INSERT INTO xdp_wan_configs (config_id, ifname, dst_ip) VALUES
@@ -26,11 +25,6 @@ INSERT INTO xdp_profiles (config_id, profile_name, enabled, description) VALUES
 
 INSERT INTO xdp_profile_locals (profile_id, ifname)
 SELECT p.id, 'eno2'
-FROM xdp_profiles p
-WHERE p.config_id = 30 AND p.profile_name = 'wan_enp4s0_enp5s0_70_30';
-
-INSERT INTO xdp_profile_locals (profile_id, ifname)
-SELECT p.id, 'eno3'
 FROM xdp_profiles p
 WHERE p.config_id = 30 AND p.profile_name = 'wan_enp4s0_enp5s0_70_30';
 
