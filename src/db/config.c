@@ -201,16 +201,6 @@ int config_validate(struct app_config *cfg) {
     return 0;
 }
 
-int config_find_local_for_ip(struct app_config *cfg, uint32_t dest_ip) {
-    for (int i = 0; i < cfg->local_count; i++) {
-        struct local_config *local = &cfg->locals[i];
-        if ((dest_ip & local->netmask) == local->network) {
-            return i;
-        }
-    }
-    return -1;
-}
-
 static int cidr_match_with_negate(int any_flag, int negate,
                                     uint32_t ip, uint32_t net, uint32_t mask) {
     if (any_flag)

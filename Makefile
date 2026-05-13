@@ -13,7 +13,7 @@ KERNEL_HEADERS = /usr/include
 
 BIN_DIR = bin
 
-APP_SRC = main.c src/core/main_diag.c src/core/interface.c src/core/forwarder.c src/core/wan_arp.c src/crypto/crypto_policy_utils.c src/crypto/crypto_dispatch.c src/crypto/packet_crypto.c src/crypto/crypto_layer2.c src/crypto/crypto_layer3.c src/crypto/crypto_layer4.c src/core/flow_table.c src/core/fragment.c
+APP_SRC = main.c src/core/main_diag.c src/core/interface.c src/core/forwarder.c src/crypto/crypto_policy_utils.c src/crypto/crypto_dispatch.c src/crypto/packet_crypto.c src/crypto/crypto_layer2.c src/crypto/crypto_layer3.c src/crypto/crypto_layer4.c src/core/flow_table.c src/core/fragment.c
 APP_OBJ = $(APP_SRC:.c=.o)
 TARGET = $(BIN_DIR)/network-encryptor
 DB_LIB_SRC = src/db/config.c src/db/db_config.c src/db/db_env.c src/db/db_runtime.c

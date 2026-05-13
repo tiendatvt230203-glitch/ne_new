@@ -108,9 +108,6 @@ struct local_config {
 
 struct wan_config {
     char ifname[IF_NAMESIZE];
-    uint32_t dst_ip;      
-    uint8_t src_mac[MAC_LEN];
-    uint8_t dst_mac[MAC_LEN];
     uint32_t window_size;
     uint32_t umem_mb;
     uint32_t ring_size;
@@ -149,7 +146,6 @@ struct app_config {
 int parse_mac(const char *str, uint8_t *mac);
 int parse_ip_cidr_pub(const char *str, uint32_t *ip, uint32_t *netmask, uint32_t *network);
 int parse_hex_bytes_pub(const char *str, uint8_t *out, int expected_len);
-int config_find_local_for_ip(struct app_config *cfg, uint32_t dest_ip);
 int config_validate(struct app_config *cfg);
 int config_select_profile_for_local(const struct app_config *cfg, int local_idx);
 int config_select_profile_for_wan(const struct app_config *cfg, int wan_idx);

@@ -4,7 +4,8 @@
 #include <string.h>
 
 #define L4_TUNNEL_MAGIC    0xA5
-#define L4_FRAG_MAGIC      (L4_TUNNEL_MAGIC | FRAG_FLAG_BIT)
+/* Must differ from L4_TUNNEL_MAGIC to avoid misclassifying normal L4 packets as fragments. */
+#define L4_FRAG_MAGIC      0x5A
 
 #define L4_MAX_FRAME      1514
 

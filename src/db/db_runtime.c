@@ -275,17 +275,8 @@ int build_merged_config(struct app_config *out_cfg, const int *ids, int id_count
             return -1;
     }
 
-    merged.crypto_enabled = (merged.policy_count > 0) ? 1 : 0;
-    if (merged.crypto_enabled) {
-        merged.encrypt_layer = 3;
-        merged.fake_protocol = 99;
-        merged.fake_ethertype_ipv4 = 0x88b5;
-        merged.fake_ethertype_ipv6 = 0x88b6;
-        merged.crypto_mode = merged.policies[0].crypto_mode;
-        merged.aes_bits = merged.policies[0].aes_bits;
-        merged.nonce_size = merged.policies[0].nonce_size;
-        memcpy(merged.crypto_key, merged.policies[0].key, sizeof(merged.crypto_key));
-    }
+    if (app_config_apply_crypto_from_policies(&merged) != 0)
+        return -1;
 
     if (config_validate(&merged) != 0)
         return -1;

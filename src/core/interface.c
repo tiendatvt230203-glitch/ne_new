@@ -592,8 +592,6 @@ int interface_init_wan(struct xsk_interface *iface,
     iface->ifindex = if_nametoindex(wan_cfg->ifname);
     strncpy(iface->ifname, wan_cfg->ifname, IF_NAMESIZE - 1);
     iface->ifname[IF_NAMESIZE - 1] = '\0';
-    memcpy(iface->src_mac, wan_cfg->src_mac, MAC_LEN);
-    memcpy(iface->dst_mac, wan_cfg->dst_mac, MAC_LEN);
 
     if (iface->ifindex == 0) {
         fprintf(stderr, "Interface %s not found\n", wan_cfg->ifname);
@@ -674,9 +672,6 @@ int interface_init_wan_rx(struct xsk_interface *iface,
     iface->ifindex = if_nametoindex(wan_cfg->ifname);
     strncpy(iface->ifname, wan_cfg->ifname, IF_NAMESIZE - 1);
     iface->ifname[IF_NAMESIZE - 1] = '\0';
-    memcpy(iface->src_mac, wan_cfg->src_mac, MAC_LEN);
-    memcpy(iface->dst_mac, wan_cfg->dst_mac, MAC_LEN);
-
     if (iface->ifindex == 0) {
         fprintf(stderr, "WAN Interface %s not found\n", wan_cfg->ifname);
         return -1;

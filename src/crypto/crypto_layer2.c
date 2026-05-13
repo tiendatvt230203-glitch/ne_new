@@ -21,18 +21,6 @@ int verify_ipv4_after_decrypt(const uint8_t *ip_payload, size_t len) {
     return 0;
 }
 
-static inline __attribute__((always_inline))
-int verify_ipv6_after_decrypt(const uint8_t *ip_payload, size_t len) {
-    if (unlikely(len < 40)) return 0;
-    uint8_t next_hdr  = ip_payload[6];
-    uint8_t hop_limit = ip_payload[7];
-    if (unlikely(hop_limit == 0)) return 0;
-    if (next_hdr == 6 || next_hdr == 17 || next_hdr == 58 ||
-        next_hdr == 44 || next_hdr == 43 || next_hdr == 0 || next_hdr == 60)
-        return 1;
-    return 0;
-}
-
 int crypto_layer2_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len) {
     if (unlikely(!ctx || !ctx->initialized || !packet || pkt_len < MIN_ETH_PKT)) return -1;
 
@@ -44,15 +32,11 @@ int crypto_layer2_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
     uint8_t proto_flag;
     uint16_t fake_etype;
 
-    if (likely(ether_type == 0x0800)) {
-        proto_flag = PROTO_FLAG_IPV4;
-        fake_etype = packet_crypto_get_fake_ethertype_ipv4();
-    }
-    else if (ether_type == 0x86DD) {
-        proto_flag = PROTO_FLAG_IPV6;
-        fake_etype = packet_crypto_get_fake_ethertype_ipv6();
-    }
-    else return (int)pkt_len;
+    if (unlikely(ether_type != 0x0800))
+        return (int)pkt_len;
+
+    proto_flag = PROTO_FLAG_IPV4;
+    fake_etype = packet_crypto_get_fake_ethertype_ipv4();
 
     if (unlikely(fake_etype == 0)) return (int)pkt_len;
 
@@ -98,18 +82,17 @@ int crypto_layer2_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
     if (unlikely(pkt_len < (size_t)l2_enc_start)) return -1;
 
     const uint16_t fake_ipv4 = packet_crypto_get_fake_ethertype_ipv4();
-    const uint16_t fake_ipv6 = packet_crypto_get_fake_ethertype_ipv6();
     const uint8_t pkt_marker = packet[12];
 
-    if (!((fake_ipv4 && pkt_marker == (uint8_t)(fake_ipv4 >> 8)) ||
-          (fake_ipv6 && pkt_marker == (uint8_t)(fake_ipv6 >> 8)))) return (int)pkt_len;
+    if (!(fake_ipv4 && pkt_marker == (uint8_t)(fake_ipv4 >> 8)))
+        return (int)pkt_len;
 
     uint8_t policy_id;
     uint8_t proto_flag;
     uint8_t nonce[16];
     crypto_read_counter(packet, nonce_size, nonce, &policy_id, &proto_flag);
     (void)policy_id;
-    const int is_ipv4 = (proto_flag == PROTO_FLAG_IPV4);
+    (void)proto_flag;
     const int is_gcm = (packet_crypto_get_mode() == CRYPTO_MODE_GCM);
 
     const int nonce_len = is_gcm ? nonce_size : AES128_IV_SIZE;
@@ -134,26 +117,23 @@ int crypto_layer2_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
         uint8_t iv[AES128_IV_SIZE];
         crypto_nonce_to_iv(nonce, nonce_size, iv);
         if (likely(crypto_aes_ctr_with_key(key, iv, work_ptr, (int)enc_len) == 0)) {
-            if (likely(is_ipv4 ? verify_ipv4_after_decrypt(work_ptr, enc_len)
-                               : verify_ipv6_after_decrypt(work_ptr, enc_len))) {
+            if (likely(verify_ipv4_after_decrypt(work_ptr, enc_len)))
                 goto decrypt_success;
-            }
         }
     }
     return -1;
 
 decrypt_success:
     {
-        int has_ethertype = (work_ptr[0] == 0x08 && work_ptr[1] == 0x00) ||
-                            (work_ptr[0] == 0x86 && work_ptr[1] == 0xDD);
+        int has_ethertype = (work_ptr[0] == 0x08 && work_ptr[1] == 0x00);
         if (has_ethertype) {
             packet[12] = work_ptr[0];
             packet[13] = work_ptr[1];
             memmove(packet + ETH_HEADER_SIZE, work_ptr + 2, enc_len - 2);
             return (int)(ETH_HEADER_SIZE + enc_len - 2);
         } else {
-            packet[12] = is_ipv4 ? 0x08 : 0x86;
-            packet[13] = is_ipv4 ? 0x00 : 0xDD;
+            packet[12] = 0x08;
+            packet[13] = 0x00;
             memmove(packet + ETH_HEADER_SIZE, work_ptr, enc_len);
             return (int)(ETH_HEADER_SIZE + enc_len);
         }

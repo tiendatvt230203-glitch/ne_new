@@ -173,26 +173,14 @@ static void log_crypto_policies_human(struct app_config *cfg, int config_id) {
     }
 }
 
-static void log_wan_l2_resolution_plan(struct app_config *cfg) {
-    if (!cfg) return;
-    for (int i = 0; i < cfg->wan_count; i++) {
-        struct wan_config *w = &cfg->wans[i];
-        char ipbuf[INET_ADDRSTRLEN] = {0};
-        if (w->dst_ip)
-            inet_ntop(AF_INET, &(struct in_addr){ .s_addr = w->dst_ip }, ipbuf, sizeof(ipbuf));
-        else
-            strncpy(ipbuf, "(none)", sizeof(ipbuf) - 1);
-        int mac_zero = !(w->dst_mac[0] | w->dst_mac[1] | w->dst_mac[2] |
-                         w->dst_mac[3] | w->dst_mac[4] | w->dst_mac[5]);
-        fprintf(stderr,
-                "[WAN CFG] if=%s peer_next_hop=%s dst_mac_from_db=%02x:%02x:%02x:%02x:%02x:%02x%s\n",
-                w->ifname,
-                ipbuf,
-                w->dst_mac[0], w->dst_mac[1], w->dst_mac[2],
-                w->dst_mac[3], w->dst_mac[4], w->dst_mac[5],
-                mac_zero ? " (zeros OK: MAC filled via ARP — watch [WAN ARP] after start)"
-                         : "");
-    }
+static void log_local_peer_mac_hint(struct app_config *cfg) {
+    if (!cfg || cfg->local_count <= 0)
+        return;
+    fprintf(stderr,
+            "[LOCAL CFG] locals from DB:");
+    for (int i = 0; i < cfg->local_count; i++)
+        fprintf(stderr, " %s", cfg->locals[i].ifname);
+    fprintf(stderr, " — peer MAC from kernel neigh/fdb or NE_LOCAL_MAC_PRELOAD.\n");
 }
 
 void main_diag_log_loaded_config(struct app_config *cfg, int config_id) {
@@ -212,5 +200,5 @@ void main_diag_log_loaded_config(struct app_config *cfg, int config_id) {
             cfg->profile_count,
             cfg->policy_count);
     log_crypto_policies_human(cfg, config_id);
-    log_wan_l2_resolution_plan(cfg);
+    log_local_peer_mac_hint(cfg);
 }

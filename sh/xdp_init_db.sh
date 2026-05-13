@@ -43,4 +43,5 @@ createdb -h "${DB_HOST}" -p "${DB_PORT}" -U "${DB_USER}" "${DB_NAME}"
 echo "[3/3] psql -f ${SCHEMA_FILE}"
 psql -h "${DB_HOST}" -p "${DB_PORT}" -U "${DB_USER}" -d "${DB_NAME}" -v ON_ERROR_STOP=1 -f "${SCHEMA_FILE}"
 
-echo "OK: ${DB_NAME} ready. Load test data: sh/xdp_load_option.sh <id> or sh/xdp_load_all_options.sh"
+echo "OK: ${DB_NAME} ready (xdp_local_configs / xdp_wan_configs: ifname only; MAC/IP peer qua runtime)."
+echo "Load options: sh/xdp_load_option.sh <id> or sh/xdp_load_all_options.sh"

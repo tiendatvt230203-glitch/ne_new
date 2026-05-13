@@ -75,19 +75,14 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
         goto redirect;
     }
 
+    /* IPv4-only userspace path: let native IPv6 pass the stack (no AF_XDP redirect). */
     if (proto == __constant_htons(ETH_P_IPV6))
-        goto redirect;
+        return XDP_PASS;
 
-
-    int key0 = 0, key1 = 1;
+    int key0 = 0;
     __u16 *fake4 = bpf_map_lookup_elem(&wan_config_map, &key0);
     if (fake4 && *fake4 != 0 &&
         (proto & __constant_htons(0xFF00)) == (*fake4 & __constant_htons(0xFF00)))
-        goto redirect;
-
-    __u16 *fake6 = bpf_map_lookup_elem(&wan_config_map, &key1);
-    if (fake6 && *fake6 != 0 &&
-        (proto & __constant_htons(0xFF00)) == (*fake6 & __constant_htons(0xFF00)))
         goto redirect;
 
     inc_stat(STAT_NON_IP);

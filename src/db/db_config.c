@@ -3,7 +3,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
-#include <arpa/inet.h>
 #include <libpq-fe.h>
 #include <strings.h>
 
@@ -31,22 +30,6 @@ static int parse_port_range(const char *v, int *from_out, int *to_out) {
         return 0;
     }
     return -1;
-}
-
-static int parse_ipv4_addr(const char *v, uint32_t *out_ip) {
-    if (!v || !out_ip || v[0] == '\0')
-        return -1;
-    char buf[64];
-    strncpy(buf, v, sizeof(buf) - 1);
-    buf[sizeof(buf) - 1] = '\0';
-    char *slash = strchr(buf, '/');
-    if (slash)
-        *slash = '\0';
-    struct in_addr a;
-    if (inet_pton(AF_INET, buf, &a) != 1)
-        return -1;
-    *out_ip = a.s_addr;
-    return 0;
 }
 
 static uint8_t parse_protocol_name(const char *v) {
@@ -221,8 +204,9 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
         1, NULL, params, NULL, NULL, 0);
 
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        fprintf(stderr, "[DB] xdp_profiles query failed: %s\n", PQresultErrorMessage(res));
         PQclear(res);
-        return 0;
+        return -1;
     }
 
     int col_id = PQfnumber(res, "id");
@@ -259,7 +243,13 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
         res = PQexecParams(conn,
             "SELECT ifname FROM xdp_profile_locals WHERE profile_id = $1 ORDER BY id",
             1, NULL, pp, NULL, NULL, 0);
-        if (PQresultStatus(res) == PGRES_TUPLES_OK) {
+        if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+            fprintf(stderr, "[DB] profile \"%s\" xdp_profile_locals query failed: %s\n",
+                    p->name, PQresultErrorMessage(res));
+            PQclear(res);
+            return -1;
+        }
+        {
             int rows = PQntuples(res);
             for (int r = 0; r < rows && p->local_count < MAX_PROFILE_INTERFACES; r++) {
                 const char *ifname = PQgetvalue(res, r, 0);
@@ -272,6 +262,12 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
         res = PQexecParams(conn,
             "SELECT ifname, bandwidth_weight_percent FROM xdp_profile_wans WHERE profile_id = $1 ORDER BY id",
             1, NULL, pp, NULL, NULL, 0);
+        if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+            fprintf(stderr, "[DB] profile \"%s\" xdp_profile_wans query failed: %s\n",
+                    p->name, PQresultErrorMessage(res));
+            PQclear(res);
+            return -1;
+        }
         profile_append_wans_from_rows(cfg, p, res);
         PQclear(res);
 
@@ -281,7 +277,13 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
             "FROM xdp_profile_crypto_policies WHERE profile_id = $1 "
             "ORDER BY priority ASC, id ASC",
             1, NULL, pp, NULL, NULL, 0);
-        if (PQresultStatus(res) == PGRES_TUPLES_OK) {
+        if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+            fprintf(stderr, "[DB] profile \"%s\" xdp_profile_crypto_policies query failed: %s\n",
+                    p->name, PQresultErrorMessage(res));
+            PQclear(res);
+            return -1;
+        }
+        {
             int rows = PQntuples(res);
             for (int r = 0; r < rows; r++) {
                 struct crypto_policy cp_base;
@@ -348,7 +350,7 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
                 int match_rows = 0;
                 if (PQresultStatus(mres) != PGRES_TUPLES_OK) {
                     fprintf(stderr,
-                            "[DB CRYPTO] policy id=%d failed to read xdp_profile_crypto_policy_matches: %s",
+                            "[DB CRYPTO] policy id=%d failed to read xdp_profile_crypto_policy_matches: %s\n",
                             cp_base.id,
                             PQresultErrorMessage(mres));
                     PQclear(mres);
@@ -472,13 +474,6 @@ static int load_local_rows(struct app_config *cfg, PGresult *res)
         }
         strncpy(loc->ifname, v, IF_NAMESIZE - 1);
 
-        if (local_config_fill_ipv4_from_iface(loc) != 0) {
-            fprintf(stderr,
-                    "[DB LOCAL] %s: cannot read IPv4 from kernel (assign IP on interface or fix name).\n",
-                    loc->ifname);
-            return -1;
-        }
-
         cfg->local_count++;
     }
     return 0;
@@ -515,34 +510,6 @@ static int load_wan_rows(struct app_config *cfg, PGresult *res)
             return -1;
         }
         strncpy(wan->ifname, v, IF_NAMESIZE - 1);
-
-        int dst_ip_col = PQfnumber(res, "dst_ip");
-        if (dst_ip_col >= 0) {
-            v = PQgetvalue(res, row, dst_ip_col);
-            if (v && v[0] != '\0' && parse_ipv4_addr(v, &wan->dst_ip) != 0) {
-                fprintf(stderr, "[DB WAN] Invalid dst_ip: %s\n", v);
-                return -1;
-            }
-        }
-
-
-        int src_mac_col = PQfnumber(res, "src_mac");
-        int dst_mac_col = PQfnumber(res, "dst_mac");
-        if (src_mac_col >= 0) {
-            v = PQgetvalue(res, row, src_mac_col);
-            if (v && v[0] != '\0' && parse_mac(v, wan->src_mac) != 0) {
-                fprintf(stderr, "[DB WAN] Invalid src_mac: %s\n", v);
-                return -1;
-            }
-        }
-        if (dst_mac_col >= 0) {
-            v = PQgetvalue(res, row, dst_mac_col);
-            if (v && v[0] != '\0' && parse_mac(v, wan->dst_mac) != 0) {
-                fprintf(stderr, "[DB WAN] Invalid dst_mac: %s\n", v);
-                return -1;
-            }
-        }
-
 
         cfg->wan_count++;
     }
@@ -605,24 +572,8 @@ static int db_load_wan_configs(PGconn *conn, struct app_config *cfg, int config_
     const char *params[1] = { id_str };
 
     PGresult *res = PQexecParams(conn,
-        "SELECT ifname, dst_ip "
-        "FROM xdp_wan_configs WHERE config_id = $1 ORDER BY id",
+        "SELECT ifname FROM xdp_wan_configs WHERE config_id = $1 ORDER BY id",
         1, NULL, params, NULL, NULL, 0);
-
-    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-        PQclear(res);
-        res = PQexecParams(conn,
-            "SELECT ifname, dst_ip, src_mac, dst_mac "
-            "FROM xdp_wan_configs WHERE config_id = $1 ORDER BY id",
-            1, NULL, params, NULL, NULL, 0);
-    }
-
-    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-        PQclear(res);
-        res = PQexecParams(conn,
-            "SELECT ifname FROM xdp_wan_configs WHERE config_id = $1 ORDER BY id",
-            1, NULL, params, NULL, NULL, 0);
-    }
 
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
         fprintf(stderr, "[DB] Query xdp_wan_configs failed: %s\n", PQresultErrorMessage(res));
@@ -638,7 +589,7 @@ static int db_load_wan_configs(PGconn *conn, struct app_config *cfg, int config_
     return 0;
 }
 
-static int apply_crypto_derived_from_policies(struct app_config *cfg)
+int app_config_apply_crypto_from_policies(struct app_config *cfg)
 {
     cfg->crypto_enabled = 0;
     cfg->encrypt_layer = 0;
@@ -698,7 +649,7 @@ static int apply_crypto_derived_from_policies(struct app_config *cfg)
     }
     if (has_l2) {
         cfg->fake_ethertype_ipv4 = 0x88b5;
-        cfg->fake_ethertype_ipv6 = 0x88b6;
+        cfg->fake_ethertype_ipv6 = 0;
     }
 
     return 0;
@@ -764,7 +715,7 @@ int config_load_from_db(struct app_config *cfg, int config_id, const char *conn_
 
     PQfinish(conn);
 
-    if (apply_crypto_derived_from_policies(cfg) != 0)
+    if (app_config_apply_crypto_from_policies(cfg) != 0)
         return -1;
 
     return config_validate(cfg);

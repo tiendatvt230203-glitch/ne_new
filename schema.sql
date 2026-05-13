@@ -11,8 +11,7 @@ CREATE TABLE IF NOT EXISTS xdp_local_configs (
 CREATE TABLE IF NOT EXISTS xdp_wan_configs (
     id SERIAL PRIMARY KEY,
     config_id INT NOT NULL REFERENCES xdp_configs(id) ON DELETE CASCADE,
-    ifname VARCHAR(32) NOT NULL,
-    dst_ip VARCHAR(32) NOT NULL DEFAULT ''
+    ifname VARCHAR(32) NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS xdp_profiles (
@@ -109,10 +108,14 @@ ALTER TABLE xdp_configs DROP COLUMN IF EXISTS nonce_size;
 ALTER TABLE xdp_local_configs DROP COLUMN IF EXISTS network;
 ALTER TABLE xdp_local_configs DROP COLUMN IF EXISTS ingress_mbps;
 
-ALTER TABLE xdp_wan_configs ADD COLUMN IF NOT EXISTS dst_ip VARCHAR(32) NOT NULL DEFAULT '';
+ALTER TABLE xdp_wan_configs DROP COLUMN IF EXISTS dst_ip;
 ALTER TABLE xdp_wan_configs DROP COLUMN IF EXISTS window_size_kb;
 ALTER TABLE xdp_wan_configs DROP COLUMN IF EXISTS src_ip;
 ALTER TABLE xdp_wan_configs DROP COLUMN IF EXISTS next_hop_ip;
+ALTER TABLE xdp_wan_configs DROP COLUMN IF EXISTS src_mac;
+ALTER TABLE xdp_wan_configs DROP COLUMN IF EXISTS dst_mac;
+
+ALTER TABLE xdp_local_configs DROP COLUMN IF EXISTS dst_mac;
 
 ALTER TABLE xdp_profile_wans
     ADD COLUMN IF NOT EXISTS bandwidth_weight_percent INTEGER NOT NULL DEFAULT 0;

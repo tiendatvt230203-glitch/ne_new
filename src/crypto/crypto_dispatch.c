@@ -50,21 +50,14 @@ int crypto_l3_extract_policy_id(uint8_t *pkt, uint32_t pkt_len, uint8_t *policy_
     int nonce_size = packet_crypto_get_nonce_size();
     int tunnel_hdr_size = packet_crypto_get_tunnel_hdr_size();
 
-    if (ether_type == 0x0800) {
-        l3_off = 14;
-        ip_hdr_len = (pkt[l3_off] & 0x0F) * 4;
-        if (ip_hdr_len < 20 || pkt_len < (uint32_t)(l3_off + ip_hdr_len + 1))
-            return -1;
-        proto = pkt[l3_off + 9];
-    } else if (ether_type == 0x86DD) {
-        l3_off = 14;
-        ip_hdr_len = 40;
-        if (pkt_len < (uint32_t)(l3_off + ip_hdr_len + 1))
-            return -1;
-        proto = pkt[l3_off + 6];
-    } else {
+    if (ether_type != 0x0800)
         return -1;
-    }
+
+    l3_off = 14;
+    ip_hdr_len = (pkt[l3_off] & 0x0F) * 4;
+    if (ip_hdr_len < 20 || pkt_len < (uint32_t)(l3_off + ip_hdr_len + 1))
+        return -1;
+    proto = pkt[l3_off + 9];
 
     if (proto != marker)
         return -1;
@@ -220,6 +213,7 @@ int crypto_decrypt_packet_auto_by_action(
             return 0;
 
         int transport_off = l3_off + ip_hdr_len;
+        int has_payload = 0;
 
         int tcp_hdr_len = 0;
         if (ip_proto == 6) {
@@ -228,13 +222,23 @@ int crypto_decrypt_packet_auto_by_action(
             tcp_hdr_len = ((pkt[transport_off + 12] >> 4) & 0x0F) * 4;
             if (tcp_hdr_len < 20)
                 return 0;
+            has_payload = (*pkt_len > (uint32_t)(transport_off + tcp_hdr_len));
+        } else if (ip_proto == 17) {
+            has_payload = (*pkt_len > (uint32_t)(transport_off + 8));
         }
 
 
         uint8_t policy_id = 0;
         int nonce_size = 0;
-        if (crypto_l4_extract_policy_id_ipv4(pkt, *pkt_len, &policy_id, &nonce_size) != 0)
+        if (crypto_l4_extract_policy_id_ipv4(pkt, *pkt_len, &policy_id, &nonce_size) != 0) {
+            /*
+             * L4 policy expects payload packets to carry tunnel header.
+             * Keep clear pass-through only for no-payload TCP/UDP control packets.
+             */
+            if (has_payload)
+                return -1;
             return 0;
+        }
         int pi = lookup_policy_index(dctx,
                                      dctx->policies, dctx->policy_count,
                                      dctx->policy_index_by_action_id,
@@ -244,7 +248,8 @@ int crypto_decrypt_packet_auto_by_action(
             if (cp->nonce_size > 0 && cp->nonce_size == nonce_size) {
                 crypto_apply_from_policy(cp);
                 int new_len = crypto_layer4_decrypt(&dctx->per_policy_ctx[pi], pkt, *pkt_len);
-                if (new_len >= 0) {
+                /* True L4 decrypt must remove tunnel overhead; unchanged len is passthrough. */
+                if (new_len >= 0 && new_len < (int)*pkt_len) {
                     *pkt_len = (uint32_t)new_len;
                     return 0;
                 }
@@ -261,7 +266,7 @@ int crypto_decrypt_packet_auto_by_action(
                 if (cp_prev->nonce_size > 0 && cp_prev->nonce_size == nonce_size) {
                     crypto_apply_from_policy(cp_prev);
                     int new_len = crypto_layer4_decrypt(&dctx->prev_per_policy_ctx[ppi], pkt, *pkt_len);
-                    if (new_len >= 0) {
+                    if (new_len >= 0 && new_len < (int)*pkt_len) {
                         *pkt_len = (uint32_t)new_len;
                         return 0;
                     }

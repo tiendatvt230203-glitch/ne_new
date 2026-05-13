@@ -76,7 +76,12 @@ BEGIN
         SELECT COUNT(*)::int INTO wan_cnt FROM xdp_wan_configs WHERE config_id = ${CONFIG_ID};
 
         INSERT INTO xdp_profile_wans (profile_id, ifname, bandwidth_weight_percent)
-        SELECT p.id, w.ifname, CASE WHEN wan_cnt = 1 THEN 100 ELSE 0 END
+        SELECT p.id, w.ifname,
+               CASE
+                 WHEN wan_cnt <= 0 THEN 0
+                 WHEN wan_cnt = 1 THEN 100
+                 ELSE (100 / wan_cnt)
+               END
         FROM xdp_profiles p
         CROSS JOIN xdp_wan_configs w
         WHERE p.config_id = ${CONFIG_ID}

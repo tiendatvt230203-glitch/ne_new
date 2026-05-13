@@ -176,6 +176,11 @@ int xdp_redirect_prog(struct xdp_md *ctx)
         return XDP_PASS;
     }
 
+    if (eth->h_proto == bpf_htons(ETH_P_IPV6)) {
+        inc_stat(1);
+        return XDP_PASS;
+    }
+
     __u32 src_ip, dst_ip;
     __u8 l4_proto = 0;
     if (parse_ipv4(data, data_end, &src_ip, &dst_ip, &l4_proto) < 0) {
