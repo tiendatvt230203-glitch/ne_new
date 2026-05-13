@@ -29,21 +29,10 @@
 #define MAX_CRYPTO_POLICIES 128
 #define POLICY_PROTO_ANY 0
 
-/*
- * When 1: crypto policy match and selection use src/dst IP only (CIDR rows in
- * xdp_profile_crypto_policy_matches). Port ranges in the DB are ignored for
- * matching; keep src_port and dst_port as ANY so the schema matches runtime.
- * Layer (bypass / L2 / L3 / L4) and keys come from the winning policy row for
- * that IP pair. Set to 0 to restore port + protocol filtering.
- */
 #ifndef CRYPTO_POLICY_MATCH_IP_ONLY
-#define CRYPTO_POLICY_MATCH_IP_ONLY 1
+#define CRYPTO_POLICY_MATCH_IP_ONLY 0
 #endif
 
-/*
- * When 1: flows that match no policy row are still forwarded to WAN (cleartext).
- * When 0: those packets are dropped whenever policy_count > 0 (strict matrix).
- */
 #ifndef CRYPTO_POLICY_PASS_UNMATCHED
 #define CRYPTO_POLICY_PASS_UNMATCHED 1
 #endif
