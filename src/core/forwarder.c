@@ -646,9 +646,9 @@ static int select_wan_idx_for_packet(struct forwarder *fwd,
                     int wi = p->wan_indices[i];
                     if (wi < 0 || wi >= fwd->cfg->wan_count)
                         continue;
-                    allowed[n] = wi;
                     if (any_weight && p->wan_bandwidth_weight[i] <= 0)
                         continue;
+                    allowed[n] = wi;
                     weights[n] = p->wan_bandwidth_weight[i];
                     n++;
                 }
@@ -845,6 +845,7 @@ static void learn_local_src_mac(int local_idx, const uint8_t *pkt, uint32_t pkt_
 static int local_idx_from_dst_mac(struct forwarder *fwd, const uint8_t *pkt, uint32_t pkt_len) {
     if (!fwd || !pkt || pkt_len < sizeof(struct ether_header))
         return -1;
+    /* Match inner ether_dhost to peer MAC seeded at startup (or learned from local RX src). */
     int local_idx = local_mac_lookup(pkt);
     if (local_idx < 0 || local_idx >= fwd->local_count)
         return -1;
@@ -1013,8 +1014,9 @@ static int peer_mac_from_kernel(const char *ifname, uint8_t mac_out[MAC_LEN]) {
         if (r == 0)
             return 0;
         if (r == -2) {
-            fprintf(stderr, "[FATAL][LOCAL-MAC] %s ip neigh multiple lladdr\n", ifname);
-            return -1;
+            fprintf(stderr,
+                    "[LOCAL-MAC][WARN] %s: ip neigh has multiple lladdr; trying bridge fdb\n",
+                    ifname);
         }
     }
 
@@ -1392,6 +1394,14 @@ static int parse_flow(void *pkt_data, uint32_t pkt_len,
     int ip_hdr_len = ip->ihl * 4;
     if (ip_hdr_len < 20)
         return -1;
+
+    uint16_t frag_word = ntohs(ip->frag_off);
+    if (frag_word & (uint16_t)(IP_MF | IP_OFFMASK)) {
+        *src_port = ntohs(ip->id);
+        *dst_port = 0;
+        return 0;
+    }
+
     uint8_t *transport = pkt + l3_off + ip_hdr_len;
 
     if (ip->protocol == IPPROTO_TCP) {
