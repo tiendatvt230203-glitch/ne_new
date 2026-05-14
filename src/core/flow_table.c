@@ -98,7 +98,6 @@ void flow_table_cleanup(struct flow_table *ft) {
 }
 
 static int next_wan = 0;
-static uint32_t g_profile_weighted_tick;
 
 static int get_next_wan(int wan_count) {
     if (wan_count <= 0)
@@ -179,14 +178,6 @@ int flow_table_get_wan(struct flow_table *ft,
     return wan_idx;
 }
 
-static int wan_allowed_pos(int wan_idx, const int *allowed_wans, int allowed_count) {
-    for (int i = 0; i < allowed_count; i++) {
-        if (allowed_wans[i] == wan_idx)
-            return i;
-    }
-    return -1;
-}
-
 static int weights_sum_positive(const int *allowed_weights, int allowed_count) {
     if (!allowed_weights || allowed_count <= 0)
         return 0;
@@ -213,6 +204,68 @@ static int wrr_slot_to_wan(int slot, const int *allowed_wans, const int *allowed
             return allowed_wans[i];
     }
     return allowed_wans[allowed_count - 1];
+}
+
+static uint32_t profile_wan_stripe_limit(const struct flow_table *ft, int current_wan) {
+    const char *ev = getenv("NE_WAN_STRIPE_BYTES");
+    if (ev && ev[0]) {
+        unsigned long v = strtoul(ev, NULL, 10);
+        if (v > 0UL && v <= (unsigned long)UINT32_MAX)
+            return (uint32_t)v;
+    }
+    if (!ft || current_wan < 0 || current_wan >= ft->wan_count)
+        return 0;
+    return ft->wan_window_sizes[current_wan];
+}
+
+static uint32_t profile_stripe_cycle_bytes(void) {
+    const char *cy = getenv("NE_WAN_STRIPE_CYCLE_BYTES");
+    if (cy && cy[0]) {
+        unsigned long v = strtoul(cy, NULL, 10);
+        if (v > 0UL && v <= (unsigned long)UINT32_MAX)
+            return (uint32_t)v;
+    }
+#if NE_DEFAULT_WAN_STRIPE_CYCLE_BYTES > 0
+    {
+        long def = (long)NE_DEFAULT_WAN_STRIPE_CYCLE_BYTES;
+        if (def > 0 && def <= (long)UINT32_MAX)
+            return (uint32_t)def;
+    }
+#endif
+    return 0;
+}
+
+static uint32_t profile_stripe_cap_for_wan(const struct flow_table *ft, int current_wan,
+                                           const int *allowed_wans, int allowed_count,
+                                           const int *allowed_weights) {
+    uint32_t cycle = profile_stripe_cycle_bytes();
+    int sumw = weights_sum_positive(allowed_weights, allowed_count);
+    if (cycle > 0U && sumw > 0 && allowed_weights && allowed_wans && allowed_count > 0) {
+        int wcur = 0;
+        for (int i = 0; i < allowed_count; i++) {
+            if (allowed_wans[i] == current_wan) {
+                wcur = allowed_weights[i];
+                break;
+            }
+        }
+        if (wcur <= 0)
+            wcur = 1;
+        uint64_t cap = (uint64_t)cycle * (uint64_t)wcur / (uint64_t)sumw;
+        if (cap < 1ULL)
+            cap = 1ULL;
+        if (cap > (uint64_t)UINT32_MAX)
+            return UINT32_MAX;
+        return (uint32_t)cap;
+    }
+    return profile_wan_stripe_limit(ft, current_wan);
+}
+
+static int wan_allowed_pos(int wan_idx, const int *allowed_wans, int allowed_count) {
+    for (int i = 0; i < allowed_count; i++) {
+        if (allowed_wans[i] == wan_idx)
+            return i;
+    }
+    return -1;
 }
 
 int flow_table_get_wan_profile(struct flow_table *ft,
@@ -253,12 +306,11 @@ int flow_table_get_wan_profile(struct flow_table *ft,
             entry->last_seen = now;
             entry->byte_count += pkt_len;
 
-            uint32_t cur_limit = 0;
-            if (entry->current_wan >= 0 && entry->current_wan < ft->wan_count)
-                cur_limit = ft->wan_window_sizes[entry->current_wan];
-
+            uint32_t cur_limit = profile_stripe_cap_for_wan(ft, entry->current_wan,
+                                                            allowed_wans, allowed_count,
+                                                            allowed_weights);
             int sumw = weights_sum_positive(allowed_weights, allowed_count);
-            if (!flow_entry_tcp_stick_one_wan(entry) && cur_limit > 0 && entry->byte_count >= cur_limit) {
+            if (cur_limit > 0 && entry->byte_count >= cur_limit) {
                 entry->byte_count = 0;
                 if (sumw > 0 && allowed_weights) {
                     entry->wrr_slot = (entry->wrr_slot + 1) % sumw;
@@ -298,8 +350,8 @@ int flow_table_get_wan_profile(struct flow_table *ft,
 
     int sumw = weights_sum_positive(allowed_weights, allowed_count);
     if (sumw > 0 && allowed_weights) {
-        uint32_t tick = __sync_fetch_and_add(&g_profile_weighted_tick, 1);
-        entry->wrr_slot = (int)(tick % (uint32_t)sumw);
+        uint32_t h = flow_hash(src_ip, dst_ip, src_port, dst_port, protocol);
+        entry->wrr_slot = (int)(h % (uint32_t)sumw);
         entry->current_wan = wrr_slot_to_wan(entry->wrr_slot, allowed_wans, allowed_weights,
                                              allowed_count, sumw);
     } else {

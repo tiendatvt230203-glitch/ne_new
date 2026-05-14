@@ -20,6 +20,13 @@
 #define DEFAULT_RING_SIZE       262144
 #define DEFAULT_RING_SIZE_WAN   32768
 #define WAN_REORDER_WINDOW_KB   10240
+/* Profile multi-WAN stripe: total bytes per weight cycle (cap WAN_i = cycle * weight_i / sum(weights)).
+ * Env NE_WAN_STRIPE_CYCLE_BYTES overrides this when set. Set non-zero here to fix the milestone in
+ * source without env (e.g. 10240 = 10 KiB per cycle). Default 0 = only env or fall back to
+ * NE_WAN_STRIPE_BYTES / wan windows until you set a non-zero value here. */
+#ifndef NE_DEFAULT_WAN_STRIPE_CYCLE_BYTES
+#define NE_DEFAULT_WAN_STRIPE_CYCLE_BYTES 0
+#endif
 /* NIC RX is forced to one queue (ethtool); that queue is always index 0. AF_XDP/XDP use it only. */
 #define FORWARDER_XSK_QUEUE_ID      0
 #define FORWARDER_XSK_QUEUE_COUNT   1
