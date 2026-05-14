@@ -2,7 +2,19 @@ CC = gcc
 CLANG = clang
 AR = ar
 
+# libs/lib is copied from the build host. Those .so files need libc as new as
+# the host that produced them — not newer than each deploy machine. If a device
+# errors with GLIBC_2.xx not found, rebuild on the oldest Ubuntu you deploy to
+# (or a VM/chroot matching that device), then copy bin/ + libs/ from there.
+#
+# Ubuntu 22.04 targets: `make build-on-2204` builds in ubuntu:22.04 (Docker) and
+# copies bin/ + libs/ here — use that when your PC is newer than jammy.
 LIBS_ROOT := $(abspath libs)
+
+DOCKERFILE_2204 := $(CURDIR)/docker/Dockerfile.ubuntu-22.04
+DOCKER_TAG_2204 ?= network-encryptor:ubuntu-22.04-build
+# e.g. Apple Silicon → amd64 NE: make build-on-2204 DOCKER_PLATFORM=--platform=linux/amd64
+DOCKER_PLATFORM ?=
 
 ifeq ($(SKIP_LIBS),1)
 LIB_PREREQ :=
@@ -37,7 +49,7 @@ BPF_OBJ = bpf/xdp_redirect.o bpf/xdp_wan_redirect.o
 
 MAKEFLAGS += --no-print-directory
 
-.PHONY: all libs-clean clean run dirs
+.PHONY: all libs-clean libs-glibc-report build-on-2204 clean run dirs
 
 all: $(LIB_PREREQ) dirs $(BPF_OBJ) $(DB_LIB) $(TARGET)
 
@@ -47,6 +59,25 @@ $(LIBS_ROOT)/.ready:
 
 libs-clean:
 	rm -rf "$(LIBS_ROOT)/include" "$(LIBS_ROOT)/lib" "$(LIBS_ROOT)/.ready"
+
+# Compare host libc vs symbols bundled libxdp needs (max GLIBC_* must be <= target).
+libs-glibc-report:
+	@echo "Host libc: $$(getconf GNU_LIBC_VERSION 2>/dev/null || ldd --version 2>&1 | sed -n '1p')"
+	@test -f "$(LIBS_ROOT)/lib/libxdp.so.1" || (echo "No bundled lib yet; run make first." >&2; exit 1)
+	@echo "GLIBC_* referenced by bundled libxdp.so.1 (highest must exist on deploy box):" && strings "$(LIBS_ROOT)/lib/libxdp.so.1" | grep '^GLIBC_' | sort -uV
+
+# Build inside ubuntu:22.04; copies bin/network-encryptor + libs/ into this tree.
+build-on-2204:
+	@test -f "$(DOCKERFILE_2204)" || (echo "[FATAL] missing $(DOCKERFILE_2204)" >&2; exit 1)
+	@command -v docker >/dev/null 2>&1 || (echo "[FATAL] install docker.io (or Docker Engine)" >&2; exit 1)
+	docker build $(DOCKER_PLATFORM) -f "$(DOCKERFILE_2204)" -t "$(DOCKER_TAG_2204)" "$(CURDIR)"
+	docker run --rm -v "$(CURDIR):/host:rw" "$(DOCKER_TAG_2204)" sh -ec '\
+	  install -d /host/bin /host/libs; \
+	  cp -a /build/bin/network-encryptor /host/bin/; \
+	  rm -rf /host/libs/include /host/libs/lib /host/libs/.ready; \
+	  mkdir -p /host/libs; \
+	  test -d /build/libs/lib && cp -a /build/libs/include /build/libs/lib /build/libs/.ready /host/libs/; \
+	  echo "Wrote bin/network-encryptor and libs/ (Ubuntu 22.04 / jammy glibc)."'
 
 dirs:
 	@mkdir -p $(BIN_DIR) $(OBJ_DIR)

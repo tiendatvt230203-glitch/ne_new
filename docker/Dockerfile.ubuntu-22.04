@@ -1,0 +1,20 @@
+# Reproducible build matching Ubuntu 22.04 (glibc 2.35) for deploy to 22.04 devices.
+FROM ubuntu:22.04
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    build-essential \
+    clang \
+    llvm \
+    file \
+    pkg-config \
+    libbpf-dev \
+    libxdp-dev \
+    libssl-dev \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY . .
+RUN make clean && make -j"$(nproc)"
