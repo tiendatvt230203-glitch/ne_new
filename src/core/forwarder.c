@@ -1658,6 +1658,25 @@ static int parse_flow(void *pkt_data, uint32_t pkt_len,
     return 0;
 }
 
+#define NE_WAN_NONIP_DIST_PROTO 253
+
+static uint32_t pkt_l2_sig(const uint8_t *p, uint32_t len) {
+    uint32_t h = 2166136261u ^ len;
+    uint32_t cap = len < 192u ? len : 192u;
+    for (uint32_t i = 0; i < cap; i++)
+        h = h * 16777619u ^ p[i];
+    return h;
+}
+
+static int select_wan_idx_nonip_flow(struct forwarder *fwd, int local_idx, const void *pkt,
+                                     uint32_t pkt_len) {
+    uint32_t h = pkt ? pkt_l2_sig((const uint8_t *)pkt, pkt_len) : 0;
+    uint16_t sp = (uint16_t)h;
+    uint16_t dp = (uint16_t)(h >> 16);
+    return select_wan_idx_for_packet(fwd, local_idx, htonl(0xc0000201u), htonl(0xc0000202u), sp, dp,
+                                       NE_WAN_NONIP_DIST_PROTO, pkt_len);
+}
+
 static inline uint32_t flow_hash_local_tq(uint32_t src_ip, uint32_t dst_ip,
                                           uint16_t src_port, uint16_t dst_port,
                                           uint8_t protocol) {
@@ -1729,7 +1748,7 @@ static void *local_queue_thread_no_crypto(void *arg) {
                                                     src_ip, dst_ip, src_port, dst_port,
                                                     protocol, pkt_lens[i]);
             } else {
-                wan_idx = 0;
+                wan_idx = select_wan_idx_nonip_flow(fwd, local_idx, pkt_ptrs[i], pkt_lens[i]);
             }
 
             if (wan_idx < 0 || wan_idx >= fwd->wan_count)
@@ -1878,7 +1897,7 @@ static void *local_queue_thread_l2(void *arg) {
                                                     src_ip, dst_ip, src_port, dst_port,
                                                     protocol, pkt_lens[i]);
             } else {
-                wan_idx = 0;
+                wan_idx = select_wan_idx_nonip_flow(fwd, local_idx, pkt_ptrs[i], pkt_lens[i]);
             }
 
             if (wan_idx < 0 || wan_idx >= fwd->wan_count)
@@ -2554,7 +2573,7 @@ static void *worker_thread(void *arg) {
                                                 src_ip, dst_ip, src_port, dst_port,
                                                 protocol, job.pkt_len);
         } else {
-            wan_idx = 0;
+            wan_idx = select_wan_idx_nonip_flow(fwd, job.local_idx, job.pkt_ptr, job.pkt_len);
         }
 
         if (wan_idx < 0 || wan_idx >= fwd->wan_count) {

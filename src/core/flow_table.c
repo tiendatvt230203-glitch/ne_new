@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 199309L
 #include "../../inc/flow_table.h"
 #include <arpa/inet.h>
+#include <netinet/in.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -97,6 +98,7 @@ void flow_table_cleanup(struct flow_table *ft) {
 }
 
 static int next_wan = 0;
+static uint32_t g_profile_weighted_tick;
 
 static int get_next_wan(int wan_count) {
     if (wan_count <= 0)
@@ -107,6 +109,10 @@ static int get_next_wan(int wan_count) {
         wan = -wan;
     wan %= wan_count;
     return wan;
+}
+
+static int flow_entry_tcp_stick_one_wan(const struct flow_entry *e) {
+    return e && e->key.protocol == (uint8_t)IPPROTO_TCP;
 }
 
 int flow_table_get_wan(struct flow_table *ft,
@@ -135,7 +141,7 @@ int flow_table_get_wan(struct flow_table *ft,
                 cur_limit = ft->wan_window_sizes[entry->current_wan];
 
 
-            if (cur_limit > 0 && entry->byte_count >= cur_limit) {
+            if (!flow_entry_tcp_stick_one_wan(entry) && cur_limit > 0 && entry->byte_count >= cur_limit) {
                 entry->byte_count = 0;
                 entry->current_wan = (entry->current_wan + 1) % ft->wan_count;
             }
@@ -252,7 +258,7 @@ int flow_table_get_wan_profile(struct flow_table *ft,
                 cur_limit = ft->wan_window_sizes[entry->current_wan];
 
             int sumw = weights_sum_positive(allowed_weights, allowed_count);
-            if (cur_limit > 0 && entry->byte_count >= cur_limit) {
+            if (!flow_entry_tcp_stick_one_wan(entry) && cur_limit > 0 && entry->byte_count >= cur_limit) {
                 entry->byte_count = 0;
                 if (sumw > 0 && allowed_weights) {
                     entry->wrr_slot = (entry->wrr_slot + 1) % sumw;
@@ -292,8 +298,8 @@ int flow_table_get_wan_profile(struct flow_table *ft,
 
     int sumw = weights_sum_positive(allowed_weights, allowed_count);
     if (sumw > 0 && allowed_weights) {
-        uint32_t h = flow_hash(src_ip, dst_ip, src_port, dst_port, protocol);
-        entry->wrr_slot = (int)(h % (uint32_t)sumw);
+        uint32_t tick = __sync_fetch_and_add(&g_profile_weighted_tick, 1);
+        entry->wrr_slot = (int)(tick % (uint32_t)sumw);
         entry->current_wan = wrr_slot_to_wan(entry->wrr_slot, allowed_wans, allowed_weights,
                                              allowed_count, sumw);
     } else {

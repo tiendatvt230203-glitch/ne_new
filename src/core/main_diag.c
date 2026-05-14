@@ -148,9 +148,9 @@ static void log_crypto_policies_human(struct app_config *cfg, int config_id) {
             policy_port_str(dp, sizeof(dp), cp->dst_port_from, cp->dst_port_to);
 
             fprintf(stderr,
-                    "    crypto_policy db_id=%d wire_id=%d priority=%d\n"
+                    "    crypto_policy sql_id=%d packet_marker=%d priority=%d\n"
                     "      layer/action: %s  |  match: protocol=%s  src_ip=%s  dst_ip=%s  src_port=%s  dst_port=%s\n"
-                    "      crypto: %s-%u  nonce=%d bytes  policy_embed_byte=0x%02x (wire_id on packet for L3/L4)\n"
+                    "      crypto: %s-%u  nonce=%d bytes  embed_on_wire=0x%02x (L3/L4 ciphertext marker byte)\n"
                     "      key_prefix(hex)=%02x%02x%02x%02x (first 4 bytes)\n",
                     cp->db_id,
                     cp->id,
