@@ -34,7 +34,9 @@
  * xdp_profile_crypto_policy_matches). Port ranges in the DB are ignored for
  * matching; keep src_port and dst_port as ANY so the schema matches runtime.
  * Layer (bypass / L2 / L3 / L4) and keys come from the winning policy row for
- * that IP pair. Set to 0 to restore port + protocol filtering.
+ * that IP pair. A non-ANY protocol column still must match the packet (so
+ * separate UDP vs TCP rows for the same IPs work). Set to 0 to restore full
+ * port + protocol filtering (including port ranges in match).
  */
 #ifndef CRYPTO_POLICY_MATCH_IP_ONLY
 #define CRYPTO_POLICY_MATCH_IP_ONLY 1

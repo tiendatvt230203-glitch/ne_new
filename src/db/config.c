@@ -361,6 +361,10 @@ const struct crypto_policy *config_select_crypto_policy(struct app_config *cfg, 
                 matched = crypto_policy_match_flow(cp, dst_ip, src_ip, dst_port, src_port);
             if (!matched)
                 continue;
+            /* IP-only still honors protocol when the row is not ANY; otherwise two
+             * rows for the same IP pair (e.g. UDP vs TCP) would tie-break on db_id. */
+            if (cp->protocol != POLICY_PROTO_ANY && cp->protocol != protocol)
+                continue;
             if (crypto_policy_candidate_preferred(cp, pi, best, best_pi)) {
                 best = cp;
                 best_pi = pi;
