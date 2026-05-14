@@ -5,7 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-
+// 1
 static inline void normalize_flow_5tuple(uint32_t *src_ip, uint32_t *dst_ip,
                                          uint16_t *src_port, uint16_t *dst_port) {
     if (!src_ip || !dst_ip || !src_port || !dst_port)
