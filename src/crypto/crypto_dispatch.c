@@ -154,8 +154,17 @@ int crypto_decrypt_packet_auto_by_action(
 
     if (cfg->policy_count <= 0) {
         crypto_apply_default_from_cfg(cfg);
-        int new_len = packet_decrypt(dctx->base_ctx, pkt, *pkt_len);
-        if (new_len < 0) return -1;
+        int new_len = -1;
+        if (action_layer == POLICY_ACTION_ENCRYPT_L2)
+            new_len = crypto_layer2_decrypt(dctx->base_ctx, pkt, *pkt_len);
+        else if (action_layer == POLICY_ACTION_ENCRYPT_L3)
+            new_len = crypto_layer3_decrypt(dctx->base_ctx, pkt, *pkt_len);
+        else if (action_layer == POLICY_ACTION_ENCRYPT_L4)
+            new_len = crypto_layer4_decrypt(dctx->base_ctx, pkt, *pkt_len);
+        else
+            new_len = packet_decrypt(dctx->base_ctx, pkt, *pkt_len);
+        if (new_len < 0)
+            return -1;
         *pkt_len = (uint32_t)new_len;
         return 0;
     }

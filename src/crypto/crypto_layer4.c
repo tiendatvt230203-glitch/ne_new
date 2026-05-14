@@ -260,6 +260,8 @@ int crypto_layer4_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
         memmove(packet + tunnel_off, work_ptr, enc_len);
 
         uint16_t old_totlen = ((uint16_t)packet[l3_off + 2] << 8) | packet[l3_off + 3];
+        if (old_totlen < (uint16_t)total_overhead)
+            return -1;
         uint16_t new_totlen = old_totlen - (uint16_t)total_overhead;
         packet[l3_off + 2] = (uint8_t)(new_totlen >> 8);
         packet[l3_off + 3] = (uint8_t)(new_totlen & 0xFF);
@@ -270,6 +272,8 @@ int crypto_layer4_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
         packet[l3_off + 11] = (uint8_t)(cksum & 0xFF);
 
         size_t new_pkt_len = pkt_len - (size_t)total_overhead;
+        if (new_pkt_len < (size_t)l3_off + (size_t)new_totlen)
+            return -1;
         if (ip_proto == 6) {
             uint8_t *tcp_seg = packet + transport_off;
             int tcp_seg_len = (int)(new_pkt_len - (size_t)transport_off);

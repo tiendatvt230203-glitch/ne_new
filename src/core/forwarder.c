@@ -1752,7 +1752,62 @@ struct queue_thread_args {
  * (see decrypt_packet_auto_l2 / crypto_l3_extract_policy_id / crypto_l4_*), not
  * from cleartext IP direction. Return-path IP swap does not change that id.
  * Outbound encrypt policy match already tries both tuple orders in config_select_crypto_policy().
+ *
+ * WAN L2 ciphertext must use crypto_layer2_decrypt(), not packet_decrypt(): the latter
+ * follows g_encrypt_layer (often 3 from DB) and crypto_layer3_decrypt no-ops on non-0x0800
+ * frames, leaving 0x88xx on wire and then injecting garbage toward LAN/firewall.
  */
+static int ne_rx_ipv4_header_csum_ok(const uint8_t *ip, int ihl) {
+    uint32_t sum = 0;
+    for (int i = 0; i < ihl; i += 2) {
+        uint16_t w = ((uint16_t)ip[i] << 8);
+        if (i + 1 < ihl)
+            w |= ip[i + 1];
+        sum += w;
+    }
+    while (sum >> 16)
+        sum = (sum & 0xffff) + (sum >> 16);
+    return ((uint16_t)sum) == 0xffff;
+}
+
+/* After WAN decrypt, ensure Ethernet II IPv4 (0x0800) before AF_XDP inject to LAN
+ * so bridges/firewalls see standard frames. Belt-and-suspenders if L2 decrypt ran
+ * but ethertype was left non-0800. */
+static void ne_wan_rx_normalize_eth_ipv4_before_local_inject(uint8_t *pkt, uint32_t pkt_len) {
+    if (!pkt || pkt_len < 14 + 20)
+        return;
+    uint16_t et = ((uint16_t)pkt[12] << 8) | pkt[13];
+    if (et == 0x0800)
+        return;
+    if (et == 0x8100)
+        return;
+
+    const uint8_t *iph = pkt + 14;
+    if ((iph[0] >> 4) != 4)
+        return;
+    int ihl = (iph[0] & 0x0F) * 4;
+    if (ihl < 20 || ihl > 60 || pkt_len < 14 + (uint32_t)ihl)
+        return;
+    uint16_t tot = ((uint16_t)iph[2] << 8) | iph[3];
+    if (tot < (uint16_t)ihl || pkt_len < 14 + (uint32_t)tot)
+        return;
+    if (!ne_rx_ipv4_header_csum_ok(iph, ihl))
+        return;
+
+    uint16_t fake4 = packet_crypto_get_fake_ethertype_ipv4();
+    int ne_wireish = 0;
+    if (fake4 && pkt[12] == (uint8_t)(fake4 >> 8))
+        ne_wireish = 1;
+    else if (!fake4 && pkt[12] == 0x88)
+        ne_wireish = 1;
+
+    if (!ne_wireish)
+        return;
+
+    pkt[12] = 0x08;
+    pkt[13] = 0x00;
+}
+
 static int decrypt_packet_auto_l2(struct forwarder *fwd,
                                   uint8_t *pkt, uint32_t *pkt_len,
                                   uint8_t *scratch, size_t scratch_sz) {
@@ -1768,7 +1823,7 @@ static int decrypt_packet_auto_l2(struct forwarder *fwd,
 
     if (fwd->cfg->policy_count <= 0) {
         apply_default_crypto_params(fwd);
-        int new_len = packet_decrypt(&crypto_ctx, pkt, *pkt_len);
+        int new_len = crypto_layer2_decrypt(&crypto_ctx, pkt, *pkt_len);
         if (new_len < 0) return -1;
         *pkt_len = (uint32_t)new_len;
         return 0;
@@ -1780,7 +1835,7 @@ static int decrypt_packet_auto_l2(struct forwarder *fwd,
     if (pi >= 0 && pi < fwd->cfg->policy_count && g_policy_crypto_ctx_ready[pi]) {
         const struct crypto_policy *cp = &fwd->cfg->policies[pi];
         apply_crypto_params_from_policy(cp);
-        int new_len = packet_decrypt(&g_policy_crypto_ctx[pi], pkt, *pkt_len);
+        int new_len = crypto_layer2_decrypt(&g_policy_crypto_ctx[pi], pkt, *pkt_len);
         if (new_len < 0)
             return -1;
         *pkt_len = (uint32_t)new_len;
@@ -1792,7 +1847,7 @@ static int decrypt_packet_auto_l2(struct forwarder *fwd,
         if (ppi >= 0 && ppi < g_prev_policy_count && g_prev_policy_crypto_ctx_ready[ppi]) {
             const struct crypto_policy *cp_prev = &g_prev_policies[ppi];
             apply_crypto_params_from_policy(cp_prev);
-            int new_len = packet_decrypt(&g_prev_policy_crypto_ctx[ppi], pkt, *pkt_len);
+            int new_len = crypto_layer2_decrypt(&g_prev_policy_crypto_ctx[ppi], pkt, *pkt_len);
             if (new_len < 0)
                 return -1;
             *pkt_len = (uint32_t)new_len;
@@ -2133,6 +2188,7 @@ static void *wan_queue_thread_no_crypto(void *arg) {
                     tq = args->wan_worker_index >= 0 ? (args->wan_worker_index % nq) : (tx_base % nq);
             }
 
+            ne_wan_rx_normalize_eth_ipv4_before_local_inject(pkt, pkt_len);
             if (interface_send_to_local_batch_queue(local_iface, tq, local_cfg, pkt, pkt_len) == 0) {
                 __sync_fetch_and_add(&fwd->wan_to_local, 1);
                 local_used_queues[local_idx] |= (1u << tq);
@@ -2526,6 +2582,7 @@ static void *wan_queue_thread_l2(void *arg) {
                     tq = args->wan_worker_index >= 0 ? (args->wan_worker_index % nq) : (tx_base % nq);
             }
 
+            ne_wan_rx_normalize_eth_ipv4_before_local_inject(final_pkt, final_len);
             if (interface_send_to_local_batch_queue(local_iface, tq, local_cfg, final_pkt, final_len) == 0) {
                 __sync_fetch_and_add(&fwd->wan_to_local, 1);
                 if (tq < 32)
@@ -2965,6 +3022,7 @@ static void *wan_queue_thread_l3l4(void *arg) {
                     tq = args->wan_worker_index >= 0 ? (args->wan_worker_index % nq) : (tx_base % nq);
             }
 
+            ne_wan_rx_normalize_eth_ipv4_before_local_inject(final_pkt, final_len);
             if (interface_send_to_local_batch_queue(local_iface, tq, local_cfg, final_pkt, final_len) == 0) {
                 __sync_fetch_and_add(&fwd->wan_to_local, 1);
                 if (tq < 32)

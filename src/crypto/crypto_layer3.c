@@ -167,6 +167,8 @@ int crypto_layer3_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
 
         packet[IPV4_PROTO_OFF] = orig_proto;
         uint16_t old_totlen = ((uint16_t)packet[IPV4_TOTLEN_OFF] << 8) | packet[IPV4_TOTLEN_OFF + 1];
+        if (old_totlen < (uint16_t)total_overhead)
+            return -1;
         uint16_t new_totlen = old_totlen - (uint16_t)total_overhead;
         packet[IPV4_TOTLEN_OFF] = (uint8_t)(new_totlen >> 8);
         packet[IPV4_TOTLEN_OFF + 1] = (uint8_t)(new_totlen & 0xFF);
@@ -176,6 +178,8 @@ int crypto_layer3_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
         packet[IPV4_CKSUM_OFF + 1] = (uint8_t)(cksum & 0xFF);
 
         size_t dec_pkt_len = pkt_len - (size_t)total_overhead;
+        if (dec_pkt_len < ETH_HEADER_SIZE + (size_t)new_totlen)
+            return -1;
         int ip_hdr_len = (packet[ETH_HEADER_SIZE] & 0x0F) * 4;
         size_t transport_off = (size_t)ETH_HEADER_SIZE + (size_t)ip_hdr_len;
 
