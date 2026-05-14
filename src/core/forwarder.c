@@ -962,7 +962,7 @@ static int merge_lladdr(FILE *fp, uint8_t out[MAC_LEN]) {
     return -2;
 }
 
-static int merge_bridge_fdb(FILE *fp, uint8_t out[MAC_LEN]) {
+static int merge_bridge_fdb(FILE *fp, uint8_t out[MAC_LEN], const uint8_t *skip_mac) {
     uint8_t uniq[NE_LLADDR_MAX][MAC_LEN];
     int n = 0;
     char line[768];
@@ -979,6 +979,8 @@ static int merge_bridge_fdb(FILE *fp, uint8_t out[MAC_LEN]) {
         if (parse_mac(macstr, m) != 0)
             continue;
         if (mac_is_zero(m) || mac_is_broadcast(m) || mac_is_multicast(m))
+            continue;
+        if (skip_mac && memcmp(m, skip_mac, MAC_LEN) == 0)
             continue;
         int dup = 0;
         for (int j = 0; j < n; j++) {
@@ -1002,9 +1004,28 @@ static int merge_bridge_fdb(FILE *fp, uint8_t out[MAC_LEN]) {
     return -2;
 }
 
+static int net_sysfs_bridge_master(const char *slave, char master[IFNAMSIZ]) {
+    char path[256];
+    char buf[512];
+    ssize_t len;
+
+    snprintf(path, sizeof(path), "/sys/class/net/%s/brport/bridge", slave);
+    len = readlink(path, buf, sizeof(buf) - 1);
+    if (len < 0)
+        return -1;
+    buf[len] = '\0';
+    const char *base = strrchr(buf, '/');
+    if (!base || !base[1])
+        return -1;
+    snprintf(master, IFNAMSIZ, "%s", base + 1);
+    return 0;
+}
+
 static int peer_mac_from_kernel(const char *ifname, uint8_t mac_out[MAC_LEN]) {
     char cmd[384];
     FILE *fp;
+    uint8_t local_hw[MAC_LEN];
+    int have_local = (read_local_iface_hwaddr(ifname, local_hw, NULL) == 0);
 
     snprintf(cmd, sizeof(cmd), "ip neigh show dev %s 2>/dev/null", ifname);
     fp = popen(cmd, "r");
@@ -1015,8 +1036,25 @@ static int peer_mac_from_kernel(const char *ifname, uint8_t mac_out[MAC_LEN]) {
             return 0;
         if (r == -2) {
             fprintf(stderr,
-                    "[LOCAL-MAC][WARN] %s: ip neigh has multiple lladdr; trying bridge fdb\n",
+                    "[LOCAL-MAC][WARN] %s: ip neigh has multiple lladdr; trying bridge master / fdb\n",
                     ifname);
+        }
+    }
+
+    char brm[IFNAMSIZ];
+    if (net_sysfs_bridge_master(ifname, brm) == 0) {
+        snprintf(cmd, sizeof(cmd), "ip neigh show dev %s 2>/dev/null", brm);
+        fp = popen(cmd, "r");
+        if (fp) {
+            int r = merge_lladdr(fp, mac_out);
+            pclose(fp);
+            if (r == 0)
+                return 0;
+            if (r == -2) {
+                fprintf(stderr,
+                        "[LOCAL-MAC][WARN] %s: bridge %s neigh has multiple lladdr; trying bridge fdb\n",
+                        ifname, brm);
+            }
         }
     }
 
@@ -1024,7 +1062,7 @@ static int peer_mac_from_kernel(const char *ifname, uint8_t mac_out[MAC_LEN]) {
     fp = popen(cmd, "r");
     if (!fp)
         return -1;
-    int r = merge_bridge_fdb(fp, mac_out);
+    int r = merge_bridge_fdb(fp, mac_out, have_local ? local_hw : NULL);
     pclose(fp);
     if (r == 0)
         return 0;
