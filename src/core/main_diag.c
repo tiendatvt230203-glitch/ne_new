@@ -180,7 +180,8 @@ static void log_local_peer_mac_hint(struct app_config *cfg) {
             "[LOCAL CFG] locals from DB:");
     for (int i = 0; i < cfg->local_count; i++)
         fprintf(stderr, " %s", cfg->locals[i].ifname);
-    fprintf(stderr, " — peer MAC from kernel neigh/fdb/arp or NE_LOCAL_MAC_PRELOAD.\n");
+    fprintf(stderr,
+            " — peer MAC from kernel when present, else learned on RX; optional NE_LOCAL_MAC_PRELOAD.\n");
 }
 
 void main_diag_log_loaded_config(struct app_config *cfg, int config_id) {

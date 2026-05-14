@@ -69,8 +69,7 @@ static int runtime_start(struct runtime_state *rt, const struct app_config *cfg)
     rt->running = 0;
     if (rt->cfg_slots[rt->active_slot].local_count > 0) {
         if (forwarder_prepare_local_peer_macs(&rt->cfg_slots[rt->active_slot]) != 0) {
-            fprintf(stderr,
-                    "[FATAL] forwarder_prepare_local_peer_macs failed — kernel neigh/fdb/arp or NE_LOCAL_MAC_PRELOAD\n");
+            fprintf(stderr, "[FATAL] forwarder_prepare_local_peer_macs failed (NE_LOCAL_MAC_PRELOAD)\n");
             return -1;
         }
     }

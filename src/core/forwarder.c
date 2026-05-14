@@ -836,10 +836,18 @@ static int local_mac_lookup(const uint8_t mac[MAC_LEN]) {
     return -1;
 }
 
-static void learn_local_src_mac(int local_idx, const uint8_t *pkt, uint32_t pkt_len) {
-    if (!pkt || pkt_len < sizeof(struct ether_header))
+static void learn_local_src_mac(struct forwarder *fwd, int local_idx, const uint8_t *pkt,
+                                uint32_t pkt_len) {
+    if (!fwd || !pkt || pkt_len < sizeof(struct ether_header))
         return;
-    local_mac_learn(local_idx, pkt + 6);
+    const uint8_t *sm = pkt + 6;
+    if (mac_is_zero(sm) || mac_is_broadcast(sm) || mac_is_multicast(sm))
+        return;
+    if (memcmp(fwd->cfg->locals[local_idx].dst_mac, sm, MAC_LEN) == 0)
+        return;
+    local_mac_learn(local_idx, sm);
+    memcpy(fwd->cfg->locals[local_idx].dst_mac, sm, MAC_LEN);
+    memcpy(fwd->locals[local_idx].dst_mac, sm, MAC_LEN);
 }
 
 static int local_idx_from_dst_mac(struct forwarder *fwd, const uint8_t *pkt, uint32_t pkt_len) {
@@ -1071,6 +1079,86 @@ static int merge_arp_device(const char *dev, uint8_t out[MAC_LEN], const uint8_t
     return -2;
 }
 
+static int peer_mac_from_full_bridge_fdb(const char *ifname, const char *brm,
+                                           const uint8_t *skip_mac, uint8_t out[MAC_LEN]) {
+    char devm[IFNAMSIZ + 16];
+    snprintf(devm, sizeof(devm), " dev %s ", ifname);
+
+    FILE *fp = popen("bridge fdb show 2>/dev/null", "r");
+    if (!fp)
+        return -1;
+
+    uint8_t dyn[NE_LLADDR_MAX][MAC_LEN];
+    int n_dyn = 0;
+    uint8_t oth[NE_LLADDR_MAX][MAC_LEN];
+    int n_oth = 0;
+    char line[768];
+
+    while (fgets(line, sizeof(line), fp)) {
+        if (strstr(line, "self permanent"))
+            continue;
+        if (!strstr(line, devm))
+            continue;
+        char *mp = strstr(line, "master ");
+        if (!mp)
+            continue;
+        char brtok[IFNAMSIZ];
+        if (sscanf(mp, "master %31s", brtok) != 1 || strcmp(brtok, brm) != 0)
+            continue;
+        char macstr[32];
+        if (sscanf(line, "%31s", macstr) != 1)
+            continue;
+        if (!strchr(macstr, ':'))
+            continue;
+        uint8_t m[MAC_LEN];
+        if (parse_mac(macstr, m) != 0)
+            continue;
+        if (mac_is_zero(m) || mac_is_broadcast(m) || mac_is_multicast(m))
+            continue;
+        if (skip_mac && memcmp(m, skip_mac, MAC_LEN) == 0)
+            continue;
+        int is_perm = (strstr(line, "permanent") != NULL);
+        uint8_t(*arr)[MAC_LEN];
+        int *np;
+        if (is_perm) {
+            arr = oth;
+            np = &n_oth;
+        } else {
+            arr = dyn;
+            np = &n_dyn;
+        }
+        int dup = 0;
+        for (int j = 0; j < *np; j++) {
+            if (memcmp(arr[j], m, MAC_LEN) == 0) {
+                dup = 1;
+                break;
+            }
+        }
+        if (dup)
+            continue;
+        if (*np >= NE_LLADDR_MAX) {
+            pclose(fp);
+            return -2;
+        }
+        memcpy(arr[(*np)++], m, MAC_LEN);
+    }
+    pclose(fp);
+
+    if (n_dyn == 1) {
+        memcpy(out, dyn[0], MAC_LEN);
+        return 0;
+    }
+    if (n_dyn > 1)
+        return -2;
+    if (n_oth == 1) {
+        memcpy(out, oth[0], MAC_LEN);
+        return 0;
+    }
+    if (n_oth > 1)
+        return -2;
+    return -1;
+}
+
 static int peer_mac_from_kernel(const char *ifname, uint8_t mac_out[MAC_LEN]) {
     char cmd[384];
     FILE *fp;
@@ -1078,6 +1166,22 @@ static int peer_mac_from_kernel(const char *ifname, uint8_t mac_out[MAC_LEN]) {
     int have_local = (read_local_iface_hwaddr(ifname, local_hw, NULL) == 0);
     char brm[IFNAMSIZ];
     int have_br = (net_sysfs_bridge_master(ifname, brm) == 0);
+
+    if (have_br) {
+        int bf = peer_mac_from_full_bridge_fdb(ifname, brm, have_local ? local_hw : NULL, mac_out);
+        if (bf == 0) {
+            fprintf(stderr,
+                    "[LOCAL-MAC] %s peer from bridge fdb (dev %s master %s, learned or single candidate)\n",
+                    ifname, ifname, brm);
+            return 0;
+        }
+        if (bf == -2) {
+            fprintf(stderr,
+                    "[LOCAL-MAC][WARN] %s: multiple MAC in `bridge fdb show` for dev %s master %s; "
+                    "try NE_LOCAL_MAC_PRELOAD or reduce hosts on segment\n",
+                    ifname, ifname, brm);
+        }
+    }
 
     snprintf(cmd, sizeof(cmd), "ip neigh show dev %s 2>/dev/null", ifname);
     fp = popen(cmd, "r");
@@ -1139,22 +1243,41 @@ static int peer_mac_from_kernel(const char *ifname, uint8_t mac_out[MAC_LEN]) {
 static int mac_load_from_kernel(struct app_config *cfg, uint64_t *out_n) {
     uint8_t macs[MAX_INTERFACES][MAC_LEN];
 
-    for (int i = 0; i < cfg->local_count; i++) {
-        if (peer_mac_from_kernel(cfg->locals[i].ifname, macs[i]) != 0) {
+    fprintf(stderr, "[LOCAL-MAC] hardware MAC of local interfaces (ioctl):\n");
+    for (int li = 0; li < cfg->local_count; li++) {
+        uint8_t hw[MAC_LEN];
+        if (read_local_iface_hwaddr(cfg->locals[li].ifname, hw, NULL) == 0) {
             fprintf(stderr,
-                    "[LOCAL-MAC] %s peer not in kernel neigh/fdb/arp (need traffic or NE_LOCAL_MAC_PRELOAD)\n",
-                    cfg->locals[i].ifname);
-            return -1;
+                    "  %s %02x:%02x:%02x:%02x:%02x:%02x\n",
+                    cfg->locals[li].ifname,
+                    hw[0], hw[1], hw[2], hw[3], hw[4], hw[5]);
+        } else {
+            fprintf(stderr, "  %s (SIOCGIFHWADDR failed)\n", cfg->locals[li].ifname);
         }
     }
 
+    int n_ok = 0;
     for (int i = 0; i < cfg->local_count; i++) {
-        local_mac_learn(i, macs[i]);
-        memcpy(cfg->locals[i].dst_mac, macs[i], MAC_LEN);
+        memset(macs[i], 0, MAC_LEN);
+        if (peer_mac_from_kernel(cfg->locals[i].ifname, macs[i]) != 0) {
+            fprintf(stderr,
+                    "[LOCAL-MAC] %s peer not resolved yet (will learn from RX when link has traffic)\n",
+                    cfg->locals[i].ifname);
+            continue;
+        }
+        n_ok++;
+    }
+
+    for (int i = 0; i < cfg->local_count; i++) {
+        memset(cfg->locals[i].dst_mac, 0, MAC_LEN);
+        if (!mac_is_zero(macs[i])) {
+            local_mac_learn(i, macs[i]);
+            memcpy(cfg->locals[i].dst_mac, macs[i], MAC_LEN);
+        }
         local_mac_log_iface_and_peer(cfg->locals[i].ifname, macs[i], cfg->locals[i].src_mac);
     }
 
-    *out_n = (uint64_t)cfg->local_count;
+    *out_n = (uint64_t)n_ok;
     return 0;
 }
 
@@ -1232,15 +1355,6 @@ static int mac_load_from_preload_script(struct app_config *cfg, uint64_t *out_n)
         return -1;
     }
 
-    for (int i = 0; i < cfg->local_count; i++) {
-        if (!covered[i]) {
-            fprintf(stderr,
-                    "[FATAL][LOCAL-MAC] NE_LOCAL_MAC_PRELOAD: no peer MAC line for local \"%s\" (index %d).\n",
-                    cfg->locals[i].ifname, i);
-            return -1;
-        }
-    }
-
     *out_n = nlines;
     return 0;
 }
@@ -1257,23 +1371,40 @@ int forwarder_prepare_local_peer_macs(struct app_config *cfg) {
     local_mac_table_clear();
     uint64_t cnt = 0;
 
-    if (mac_load_from_kernel(cfg, &cnt) == 0)
-        goto done;
+    unsigned wait_sec = 0;
+    const char *wenv = getenv("NE_PEER_MAC_WAIT_SEC");
+    if (wenv && wenv[0])
+        wait_sec = (unsigned)strtoul(wenv, NULL, 10);
+    time_t deadline = time(NULL) + (time_t)wait_sec;
+
+    for (;;) {
+        mac_load_from_kernel(cfg, &cnt);
+        if (cnt >= (uint64_t)cfg->local_count)
+            goto done;
+        if (wait_sec == 0 || time(NULL) >= deadline)
+            break;
+        fprintf(stderr,
+                "[LOCAL-MAC] partial peer MAC; sleep 1s (NE_PEER_MAC_WAIT_SEC=%u)\n",
+                wait_sec);
+        sleep(1);
+    }
 
     if (getenv("NE_LOCAL_MAC_PRELOAD") && getenv("NE_LOCAL_MAC_PRELOAD")[0]) {
         if (mac_load_from_preload_script(cfg, &cnt) != 0)
             return -1;
-        goto done;
     }
 
-    fprintf(stderr,
-            "[FATAL][LOCAL-MAC] kernel neigh/fdb/arp empty or ambiguous for some local; set NE_LOCAL_MAC_PRELOAD\n");
-    return -1;
-
 done:
-    g_peer_mac_seed_count = cnt;
+    {
+    uint64_t nz = 0;
+    for (int i = 0; i < cfg->local_count; i++) {
+        if (!mac_is_zero(cfg->locals[i].dst_mac))
+            nz++;
+    }
+    g_peer_mac_seed_count = nz;
     g_local_peer_macs_ready = 1;
     return 0;
+    }
 }
 
 static int install_local_mac_table(struct forwarder *fwd) {
@@ -1586,7 +1717,7 @@ static void *local_queue_thread_no_crypto(void *arg) {
             wan_tx_q[w] = tx_base % fwd->wans[w].queue_count;
 
         for (int i = 0; i < rcvd; i++) {
-            learn_local_src_mac(local_idx, (const uint8_t *)pkt_ptrs[i], pkt_lens[i]);
+            learn_local_src_mac(fwd, local_idx, (const uint8_t *)pkt_ptrs[i], pkt_lens[i]);
             uint32_t src_ip = 0, dst_ip = 0;
             uint16_t src_port = 0, dst_port = 0;
             uint8_t protocol = 0;
@@ -1733,7 +1864,7 @@ static void *local_queue_thread_l2(void *arg) {
             wan_tx_q[w] = tx_base % fwd->wans[w].queue_count;
 
         for (int i = 0; i < rcvd; i++) {
-            learn_local_src_mac(local_idx, (const uint8_t *)pkt_ptrs[i], pkt_lens[i]);
+            learn_local_src_mac(fwd, local_idx, (const uint8_t *)pkt_ptrs[i], pkt_lens[i]);
             uint32_t src_ip = 0, dst_ip = 0;
             uint16_t src_port = 0, dst_port = 0;
             uint8_t protocol = 0;
@@ -1886,7 +2017,7 @@ static void *local_queue_thread_l3l4(void *arg) {
 
 
         for (int i = 0; i < rcvd; i++) {
-            learn_local_src_mac(local_idx, (const uint8_t *)pkt_ptrs[i], pkt_lens[i]);
+            learn_local_src_mac(fwd, local_idx, (const uint8_t *)pkt_ptrs[i], pkt_lens[i]);
             struct packet_job job;
             job.fwd = fwd;
             job.local_idx = local_idx;
