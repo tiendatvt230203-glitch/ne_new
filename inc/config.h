@@ -20,13 +20,6 @@
 #define DEFAULT_RING_SIZE       262144
 #define DEFAULT_RING_SIZE_WAN   32768
 #define WAN_REORDER_WINDOW_KB   10240
-/* Profile multi-WAN stripe: total bytes per weight cycle (cap WAN_i = cycle * weight_i / sum(weights)).
- * Env NE_WAN_STRIPE_CYCLE_BYTES overrides this when set. Set non-zero here to fix the milestone in
- * source without env (e.g. 10240 = 10 KiB per cycle). Default 0 = only env or fall back to
- * NE_WAN_STRIPE_BYTES / wan windows until you set a non-zero value here. */
-#ifndef NE_DEFAULT_WAN_STRIPE_CYCLE_BYTES
-#define NE_DEFAULT_WAN_STRIPE_CYCLE_BYTES 0
-#endif
 /* NIC RX is forced to one queue (ethtool); that queue is always index 0. AF_XDP/XDP use it only. */
 #define FORWARDER_XSK_QUEUE_ID      0
 #define FORWARDER_XSK_QUEUE_COUNT   1
@@ -36,10 +29,21 @@
 #define MAX_CRYPTO_POLICIES 128
 #define POLICY_PROTO_ANY 0
 
+/*
+ * When 1: crypto policy match and selection use src/dst IP only (CIDR rows in
+ * xdp_profile_crypto_policy_matches). Port ranges in the DB are ignored for
+ * matching; keep src_port and dst_port as ANY so the schema matches runtime.
+ * Layer (bypass / L2 / L3 / L4) and keys come from the winning policy row for
+ * that IP pair. Set to 0 to restore port + protocol filtering.
+ */
 #ifndef CRYPTO_POLICY_MATCH_IP_ONLY
-#define CRYPTO_POLICY_MATCH_IP_ONLY 0
+#define CRYPTO_POLICY_MATCH_IP_ONLY 1
 #endif
 
+/*
+ * When 1: flows that match no policy row are still forwarded to WAN (cleartext).
+ * When 0: those packets are dropped whenever policy_count > 0 (strict matrix).
+ */
 #ifndef CRYPTO_POLICY_PASS_UNMATCHED
 #define CRYPTO_POLICY_PASS_UNMATCHED 1
 #endif
@@ -104,6 +108,9 @@ struct local_config {
 
 struct wan_config {
     char ifname[IF_NAMESIZE];
+    uint32_t dst_ip;
+    uint8_t src_mac[MAC_LEN];
+    uint8_t dst_mac[MAC_LEN];
     uint32_t window_size;
     uint32_t umem_mb;
     uint32_t ring_size;

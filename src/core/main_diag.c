@@ -181,9 +181,7 @@ static void log_local_peer_mac_hint(struct app_config *cfg) {
     for (int i = 0; i < cfg->local_count; i++)
         fprintf(stderr, " %s", cfg->locals[i].ifname);
     fprintf(stderr,
-            " — peer MAC from kernel when present, else learned on RX; optional NE_LOCAL_MAC_PRELOAD; "
-            "profile multi-WAN: NE_WAN_STRIPE_CYCLE_BYTES overrides NE_DEFAULT_WAN_STRIPE_CYCLE_BYTES "
-            "(inc/config.h); per-WAN cap=cycle*weight/sum(weights); or NE_WAN_STRIPE_BYTES=fixed cap.\n");
+            " — peer MAC from kernel when present, else learned on RX; optional NE_LOCAL_MAC_PRELOAD.\n");
 }
 
 void main_diag_log_loaded_config(struct app_config *cfg, int config_id) {

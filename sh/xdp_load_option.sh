@@ -8,7 +8,9 @@ network_encryptor_load_db_env
 SQL_DIR="${NETWORK_ENCRYPTOR_ROOT}/sql_options"
 
 usage() {
-  echo "Usage: $0 <config_id>   # ${SQL_DIR}/<NN>_*.sql (NN = zero-padded id)"
+  echo "Usage: $0 <config_id>"
+  echo "  Loads one file from ${SQL_DIR}/<NN>_*.sql (NN = zero-padded id)."
+  echo "  If several match, set NETWORK_ENCRYPTOR_SQL_FILE to the path to load."
 }
 
 if [ "$#" -ne 1 ]; then
@@ -22,24 +24,35 @@ if ! [[ "${CONFIG_ID}" =~ ^[0-9]+$ ]]; then
   exit 1
 fi
 
-ID_PADDED=$(printf "%02d" "$((10#${CONFIG_ID}))")
-SQL_FILE_GLOB="${SQL_DIR}/${ID_PADDED}_*.sql"
+if [ -n "${NETWORK_ENCRYPTOR_SQL_FILE:-}" ]; then
+  SQL_FILE="${NETWORK_ENCRYPTOR_SQL_FILE}"
+  if [ ! -f "${SQL_FILE}" ]; then
+    echo "NETWORK_ENCRYPTOR_SQL_FILE not found: ${SQL_FILE}" >&2
+    exit 1
+  fi
+else
+  ID_PADDED=$(printf "%02d" "$((10#${CONFIG_ID}))")
+  SQL_FILE_GLOB="${SQL_DIR}/${ID_PADDED}_*.sql"
 
-shopt -s nullglob
-SQL_FILES=( ${SQL_FILE_GLOB} )
-shopt -u nullglob
+  shopt -s nullglob
+  SQL_FILES=( ${SQL_FILE_GLOB} )
+  shopt -u nullglob
 
-if [ "${#SQL_FILES[@]}" -eq 0 ]; then
-  echo "No SQL for config_id=${CONFIG_ID} (glob ${SQL_FILE_GLOB})" >&2
-  exit 1
-fi
+  if [ "${#SQL_FILES[@]}" -eq 0 ]; then
+    echo "No SQL for config_id=${CONFIG_ID} (glob ${SQL_FILE_GLOB})" >&2
+    exit 1
+  fi
 
-IFS=$'\n' SQL_FILES_SORTED=($(printf '%s\n' "${SQL_FILES[@]}" | sort))
-unset IFS
-SQL_FILE="${SQL_FILES_SORTED[0]}"
+  IFS=$'\n' SQL_FILES_SORTED=($(printf '%s\n' "${SQL_FILES[@]}" | sort))
+  unset IFS
 
-if [ "${#SQL_FILES_SORTED[@]}" -gt 1 ]; then
-  echo "[WARN] Multiple files for id=${CONFIG_ID}; using: ${SQL_FILE}" >&2
+  if [ "${#SQL_FILES_SORTED[@]}" -gt 1 ]; then
+    echo "Multiple SQL files match ${SQL_FILE_GLOB}:" >&2
+    printf '  %s\n' "${SQL_FILES_SORTED[@]}" >&2
+    echo "Set NETWORK_ENCRYPTOR_SQL_FILE to the file to load, or keep a single file per id." >&2
+    exit 1
+  fi
+  SQL_FILE="${SQL_FILES_SORTED[0]}"
 fi
 
 echo "=== xdp_load_option ==="

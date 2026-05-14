@@ -5,6 +5,8 @@
 #include <stdint.h>
 #include <libpq-fe.h>
 #include <strings.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 
 static int str_is_any(const char *v) {
     if (!v) return 1;
@@ -30,6 +32,22 @@ static int parse_port_range(const char *v, int *from_out, int *to_out) {
         return 0;
     }
     return -1;
+}
+
+static int parse_ipv4_addr(const char *v, uint32_t *out_ip) {
+    if (!v || !out_ip || v[0] == '\0')
+        return -1;
+    char buf[64];
+    strncpy(buf, v, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    char *slash = strchr(buf, '/');
+    if (slash)
+        *slash = '\0';
+    struct in_addr a;
+    if (inet_pton(AF_INET, buf, &a) != 1)
+        return -1;
+    *out_ip = a.s_addr;
+    return 0;
 }
 
 static uint8_t parse_protocol_name(const char *v) {
@@ -513,6 +531,32 @@ static int load_wan_rows(struct app_config *cfg, PGresult *res)
         }
         strncpy(wan->ifname, v, IF_NAMESIZE - 1);
 
+        int dst_ip_col = PQfnumber(res, "dst_ip");
+        if (dst_ip_col >= 0) {
+            v = PQgetvalue(res, row, dst_ip_col);
+            if (v && v[0] != '\0' && parse_ipv4_addr(v, &wan->dst_ip) != 0) {
+                fprintf(stderr, "[DB WAN] Invalid dst_ip: %s\n", v);
+                return -1;
+            }
+        }
+
+        int src_mac_col = PQfnumber(res, "src_mac");
+        int dst_mac_col = PQfnumber(res, "dst_mac");
+        if (src_mac_col >= 0) {
+            v = PQgetvalue(res, row, src_mac_col);
+            if (v && v[0] != '\0' && parse_mac(v, wan->src_mac) != 0) {
+                fprintf(stderr, "[DB WAN] Invalid src_mac: %s\n", v);
+                return -1;
+            }
+        }
+        if (dst_mac_col >= 0) {
+            v = PQgetvalue(res, row, dst_mac_col);
+            if (v && v[0] != '\0' && parse_mac(v, wan->dst_mac) != 0) {
+                fprintf(stderr, "[DB WAN] Invalid dst_mac: %s\n", v);
+                return -1;
+            }
+        }
+
         cfg->wan_count++;
     }
     return 0;
@@ -574,8 +618,24 @@ static int db_load_wan_configs(PGconn *conn, struct app_config *cfg, int config_
     const char *params[1] = { id_str };
 
     PGresult *res = PQexecParams(conn,
-        "SELECT ifname FROM xdp_wan_configs WHERE config_id = $1 ORDER BY id",
+        "SELECT ifname, dst_ip "
+        "FROM xdp_wan_configs WHERE config_id = $1 ORDER BY id",
         1, NULL, params, NULL, NULL, 0);
+
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        PQclear(res);
+        res = PQexecParams(conn,
+            "SELECT ifname, dst_ip, src_mac, dst_mac "
+            "FROM xdp_wan_configs WHERE config_id = $1 ORDER BY id",
+            1, NULL, params, NULL, NULL, 0);
+    }
+
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        PQclear(res);
+        res = PQexecParams(conn,
+            "SELECT ifname FROM xdp_wan_configs WHERE config_id = $1 ORDER BY id",
+            1, NULL, params, NULL, NULL, 0);
+    }
 
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
         fprintf(stderr, "[DB] Query xdp_wan_configs failed: %s\n", PQresultErrorMessage(res));
