@@ -4,7 +4,7 @@ set -euo pipefail
 echo "=== install build deps (network-encryptor) ==="
 
 sudo apt update
-sudo apt install -y build-essential clang llvm pkg-config git curl ca-certificates
+sudo apt install -y build-essential clang llvm pkg-config git curl ca-certificates patchelf
 sudo apt install -y \
   libelf-dev \
   zlib1g-dev \
