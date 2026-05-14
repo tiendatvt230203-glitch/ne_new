@@ -100,4 +100,6 @@ for need in libxdp.so.1 libbpf.so.1; do
   [ "${sz:-0}" -ge 4096 ] && file -b "$p" | grep -q ELF || { echo "[FATAL] $need invalid" >&2; exit 1; }
 done
 
+getconf GNU_LIBC_VERSION 2>/dev/null >"${ROOT}/libs/.sync_host_glibc.txt" || true
+
 : >"${ROOT}/libs/.ready"

@@ -49,22 +49,32 @@ BPF_OBJ = bpf/xdp_redirect.o bpf/xdp_wan_redirect.o
 
 MAKEFLAGS += --no-print-directory
 
-.PHONY: all libs-clean libs-glibc-report build-on-2204 clean run dirs
+.PHONY: all libs-clean libs-glibc-report verify-libs build-on-2204 clean run dirs
 
 all: $(LIB_PREREQ) dirs $(BPF_OBJ) $(DB_LIB) $(TARGET)
 
 $(LIBS_ROOT)/.ready:
 	@test -f "$(CURDIR)/sh/sync_xdp_libs.sh" || (echo "[FATAL] missing $(CURDIR)/sh/sync_xdp_libs.sh" >&2; exit 127)
+	@fline=$$(head -n1 "$(CURDIR)/sh/sync_xdp_libs.sh" | tr -d '\r'); \
+	case "$$fline" in \
+	  '#!/usr/bin/env bash'|'#!/bin/bash'*) ;; \
+	  *) echo "[FATAL] sh/sync_xdp_libs.sh must start with a bash shebang (got: $$fline)." >&2; \
+	     echo "[FATAL] It is often overwritten by mistake. Restore: git checkout -- sh/sync_xdp_libs.sh" >&2; exit 1;; \
+	esac
 	@bash "$(CURDIR)/sh/sync_xdp_libs.sh"
 
 libs-clean:
-	rm -rf "$(LIBS_ROOT)/include" "$(LIBS_ROOT)/lib" "$(LIBS_ROOT)/.ready"
+	rm -rf "$(LIBS_ROOT)/include" "$(LIBS_ROOT)/lib" "$(LIBS_ROOT)/.ready" "$(LIBS_ROOT)/.sync_host_glibc.txt"
 
 # Compare host libc vs symbols bundled libxdp needs (max GLIBC_* must be <= target).
 libs-glibc-report:
 	@echo "Host libc: $$(getconf GNU_LIBC_VERSION 2>/dev/null || ldd --version 2>&1 | sed -n '1p')"
 	@test -f "$(LIBS_ROOT)/lib/libxdp.so.1" || (echo "No bundled lib yet; run make first." >&2; exit 1)
 	@echo "GLIBC_* referenced by bundled libxdp.so.1 (highest must exist on deploy box):" && strings "$(LIBS_ROOT)/lib/libxdp.so.1" | grep '^GLIBC_' | sort -uV
+
+# Run on deploy machine (e.g. NE1): fails if libs/lib was bundled on newer glibc than this host.
+verify-libs:
+	@bash "$(CURDIR)/sh/verify_bundled_glibc.sh"
 
 # Build inside ubuntu:22.04; copies bin/network-encryptor + libs/ into this tree.
 build-on-2204:
