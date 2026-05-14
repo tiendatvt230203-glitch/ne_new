@@ -7,6 +7,10 @@ INC="${ROOT}/libs/include"
 LIB="${ROOT}/libs/lib"
 mkdir -p "${INC}" "${LIB}"
 
+is_elf() {
+  case "$(file -b "$1" 2>/dev/null)" in *ELF*) return 0;; *) return 1;; esac
+}
+
 deb_lib_dirs() {
   local m d
   m="$(cc -print-multiarch 2>/dev/null || true)"
@@ -97,7 +101,8 @@ stage() {
   [ -e "$dst" ] && return 0
   cp -L "$real" "$dst"
   sz="$(stat -c%s "$dst" 2>/dev/null || echo 0)"
-  [ "${sz:-0}" -ge 4096 ] && file -b "$dst" | grep -q ELF || { echo "[FATAL] bad copy $dst" >&2; exit 1; }
+  [ "${sz:-0}" -ge 4096 ] || { echo "[FATAL] bad copy $dst (size ${sz})" >&2; exit 1; }
+  is_elf "$dst" || { echo "[FATAL] bad copy $dst (not ELF)" >&2; exit 1; }
 }
 
 for name in libbpf.so libxdp.so; do
@@ -125,7 +130,7 @@ if [ -n "${LIBS_PATCHELF:-}" ] && command -v patchelf >/dev/null 2>&1; then
   for f in "${LIB}"/*.so*; do
     [ -L "$f" ] && continue
     [ -f "$f" ] || continue
-    file -b "$f" | grep -q ELF || continue
+    is_elf "$f" || continue
     patchelf --set-rpath '$ORIGIN' "$f" 2>/dev/null || true
   done
   shopt -u nullglob
@@ -145,7 +150,8 @@ for need in libxdp.so.1 libbpf.so.1; do
   p="${LIB}/${need}"
   [ -f "$p" ] || { echo "[FATAL] missing $need" >&2; exit 1; }
   sz="$(stat -c%s "$p" 2>/dev/null || echo 0)"
-  [ "${sz:-0}" -ge 4096 ] && file -b "$p" | grep -q ELF || { echo "[FATAL] $need invalid" >&2; exit 1; }
+  [ "${sz:-0}" -ge 4096 ] || { echo "[FATAL] $need invalid (size ${sz})" >&2; exit 1; }
+  is_elf "$p" || { echo "[FATAL] $need invalid (not ELF)" >&2; exit 1; }
 done
 
 getconf GNU_LIBC_VERSION 2>/dev/null >"${ROOT}/libs/.sync_host_glibc.txt" || true

@@ -55,7 +55,7 @@ all: $(LIB_PREREQ) dirs $(BPF_OBJ) $(DB_LIB) $(TARGET)
 
 $(LIBS_ROOT)/.ready:
 	@test -f "$(CURDIR)/sh/sync_xdp_libs.sh" || (echo "[FATAL] missing $(CURDIR)/sh/sync_xdp_libs.sh" >&2; exit 127)
-	@fline=$$(head -n1 "$(CURDIR)/sh/sync_xdp_libs.sh" | tr -d '\r'); \
+	@fline=$$(awk 'NR==1{gsub(/\r/,""); print; exit}' "$(CURDIR)/sh/sync_xdp_libs.sh"); \
 	case "$$fline" in \
 	  '#!/usr/bin/env bash'|'#!/bin/bash'*) ;; \
 	  *) echo "[FATAL] sh/sync_xdp_libs.sh must start with a bash shebang (got: $$fline)." >&2; \
