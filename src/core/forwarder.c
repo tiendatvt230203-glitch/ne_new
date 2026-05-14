@@ -70,6 +70,7 @@ static uint64_t g_profile_hits[MAX_PROFILES];
 static uint64_t g_profile_miss_hits;
 static uint64_t g_profile_log_seq;
 static int g_tcp_diag_enabled = 0;
+static int g_tcp_diag_all_tcp = 0;
 
 
 static struct app_config *g_cfg_ptr = NULL;
@@ -106,6 +107,91 @@ static uint64_t monotonic_ms(void) {
 
 static int is_ssh_flow(uint8_t protocol, uint16_t src_port, uint16_t dst_port) {
     return (protocol == IPPROTO_TCP) && (src_port == 22 || dst_port == 22);
+}
+
+static int tcp_diag_want_log(uint8_t protocol, uint16_t src_port, uint16_t dst_port) {
+    if (!g_tcp_diag_enabled)
+        return 0;
+    if (g_tcp_diag_all_tcp)
+        return (protocol == IPPROTO_TCP);
+    return is_ssh_flow(protocol, src_port, dst_port);
+}
+
+/* Defaults match former NE_TCP_DIAG=1 NE_TCP_DIAG_ALL_TCP=1. Opt-out: NE_TCP_DIAG=0;
+ * restrict to SSH-only logs: NE_TCP_DIAG_ALL_TCP=0. */
+static int tcp_diag_env_is_off(const char *v) {
+    return v && v[0] == '0' && v[1] == '\0';
+}
+
+static void forwarder_tcp_diag_print_ssh_hypothesis_banner(void);
+
+static void forwarder_tcp_diag_apply_env(void) {
+    const char *diag = getenv("NE_TCP_DIAG");
+    g_tcp_diag_enabled = tcp_diag_env_is_off(diag) ? 0 : 1;
+
+    const char *all_tcp = getenv("NE_TCP_DIAG_ALL_TCP");
+    if (!g_tcp_diag_enabled)
+        g_tcp_diag_all_tcp = 0;
+    else
+        g_tcp_diag_all_tcp = tcp_diag_env_is_off(all_tcp) ? 0 : 1;
+
+    if (g_tcp_diag_enabled) {
+        fprintf(stderr, "[TCP-DIAG] on (default all TCP; NE_TCP_DIAG=0 off, NE_TCP_DIAG_ALL_TCP=0 SSH-only)\n");
+        fprintf(stderr,
+                "[NE-RX] CLASS=... ; [NE-CHAIN] root=... tren cung dong NE-RX/NE-TX de biet: "
+                "khong_toi_local vs sai_sau_ma_hoa_giai_ma_reasm vs loi_TX\n");
+        forwarder_tcp_diag_print_ssh_hypothesis_banner();
+    }
+}
+
+/* Tat ca gia thuyet SSH/TCP bat tay (trong pham vi NE) — grep [NE-HYP] */
+static void forwarder_tcp_diag_print_ssh_hypothesis_banner(void) {
+    fprintf(stderr,
+            "[NE-HYP] ===== CHECKLIST: SSH khong bat tay — loai tru theo log (tim dung nguyen nhan roi debug) "
+            "=====\n");
+    fprintf(stderr,
+            "[NE-HYP] H01_TX_STRICT_NO_POLICY: log [NE-TX] TX_NO_CRYPTO_POLICY_DROP hoac TX-SELECT cp=NULL + "
+            "policy_count>0 (strict matrix)\n");
+    fprintf(stderr,
+            "[NE-HYP] H02_TX_POLICY_BYPASS_WRONG: TX-SELECT bypass=1 nhung van mong enc — policy sai action\n");
+    fprintf(stderr,
+            "[NE-HYP] H03_TX_ENCRYPT_L2L3L4_FAIL: [NE-TX] TX_L2/L3/L4_ENCRYPT_FAIL hoac TX_*SPLIT_ENCRYPT_FAIL — "
+            "key, IV/nonce, buffer, layer khac RX\n");
+    fprintf(stderr,
+            "[NE-HYP] H04_TX_WAN_QUEUE_REJECT: [NE-TX] TX_WAN_SEND_FAIL / TX_BYPASS_WAN_SEND_FAIL — XSK TX day, "
+            "NIC\n");
+    fprintf(stderr,
+            "[NE-HYP] H05_TX_WORKER_RING_FULL: [NE-TX] TX_WORKER_RING_FULL — vong local->worker day, SYN drop "
+            "truoc ma hoa\n");
+    fprintf(stderr,
+            "[NE-HYP] H06_RX_WAN_DECRYPT_FAIL: [NE-RX] RX_L2_WAN_DECRYPT / RX_L2_MARKER / RX_L3/L4_*DECRYPT* — "
+            "key/policy id khac TX hoac wire khong phai cipher NE\n");
+    fprintf(stderr,
+            "[NE-HYP] H07_RX_REASSEMBLE_FAIL: [NE-RX] RX_*REASSEMBLE_FAIL — mat manh, ID fragment lech hai dau\n");
+    fprintf(stderr,
+            "[NE-HYP] H08_RX_BAD_PLAINTEXT: [NE-RX] POST_DECRYPT_* / TO_LOCAL_IPV4_SHAPE — mo xong nhung IPv4/TCP "
+            "vo ly\n");
+    fprintf(stderr,
+            "[NE-HYP] H09_RX_NO_DELIVERY_LOCAL: [NE-RX] RX_DST_MAC_NO_LOCAL / RX_LOCAL_INJECT — MAC dich, bang "
+            "MAC, AF_XDP toi local\n");
+    fprintf(stderr,
+            "[NE-HYP] H10_MATRIX_PEER_SQL_SAI: matrix vs peer SQL doi nguoc — policy_id/decrypt ctx khac may kia\n");
+    fprintf(stderr,
+            "[NE-HYP] H11_MULTI_WAN_ASYM: TX-SSH-TX-PRE wan# khac duong RX — mat goi hoac sai thu tu (profile/WRR)\n");
+    fprintf(stderr,
+            "[NE-HYP] H12_FRAG_PENDING_OR_MTU: tren wire co fragment nhung khong du manh — MTU/PMTU, timeout "
+            "reasm\n");
+    fprintf(stderr,
+            "[NE-HYP] H13_IP_ONLY_POLICY_PORTS: CRYPTO_POLICY_MATCH_IP_ONLY — port policy khong dung de match\n");
+    fprintf(stderr,
+            "[NE-HYP] H14_TCP_PIN_POLICY: tcp_policy_pin lech policy sau reload — grace / pin vs CIDR\n");
+    fprintf(stderr,
+            "[NE-HYP] H15_KHONG_PHAI_NE: tcpdump end-to-end; neu khong co [NE-TX]/[NE-RX] tuong ung flow thi "
+            "ngoai NE\n");
+    fprintf(stderr,
+            "[NE-HYP] Doc [NE-CHAIN] root= tren dong NE-RX/NE-TX de gom nhanh: NO_DELIVERY vs BAD_PLAINTEXT vs "
+            "RX_DECRYPT vs TX_*\n");
+    fprintf(stderr, "[NE-HYP] ===== het checklist =====\n");
 }
 
 static const char *policy_action_name(int action) {
@@ -187,6 +273,180 @@ static void log_tcp_diag_decrypt_len(const char *tag,
             (unsigned)old_len, (unsigned)new_len,
             post_parse_ok, (unsigned)post_proto,
             (unsigned)post_sport, (unsigned)post_dport);
+}
+
+/* Classify WAN→stack failures: wrong decrypt, bad reassembly, or cleartext shape after NE. */
+static int ne_rx_ipv4_frame_plausible(const uint8_t *pkt, uint32_t len) {
+    int l3 = crypto_eth_ipv4_offset(pkt, len);
+    if (l3 < 0 || (uint32_t)(l3 + 20) > len)
+        return 0;
+    const struct iphdr *ip = (const struct iphdr *)(pkt + (unsigned)l3);
+    if (ip->version != 4)
+        return 0;
+    uint32_t tot = (uint32_t)ntohs(ip->tot_len);
+    if (tot < 20u || (uint32_t)l3 + tot > len)
+        return 0;
+    int ihl = (int)ip->ihl * 4;
+    if (ihl < 20 || (uint32_t)l3 + (uint32_t)ihl > len)
+        return 0;
+    if (ip->protocol == IPPROTO_TCP) {
+        if ((uint32_t)l3 + (uint32_t)ihl + 20u > len)
+            return 0;
+    }
+    return 1;
+}
+
+/* Handshake-oriented: map CLASS -> one root cause + what to verify next (VN). */
+static void ne_chain_append_rx(const char *klass) {
+    const char *root = "RX_OTHER";
+    const char *vi = "Xem CLASS trong dong log.";
+    if (!klass)
+        klass = "";
+    if (strncmp(klass, "RX_DST_MAC", 10) == 0 || strncmp(klass, "RX_LOCAL_INJECT", 15) == 0) {
+        root = "NO_DELIVERY_TO_LOCAL_TCP";
+        vi = "Khong day duoc goi vao stack TCP local (MAC dich / bridge / hang doi AF_XDP). "
+             "Day KHONG phai loi ma hoa tren duong WAN den peer.";
+    } else if (strstr(klass, "POST_DECRYPT") != NULL || strstr(klass, "TO_LOCAL_IPV4_SHAPE") != NULL) {
+        root = "BAD_PLAINTEXT_AFTER_DECRYPT";
+        vi = "Giai ma xong nhung IPv4/TCP sai kich thuoc hoac parse fail: doi chieu policy+key+layer "
+             "voi TX va kiem tra reasm.";
+    } else if (strstr(klass, "DECRYPT") != NULL || strstr(klass, "REASSEMBLE") != NULL ||
+               strstr(klass, "_CTX") != NULL) {
+        root = "RX_DECRYPT_REASM_OR_KEY";
+        vi = "Peer co the gui dung nhung NE mo sai hoac rap manh sai: doi chieu TX (layer L2/L3/L4, "
+             "key, policy id) va trace fragment.";
+    }
+    fprintf(stderr, " [NE-CHAIN] root=%s vi=\"%s\"", root, vi);
+}
+
+static void ne_chain_append_tx(const char *klass) {
+    const char *root = "TX_OTHER";
+    const char *vi = "Xem CLASS trong dong log.";
+    if (!klass)
+        klass = "";
+    if (strstr(klass, "WORKER_RING") != NULL) {
+        root = "TX_WORKER_BACKPRESSURE";
+        vi = "Vong local->worker day: SYN co the bi drop truoc ma hoa — tang WORKER_RING_SIZE hoac giam tai.";
+    } else if (strstr(klass, "ENCRYPT") != NULL || strstr(klass, "SPLIT") != NULL) {
+        root = "TX_ENCRYPT_PIPELINE_FAIL";
+        vi = "Ma hoa that bai: peer thuong im hoac RST — debug policy, layer, buffer truoc khi nghi RX.";
+    } else if (strstr(klass, "NO_CRYPTO_POLICY") != NULL) {
+        root = "TX_POLICY_DROP";
+        vi = "Strict mode: khong policy khop — goi khong thanh cipher gui di, peer khong thay ban tin hop le.";
+    } else if (strstr(klass, "WAN_SEND") != NULL || strstr(klass, "BYPASS_WAN") != NULL) {
+        root = "TX_WAN_SEND_OR_QUEUE";
+        vi = "Ma hoa (hoac bypass) xong nhung khong day len WAN: hang doi XSK / NIC.";
+    }
+    fprintf(stderr, " [NE-CHAIN] root=%s vi=\"%s\"", root, vi);
+}
+
+static void ne_rx_class_log(const char *klass,
+                            const char *wan_if,
+                            int wan_idx,
+                            const char *phase,
+                            const char *why,
+                            uint32_t wire_len,
+                            int wire_have_flow,
+                            uint32_t sip,
+                            uint16_t sport,
+                            uint32_t dip,
+                            uint16_t dport,
+                            uint8_t proto,
+                            const char *detail) {
+    if (!g_tcp_diag_enabled)
+        return;
+    if (wire_have_flow && !tcp_diag_want_log(proto, sport, dport))
+        return;
+    fprintf(stderr, "[NE-RX][CLASS=%s][wan=%s#%d][phase=%s] why=%s",
+            klass, wan_if && wan_if[0] ? wan_if : "?", wan_idx,
+            phase && phase[0] ? phase : "-", why && why[0] ? why : "-");
+    if (wire_have_flow) {
+        char a[INET_ADDRSTRLEN], b[INET_ADDRSTRLEN];
+        struct in_addr sa = { .s_addr = sip };
+        struct in_addr da = { .s_addr = dip };
+        if (inet_ntop(AF_INET, &sa, a, sizeof(a)) && inet_ntop(AF_INET, &da, b, sizeof(b)))
+            fprintf(stderr, " %s:%u->%s:%u proto=%u", a, (unsigned)sport, b, (unsigned)dport, (unsigned)proto);
+        else
+            fprintf(stderr, " flow=(ntop_fail)");
+    } else {
+        fprintf(stderr, " flow=(wire_parse_fail)");
+    }
+    fprintf(stderr, " wire_len=%u", (unsigned)wire_len);
+    if (detail && detail[0])
+        fprintf(stderr, " %s", detail);
+    ne_chain_append_rx(klass);
+    fprintf(stderr, "\n");
+}
+
+static void ne_rx_pkt_recv_log(const struct xsk_interface *wan,
+                               int wan_idx,
+                               const uint8_t *pkt,
+                               uint32_t pkt_len,
+                               int wire_have_flow,
+                               uint32_t sip,
+                               uint16_t sport,
+                               uint32_t dip,
+                               uint16_t dport,
+                               uint8_t proto) {
+    if (!g_tcp_diag_enabled)
+        return;
+    if (wire_have_flow && !tcp_diag_want_log(proto, sport, dport))
+        return;
+    unsigned eth = 0;
+    if (pkt && pkt_len >= 14)
+        eth = ((unsigned)pkt[12] << 8) | pkt[13];
+    fprintf(stderr,
+            "[NE-RX][RX_PKT][wan=%s#%d] len=%u ethertype=0x%04x",
+            wan && wan->ifname[0] ? wan->ifname : "?", wan_idx, (unsigned)pkt_len, eth);
+    if (wire_have_flow) {
+        char a[INET_ADDRSTRLEN], b[INET_ADDRSTRLEN];
+        struct in_addr sa = { .s_addr = sip };
+        struct in_addr da = { .s_addr = dip };
+        if (inet_ntop(AF_INET, &sa, a, sizeof(a)) && inet_ntop(AF_INET, &da, b, sizeof(b)))
+            fprintf(stderr, " %s:%u->%s:%u proto=%u", a, (unsigned)sport, b, (unsigned)dport, (unsigned)proto);
+    } else {
+        fprintf(stderr, " flow=(unparsed_on_wire)");
+    }
+    fprintf(stderr,
+            " | if_peer_silent_suspect_NE_TX | if_peer_replies_gibberish_suspect_NE_RX_decrypt_reasm"
+            " [NE-CHAIN] root=RX_PKT_OBSERVE next=neu_co_NE-RX_CLASS_thi_do_theo_root_cua_CLASS\n");
+}
+
+static void ne_tx_class_log(const char *klass,
+                            const char *path,
+                            const char *why,
+                            int local_idx,
+                            const char *wan_if,
+                            int wan_idx,
+                            int flow_ok,
+                            uint32_t sip,
+                            uint16_t sport,
+                            uint32_t dip,
+                            uint16_t dport,
+                            uint8_t proto,
+                            uint32_t len,
+                            const char *detail) {
+    if (!g_tcp_diag_enabled)
+        return;
+    if (flow_ok && !tcp_diag_want_log(proto, sport, dport))
+        return;
+    fprintf(stderr, "[NE-TX][CLASS=%s][path=%s][local=%d][wan=%s#%d] why=%s",
+            klass, path && path[0] ? path : "-", local_idx,
+            wan_if && wan_if[0] ? wan_if : "?", wan_idx,
+            why && why[0] ? why : "-");
+    if (flow_ok) {
+        char a[INET_ADDRSTRLEN], b[INET_ADDRSTRLEN];
+        struct in_addr sa = { .s_addr = sip };
+        struct in_addr da = { .s_addr = dip };
+        if (inet_ntop(AF_INET, &sa, a, sizeof(a)) && inet_ntop(AF_INET, &da, b, sizeof(b)))
+            fprintf(stderr, " %s:%u->%s:%u proto=%u", a, (unsigned)sport, b, (unsigned)dport, (unsigned)proto);
+    } else
+        fprintf(stderr, " flow=(unparsed)");
+    fprintf(stderr, " len=%u", (unsigned)len);
+    if (detail && detail[0])
+        fprintf(stderr, " %s", detail);
+    ne_chain_append_tx(klass);
+    fprintf(stderr, " | TX_path_peer_may_be_silent\n");
 }
 
 static int prev_policy_grace_active(void) {
@@ -620,6 +880,45 @@ static int tcp_ipv4_tcp_flags(void *pkt_data, uint32_t pkt_len, uint8_t *flags_o
     uint8_t *th = pkt + l3_off + ip_hdr_len;
     *flags_out = th[13];
     return 0;
+}
+
+static void tcp_diag_flags_fmt(uint8_t f, char *buf, size_t buflen) {
+    size_t n = 0;
+    if (!buf || buflen < 8)
+        return;
+    buf[0] = '\0';
+    if (f & TH_FIN) {
+        int r = snprintf(buf + n, buflen - n, "%sFIN", n ? "," : "");
+        if (r > 0)
+            n += (size_t)r;
+    }
+    if (f & TH_SYN) {
+        int r = snprintf(buf + n, buflen - n, "%sSYN", n ? "," : "");
+        if (r > 0)
+            n += (size_t)r;
+    }
+    if (f & TH_RST) {
+        int r = snprintf(buf + n, buflen - n, "%sRST", n ? "," : "");
+        if (r > 0)
+            n += (size_t)r;
+    }
+    if (f & TH_PUSH) {
+        int r = snprintf(buf + n, buflen - n, "%sPSH", n ? "," : "");
+        if (r > 0)
+            n += (size_t)r;
+    }
+    if (f & TH_ACK) {
+        int r = snprintf(buf + n, buflen - n, "%sACK", n ? "," : "");
+        if (r > 0)
+            n += (size_t)r;
+    }
+    if (f & TH_URG) {
+        int r = snprintf(buf + n, buflen - n, "%sURG", n ? "," : "");
+        if (r > 0)
+            n += (size_t)r;
+    }
+    if (n == 0)
+        snprintf(buf, buflen, "0x%02x", (unsigned)f);
 }
 
 static int select_wan_idx_for_packet(struct forwarder *fwd,
@@ -1955,6 +2254,9 @@ static void *local_queue_thread_l2(void *arg) {
                     __sync_fetch_and_add(&fwd->local_to_wan, 1);
                     wan_used[wan_idx] = 1;
                 } else {
+                    ne_tx_class_log("TX_BYPASS_WAN_SEND_FAIL", "LOCAL_L2_THREAD", "bypass_wan_send_reject",
+                                    local_idx, wan->ifname, wan_idx, flow_ok, src_ip, src_port, dst_ip, dst_port,
+                                    protocol, pkt_len, "interface_send_batch_queue bypass");
                     __sync_fetch_and_add(&fwd->total_dropped, 1);
                 }
                 continue;
@@ -1970,22 +2272,34 @@ static void *local_queue_thread_l2(void *arg) {
                         __sync_fetch_and_add(&fwd->local_to_wan, 1);
                         wan_used[wan_idx] = 1;
                     } else {
+                        ne_tx_class_log("TX_L2_WAN_SEND_FAIL", "LOCAL_L2_THREAD", "wan_batch_queue_reject_part1",
+                                        local_idx, wan->ifname, wan_idx, flow_ok, src_ip, src_port, dst_ip,
+                                        dst_port, protocol, l1, "frag1");
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                     }
                     if (interface_send_batch_queue(wan, tq, f2, l2) == 0) {
                         __sync_fetch_and_add(&fwd->local_to_wan, 1);
                         wan_used[wan_idx] = 1;
                     } else {
+                        ne_tx_class_log("TX_L2_WAN_SEND_FAIL", "LOCAL_L2_THREAD", "wan_batch_queue_reject_part2",
+                                        local_idx, wan->ifname, wan_idx, flow_ok, src_ip, src_port, dst_ip,
+                                        dst_port, protocol, l2, "frag2");
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                     }
                 } else {
                     __sync_fetch_and_add(&fwd->total_dropped, 1);
+                    ne_tx_class_log("TX_L2_SPLIT_ENCRYPT_FAIL", "LOCAL_L2_THREAD", "L2_split_encrypt_failed",
+                                    local_idx, wan->ifname, wan_idx, flow_ok, src_ip, src_port, dst_ip, dst_port,
+                                    protocol, pkt_len, "frag_split_and_encrypt_l2");
                     continue;
                 }
             }
 
             if (!split_done) {
                 if (encrypt_packet_with_ctx(use_ctx, pkt_ptrs[i], &pkt_len) != 0) {
+                    ne_tx_class_log("TX_L2_ENCRYPT_FAIL", "LOCAL_L2_THREAD", "L2_encrypt_packet_with_ctx_failed",
+                                    local_idx, wan->ifname, wan_idx, flow_ok, src_ip, src_port, dst_ip, dst_port,
+                                    protocol, pkt_lens[i], "encrypt_packet_with_ctx");
                     __sync_fetch_and_add(&fwd->total_dropped, 1);
                     continue;
                 }
@@ -1994,6 +2308,9 @@ static void *local_queue_thread_l2(void *arg) {
                     __sync_fetch_and_add(&fwd->local_to_wan, 1);
                     wan_used[wan_idx] = 1;
                 } else {
+                    ne_tx_class_log("TX_L2_WAN_SEND_FAIL", "LOCAL_L2_THREAD", "wan_batch_queue_reject",
+                                    local_idx, wan->ifname, wan_idx, flow_ok, src_ip, src_port, dst_ip, dst_port,
+                                    protocol, pkt_len, "interface_send_batch_queue");
                     __sync_fetch_and_add(&fwd->total_dropped, 1);
                 }
             }
@@ -2059,6 +2376,16 @@ static void *local_queue_thread_l3l4(void *arg) {
             pthread_mutex_unlock(&ring->lock);
 
             if (!enqueued) {
+                uint32_t sip = 0, dip = 0;
+                uint16_t sp = 0, dp = 0;
+                uint8_t pr = 0;
+                int pfo = (parse_flow(pkt_ptrs[i], pkt_lens[i], &sip, &dip, &sp, &dp, &pr) == 0);
+                const char *lif = (local_idx >= 0 && local_idx < fwd->local_count)
+                                      ? fwd->locals[local_idx].ifname
+                                      : "?";
+                ne_tx_class_log("TX_WORKER_RING_FULL", "LOCAL_L3L4_THREAD", "g_worker_ring_saturated", local_idx,
+                                lif, -1, pfo, sip, sp, dip, dp, pr, pkt_lens[i],
+                                "WORKER_RING_SIZE see NE-HYP H05");
                 __sync_fetch_and_add(&fwd->total_dropped, 1);
                 interface_recv_release_single_queue(local, queue_idx, &addrs[i], 1);
             }
@@ -2104,9 +2431,24 @@ static void *wan_queue_thread_l2(void *arg) {
             uint8_t *final_pkt = pkt;
             uint32_t final_len = pkt_len;
 
+            {
+                uint32_t sip = 0, dip = 0;
+                uint16_t sp = 0, dp = 0;
+                uint8_t pr = 0;
+                int wf = (parse_flow(pkt, pkt_len, &sip, &dip, &sp, &dp, &pr) == 0);
+                ne_rx_pkt_recv_log(wan, wan_idx, pkt, pkt_len, wf, sip, sp, dip, dp, pr);
+            }
+
 
             if (decrypt_packet_auto_l2(fwd, pkt, &pkt_len,
                                         decrypt_scratch, sizeof(decrypt_scratch)) != 0) {
+                uint32_t sip = 0, dip = 0;
+                uint16_t sp = 0, dp = 0;
+                uint8_t pr = 0;
+                int wf = (parse_flow(pkt, pkt_lens[i], &sip, &dip, &sp, &dp, &pr) == 0);
+                ne_rx_class_log("RX_L2_WAN_DECRYPT_FAIL", wan->ifname, wan_idx, "RX_L2_WAN",
+                                "L2_decrypt_fail_on_WAN", pkt_lens[i], wf, sip, sp, dip, dp, pr,
+                                "decrypt_packet_auto_l2");
                 __sync_fetch_and_add(&fwd->total_dropped, 1);
                 continue;
             }
@@ -2123,6 +2465,14 @@ static void *wan_queue_thread_l2(void *arg) {
                         continue;
                     }
                     if (rr != 1) {
+                        char detail[80];
+                        snprintf(detail, sizeof(detail), "L2_frag opid=%u idx=%u rr=%d", fpid, fidx, rr);
+                        uint32_t sip = 0, dip = 0;
+                        uint16_t sp = 0, dp = 0;
+                        uint8_t pr = 0;
+                        int wf = (parse_flow(pkt, pkt_len, &sip, &dip, &sp, &dp, &pr) == 0);
+                        ne_rx_class_log("RX_L2_REASSEMBLE_FAIL", wan->ifname, wan_idx, "RX_L2_FRAG",
+                                        "L2_reassemble_fail", pkt_len, wf, sip, sp, dip, dp, pr, detail);
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                         continue;
                     }
@@ -2140,14 +2490,16 @@ static void *wan_queue_thread_l2(void *arg) {
                 uint32_t fs = 0, fd = 0;
                 uint16_t fsp = 0, fdp = 0;
                 uint8_t fp = 0;
-                if (g_tcp_diag_enabled &&
-                    parse_flow(final_pkt, final_len, &fs, &fd, &fsp, &fdp, &fp) == 0 &&
-                    is_ssh_flow(fp, fsp, fdp)) {
+                int pf = (parse_flow(final_pkt, final_len, &fs, &fd, &fsp, &fdp, &fp) == 0);
+                if (pf && tcp_diag_want_log(fp, fsp, fdp)) {
                     fprintf(stderr, "[TCP-DIAG][DROP-NO-LOCAL] dst_mac=%02x:%02x:%02x:%02x:%02x:%02x flow=%u:%u -> %u:%u len=%u\n",
                             final_pkt[0], final_pkt[1], final_pkt[2],
                             final_pkt[3], final_pkt[4], final_pkt[5],
                             ntohl(fs), (unsigned)fsp, ntohl(fd), (unsigned)fdp, (unsigned)final_len);
                 }
+                ne_rx_class_log("RX_DST_MAC_NO_LOCAL", wan->ifname, wan_idx, "TO_LOCAL",
+                                "dst_mac_unknown_bridge", final_len, pf, fs, fsp, fd, fdp, fp,
+                                "L2_only_WAN_RX_path");
                 __sync_fetch_and_add(&fwd->total_dropped, 1);
                 __sync_fetch_and_add(&fwd->dropped_no_local_match, 1);
                 continue;
@@ -2177,13 +2529,15 @@ static void *wan_queue_thread_l2(void *arg) {
                 uint32_t fs = 0, fd = 0;
                 uint16_t fsp = 0, fdp = 0;
                 uint8_t fp = 0;
-                if (g_tcp_diag_enabled &&
-                    parse_flow(final_pkt, final_len, &fs, &fd, &fsp, &fdp, &fp) == 0 &&
-                    is_ssh_flow(fp, fsp, fdp)) {
+                int pf = (parse_flow(final_pkt, final_len, &fs, &fd, &fsp, &fdp, &fp) == 0);
+                if (pf && tcp_diag_want_log(fp, fsp, fdp)) {
                     fprintf(stderr, "[TCP-DIAG][DROP-LOCAL-TX] local=%s q=%d flow=%u:%u -> %u:%u len=%u\n",
                             local_iface->ifname, tq,
                             ntohl(fs), (unsigned)fsp, ntohl(fd), (unsigned)fdp, (unsigned)final_len);
                 }
+                ne_rx_class_log("RX_LOCAL_INJECT_BATCH_FAIL", wan->ifname, wan_idx, "TO_LOCAL",
+                                "af_xdp_local_queue_reject", final_len, pf, fs, fsp, fd, fdp, fp,
+                                "L2_only_WAN_RX_path");
                 __sync_fetch_and_add(&fwd->total_dropped, 1);
                 __sync_fetch_and_add(&fwd->dropped_local_tx_fail, 1);
             }
@@ -2247,7 +2601,9 @@ static void *wan_queue_thread_l3l4(void *arg) {
                                            &wire_src_ip, &wire_dst_ip,
                                            &wire_src_port, &wire_dst_port,
                                            &wire_proto) == 0);
-            if (wire_flow_ok && is_ssh_flow(wire_proto, wire_src_port, wire_dst_port)) {
+            ne_rx_pkt_recv_log(wan, wan_idx, pkt, wire_len, wire_flow_ok,
+                               wire_src_ip, wire_src_port, wire_dst_ip, wire_dst_port, wire_proto);
+            if (wire_flow_ok && tcp_diag_want_log(wire_proto, wire_src_port, wire_dst_port)) {
                 uint8_t l3pid = 0, l4pid = 0;
                 int l4nonce = 0;
                 int l3ok = (crypto_l3_extract_policy_id(wire_pkt, wire_len, &l3pid) == 0);
@@ -2296,6 +2652,10 @@ static void *wan_queue_thread_l3l4(void *arg) {
                     if (decrypt_packet_auto_l2(fwd, pkt, &pkt_len,
                                                decrypt_scratch,
                                                sizeof(decrypt_scratch)) != 0) {
+                        ne_rx_class_log("RX_L2_MARKER_DECRYPT_FAIL", wan->ifname, wan_idx, "RX_L2_MARKER",
+                                        "L2_decrypt_fail_on_L3L4_thread", wire_len, wire_flow_ok,
+                                        wire_src_ip, wire_src_port, wire_dst_ip, wire_dst_port, wire_proto,
+                                        "decrypt_packet_auto_l2");
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                         continue;
                     }
@@ -2314,6 +2674,13 @@ static void *wan_queue_thread_l3l4(void *arg) {
                     }
                     struct packet_crypto_ctx *l3ctx = forwarder_resolve_l3_decrypt_ctx(fwd, pkt, pkt_len);
                     if (!l3ctx) {
+                        char detail[96];
+                        snprintf(detail, sizeof(detail), "L3_frag opid=%u idx=%u no_decrypt_ctx", l3_frag_pid,
+                                 l3_frag_idx);
+                        ne_rx_class_log("RX_L3_FRAG_NO_DECRYPT_CTX", wan->ifname, wan_idx, "RX_L3_FRAG",
+                                        "L3_frag_no_crypto_ctx_or_policy", wire_len, wire_flow_ok,
+                                        wire_src_ip, wire_src_port, wire_dst_ip, wire_dst_port, wire_proto,
+                                        detail);
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                         continue;
                     }
@@ -2321,6 +2688,13 @@ static void *wan_queue_thread_l3l4(void *arg) {
                     uint8_t ofidx;
                     int nd = frag_decrypt_fragment(l3ctx, pkt, pkt_len, &opid, &ofidx);
                     if (nd < 0) {
+                        char detail[96];
+                        snprintf(detail, sizeof(detail), "L3_frag opid=%u idx=%u frag_decrypt rc=%d", opid, ofidx,
+                                 nd);
+                        ne_rx_class_log("RX_L3_FRAG_DECRYPT_FAIL", wan->ifname, wan_idx, "RX_L3_FRAG",
+                                        "L3_frag_decrypt_fail_key_or_corrupt", wire_len, wire_flow_ok,
+                                        wire_src_ip, wire_src_port, wire_dst_ip, wire_dst_port, wire_proto,
+                                        detail);
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                         continue;
                     }
@@ -2333,6 +2707,12 @@ static void *wan_queue_thread_l3l4(void *arg) {
                         continue;
                     }
                     if (rr != 1) {
+                        char detail[96];
+                        snprintf(detail, sizeof(detail), "L3_frag opid=%u idx=%u rr=%d", opid, ofidx, rr);
+                        ne_rx_class_log("RX_L3_REASSEMBLE_FAIL", wan->ifname, wan_idx, "RX_L3_FRAG",
+                                        "L3_reassemble_fail_fragment_state", wire_len, wire_flow_ok,
+                                        wire_src_ip, wire_src_port, wire_dst_ip, wire_dst_port, wire_proto,
+                                        detail);
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                         continue;
                     }
@@ -2345,8 +2725,11 @@ static void *wan_queue_thread_l3l4(void *arg) {
                     uint32_t ds = 0, dd = 0;
                     uint16_t dsp = 0, ddp = 0;
                     uint8_t dproto = 0;
-                    if (parse_flow(wire_pkt, wire_len, &ds, &dd, &dsp, &ddp, &dproto) == 0 &&
-                        is_ssh_flow(dproto, dsp, ddp)) {
+                    int pfl3 = (parse_flow(wire_pkt, wire_len, &ds, &dd, &dsp, &ddp, &dproto) == 0);
+                    ne_rx_class_log("RX_L3_FULL_DECRYPT_FAIL", wan->ifname, wan_idx, "RX_L3_FULL",
+                                    "L3_full_decrypt_fail_key_or_corrupt", wire_len, pfl3, ds, dsp, dd, ddp, dproto,
+                                    "decrypt_packet_auto_by_action enc_l3");
+                    if (pfl3 && tcp_diag_want_log(dproto, dsp, ddp)) {
                         uint8_t l3pid = 0;
                         int l4nonce = 0;
                         uint8_t l4pid = 0;
@@ -2375,6 +2758,13 @@ static void *wan_queue_thread_l3l4(void *arg) {
                 if (frag_is_fragment_l4(pkt, pkt_len, &l4_frag_pid, &l4_frag_idx)) {
                     struct packet_crypto_ctx *l4ctx = forwarder_resolve_l4_decrypt_ctx(fwd, pkt, pkt_len);
                     if (!l4ctx) {
+                        char detail[96];
+                        snprintf(detail, sizeof(detail), "L4_frag opid=%u idx=%u no_decrypt_ctx", l4_frag_pid,
+                                 l4_frag_idx);
+                        ne_rx_class_log("RX_L4_FRAG_NO_DECRYPT_CTX", wan->ifname, wan_idx, "RX_L4_FRAG",
+                                        "L4_frag_no_crypto_ctx_or_policy", wire_len, wire_flow_ok,
+                                        wire_src_ip, wire_src_port, wire_dst_ip, wire_dst_port, wire_proto,
+                                        detail);
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                         continue;
                     }
@@ -2382,6 +2772,13 @@ static void *wan_queue_thread_l3l4(void *arg) {
                     uint8_t ofidx2;
                     int nd4 = frag_decrypt_fragment_l4(l4ctx, pkt, pkt_len, &opid2, &ofidx2);
                     if (nd4 < 0) {
+                        char detail[96];
+                        snprintf(detail, sizeof(detail), "L4_frag opid=%u idx=%u frag_decrypt rc=%d", opid2,
+                                 ofidx2, nd4);
+                        ne_rx_class_log("RX_L4_FRAG_DECRYPT_FAIL", wan->ifname, wan_idx, "RX_L4_FRAG",
+                                        "L4_frag_decrypt_fail_key_or_corrupt", wire_len, wire_flow_ok,
+                                        wire_src_ip, wire_src_port, wire_dst_ip, wire_dst_port, wire_proto,
+                                        detail);
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                         continue;
                     }
@@ -2394,6 +2791,12 @@ static void *wan_queue_thread_l3l4(void *arg) {
                         continue;
                     }
                     if (rr4 != 1) {
+                        char detail[96];
+                        snprintf(detail, sizeof(detail), "L4_frag opid=%u idx=%u rr=%d", opid2, ofidx2, rr4);
+                        ne_rx_class_log("RX_L4_REASSEMBLE_FAIL", wan->ifname, wan_idx, "RX_L4_FRAG",
+                                        "L4_reassemble_fail_fragment_state", wire_len, wire_flow_ok,
+                                        wire_src_ip, wire_src_port, wire_dst_ip, wire_dst_port, wire_proto,
+                                        detail);
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                         continue;
                     }
@@ -2406,8 +2809,11 @@ static void *wan_queue_thread_l3l4(void *arg) {
                     uint32_t ds = 0, dd = 0;
                     uint16_t dsp = 0, ddp = 0;
                     uint8_t dproto = 0;
-                    if (parse_flow(wire_pkt, wire_len, &ds, &dd, &dsp, &ddp, &dproto) == 0 &&
-                        is_ssh_flow(dproto, dsp, ddp)) {
+                    int pfl4 = (parse_flow(wire_pkt, wire_len, &ds, &dd, &dsp, &ddp, &dproto) == 0);
+                    ne_rx_class_log("RX_L4_FULL_DECRYPT_FAIL", wan->ifname, wan_idx, "RX_L4_FULL",
+                                    "L4_full_decrypt_fail_key_or_corrupt", wire_len, pfl4, ds, dsp, dd, ddp, dproto,
+                                    "decrypt_packet_auto_by_action enc_l4");
+                    if (pfl4 && tcp_diag_want_log(dproto, dsp, ddp)) {
                         uint8_t l3pid = 0;
                         int l4nonce = 0;
                         uint8_t l4pid = 0;
@@ -2422,7 +2828,7 @@ static void *wan_queue_thread_l3l4(void *arg) {
                     }
                     __sync_fetch_and_add(&fwd->total_dropped, 1);
                     continue;
-                } else if (wire_flow_ok && is_ssh_flow(wire_proto, wire_src_port, wire_dst_port)) {
+                } else if (wire_flow_ok && tcp_diag_want_log(wire_proto, wire_src_port, wire_dst_port)) {
                     uint32_t ps = 0, pd = 0;
                     uint16_t psp = 0, pdp = 0;
                     uint8_t pp = 0;
@@ -2432,6 +2838,29 @@ static void *wan_queue_thread_l3l4(void *arg) {
                                              wire_len, pkt_len,
                                              post_ok, post_ok ? pp : 0,
                                              post_ok ? psp : 0, post_ok ? pdp : 0);
+                    if (g_tcp_diag_enabled &&
+                        is_ssh_flow(wire_proto, wire_src_port, wire_dst_port)) {
+                        uint8_t tf = 0;
+                        char fg[64];
+                        if (tcp_ipv4_tcp_flags(pkt, pkt_len, &tf) == 0)
+                            tcp_diag_flags_fmt(tf, fg, sizeof(fg));
+                        else
+                            snprintf(fg, sizeof(fg), "unk");
+                        fprintf(stderr,
+                                "[TCP-DIAG][SSH-RX-DEC] post_dec tcp=[%s] cleartext_len=%u\n",
+                                fg, (unsigned)pkt_len);
+                    }
+                    if (!post_ok) {
+                        ne_rx_class_log("RX_POST_DECRYPT_PARSE_FAIL", wan->ifname, wan_idx, "POST_DECRYPT",
+                                        "cleartext_parse_fail_NE_output_corrupt", wire_len, wire_flow_ok,
+                                        wire_src_ip, wire_src_port, wire_dst_ip, wire_dst_port, wire_proto,
+                                        "parse_flow failed after decrypt");
+                    } else if (!ne_rx_ipv4_frame_plausible(pkt, pkt_len)) {
+                        ne_rx_class_log("RX_POST_DECRYPT_IPV4_SHAPE_BAD", wan->ifname, wan_idx, "POST_DECRYPT",
+                                        "cleartext_IPv4_length_inconsistent", wire_len, 1,
+                                        ps, psp, pd, pdp, pp,
+                                        "totlen/ihl/tcp vs buffer after decrypt");
+                    }
                 } else if (inbound_policy_pi < 0) {
                     uint8_t l4_pid = 0;
                     int l4_nonce = 0;
@@ -2450,11 +2879,28 @@ static void *wan_queue_thread_l3l4(void *arg) {
                 uint16_t fsp = 0, fdp = 0;
                 uint8_t fp = 0;
                 if (parse_flow(final_pkt, final_len, &fs, &fd, &fsp, &fdp, &fp) == 0 &&
-                    is_ssh_flow(fp, fsp, fdp)) {
+                    tcp_diag_want_log(fp, fsp, fdp)) {
                     log_tcp_diag_decrypt("RX-TO-LOCAL",
                                          fs, fsp, fd, fdp,
                                          POLICY_ACTION_ENCRYPT_L4,
                                          0, -1, 0, -1, 0, 0);
+                    if (!ne_rx_ipv4_frame_plausible((const uint8_t *)final_pkt, final_len)) {
+                        ne_rx_class_log("RX_TO_LOCAL_IPV4_SHAPE_BAD", wan->ifname, wan_idx, "TO_LOCAL",
+                                        "cleartext_IPv4_bad_before_inject", final_len, 1, fs, fsp, fd, fdp, fp,
+                                        "frame not plausible before AF_XDP to local");
+                    }
+                    if (g_tcp_diag_enabled && fp == IPPROTO_TCP &&
+                        is_ssh_flow(fp, fsp, fdp)) {
+                        uint8_t tf = 0;
+                        char fg[64];
+                        if (tcp_ipv4_tcp_flags(final_pkt, final_len, &tf) == 0)
+                            tcp_diag_flags_fmt(tf, fg, sizeof(fg));
+                        else
+                            snprintf(fg, sizeof(fg), "unk");
+                        fprintf(stderr,
+                                "[TCP-DIAG][SSH-RX-TO-LOCAL] tcp=[%s] len=%u\n",
+                                fg, (unsigned)final_len);
+                    }
                 }
             }
 
@@ -2469,6 +2915,19 @@ static void *wan_queue_thread_l3l4(void *arg) {
 
             int local_idx = local_idx_from_dst_mac(fwd, final_pkt, final_len);
             if (local_idx < 0) {
+                uint32_t fs = 0, fd = 0;
+                uint16_t fsp = 0, fdp = 0;
+                uint8_t fp = 0;
+                int pf = (parse_flow(final_pkt, final_len, &fs, &fd, &fsp, &fdp, &fp) == 0);
+                if (pf && tcp_diag_want_log(fp, fsp, fdp)) {
+                    fprintf(stderr, "[TCP-DIAG][DROP-NO-LOCAL] dst_mac=%02x:%02x:%02x:%02x:%02x:%02x flow=%u:%u -> %u:%u len=%u\n",
+                            final_pkt[0], final_pkt[1], final_pkt[2],
+                            final_pkt[3], final_pkt[4], final_pkt[5],
+                            ntohl(fs), (unsigned)fsp, ntohl(fd), (unsigned)fdp, (unsigned)final_len);
+                }
+                ne_rx_class_log("RX_DST_MAC_NO_LOCAL", wan->ifname, wan_idx, "TO_LOCAL",
+                                "dst_mac_unknown_bridge", final_len, pf, fs, fsp, fd, fdp, fp,
+                                "L3L4_WAN_RX_path");
                 __sync_fetch_and_add(&fwd->total_dropped, 1);
                 __sync_fetch_and_add(&fwd->dropped_no_local_match, 1);
                 continue;
@@ -2495,6 +2954,18 @@ static void *wan_queue_thread_l3l4(void *arg) {
                 if (tq < 32)
                     local_used_queues[local_idx] |= (1u << tq);
             } else {
+                uint32_t fs = 0, fd = 0;
+                uint16_t fsp = 0, fdp = 0;
+                uint8_t fp = 0;
+                int pf = (parse_flow(final_pkt, final_len, &fs, &fd, &fsp, &fdp, &fp) == 0);
+                if (pf && tcp_diag_want_log(fp, fsp, fdp)) {
+                    fprintf(stderr, "[TCP-DIAG][DROP-LOCAL-TX] local=%s q=%d flow=%u:%u -> %u:%u len=%u\n",
+                            local_iface->ifname, tq,
+                            ntohl(fs), (unsigned)fsp, ntohl(fd), (unsigned)fdp, (unsigned)final_len);
+                }
+                ne_rx_class_log("RX_LOCAL_INJECT_BATCH_FAIL", wan->ifname, wan_idx, "TO_LOCAL",
+                                "af_xdp_local_queue_reject", final_len, pf, fs, fsp, fd, fdp, fp,
+                                "interface_send_to_local_batch_queue rejected");
                 __sync_fetch_and_add(&fwd->total_dropped, 1);
                 __sync_fetch_and_add(&fwd->dropped_local_tx_fail, 1);
             }
@@ -2597,7 +3068,25 @@ static void *worker_thread(void *arg) {
         int tq = wan_tx_q[wan_idx];
 
         uint32_t pkt_len = job.pkt_len;
+        const uint32_t cleartext_len = job.pkt_len;
 
+        if (g_tcp_diag_enabled && flow_ok && is_ssh_flow(protocol, src_port, dst_port)) {
+            char fg[64];
+            char sip[INET_ADDRSTRLEN], dip[INET_ADDRSTRLEN];
+            struct in_addr sa = { .s_addr = src_ip };
+            struct in_addr da = { .s_addr = dst_ip };
+            if (tcp_flags_ok)
+                tcp_diag_flags_fmt(tcp_flags, fg, sizeof(fg));
+            else
+                snprintf(fg, sizeof(fg), "unk");
+            inet_ntop(AF_INET, &sa, sip, sizeof(sip));
+            inet_ntop(AF_INET, &da, dip, sizeof(dip));
+            fprintf(stderr,
+                    "[TCP-DIAG][SSH-TX-PRE] %s:%u -> %s:%u local_idx=%d wan=%d(%s) wan_q=%u len=%u tcp=[%s]\n",
+                    sip, (unsigned)src_port, dip, (unsigned)dst_port,
+                    job.local_idx, wan_idx, wan->ifname, (unsigned)tq,
+                    (unsigned)cleartext_len, fg);
+        }
 
         const struct crypto_policy *cp = NULL;
         struct packet_crypto_ctx *use_ctx = &crypto_ctx;
@@ -2629,6 +3118,21 @@ static void *worker_thread(void *arg) {
                 } else {
 #if !CRYPTO_POLICY_PASS_UNMATCHED
                     if (fwd->cfg && fwd->cfg->policy_count > 0) {
+                        if (g_tcp_diag_enabled && flow_ok &&
+                            is_ssh_flow(protocol, src_port, dst_port)) {
+                            char sip[INET_ADDRSTRLEN], dip[INET_ADDRSTRLEN];
+                            struct in_addr sa = { .s_addr = src_ip };
+                            struct in_addr da = { .s_addr = dst_ip };
+                            inet_ntop(AF_INET, &sa, sip, sizeof(sip));
+                            inet_ntop(AF_INET, &da, dip, sizeof(dip));
+                            fprintf(stderr,
+                                    "[TCP-DIAG][SSH-TX-DROP-NO-POLICY] %s:%u -> %s:%u len=%u (no cp, policy_count=%d)\n",
+                                    sip, (unsigned)src_port, dip, (unsigned)dst_port,
+                                    (unsigned)job.pkt_len, fwd->cfg->policy_count);
+                        }
+                        ne_tx_class_log("TX_NO_CRYPTO_POLICY_DROP", "WORKER_L3L4", "strict_mode_no_matching_policy",
+                                        job.local_idx, wan->ifname, wan_idx, flow_ok, src_ip, src_port, dst_ip, dst_port,
+                                        protocol, job.pkt_len, "CRYPTO_POLICY_PASS_UNMATCHED=0");
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                         goto release_local;
                     }
@@ -2637,7 +3141,7 @@ static void *worker_thread(void *arg) {
                 }
             }
 
-            if (flow_ok && is_ssh_flow(protocol, src_port, dst_port)) {
+            if (flow_ok && tcp_diag_want_log(protocol, src_port, dst_port)) {
                 log_tcp_diag_policy_select("TX-SELECT",
                                            src_ip, src_port, dst_ip, dst_port,
                                            cp, bypass_crypto);
@@ -2657,10 +3161,24 @@ static void *worker_thread(void *arg) {
             }
 
             if (bypass_crypto) {
-                if (interface_send_batch_queue(wan, tq, job.pkt_ptr, pkt_len) == 0) {
+                int send_rc = interface_send_batch_queue(wan, tq, job.pkt_ptr, pkt_len);
+                if (send_rc == 0) {
                     __sync_fetch_and_add(&fwd->local_to_wan, 1);
                     wan_used[wan_idx] = 1;
+                    if (g_tcp_diag_enabled && flow_ok && is_ssh_flow(protocol, src_port, dst_port)) {
+                        fprintf(stderr,
+                                "[TCP-DIAG][SSH-TX-BYPASS-SENT] wan=%d(%s) len=%u\n",
+                                wan_idx, wan->ifname, (unsigned)pkt_len);
+                    }
                 } else {
+                    if (g_tcp_diag_enabled && flow_ok && is_ssh_flow(protocol, src_port, dst_port)) {
+                        fprintf(stderr,
+                                "[TCP-DIAG][SSH-TX-BYPASS-SEND-FAIL] wan=%d(%s) len=%u rc=%d\n",
+                                wan_idx, wan->ifname, (unsigned)pkt_len, send_rc);
+                    }
+                    ne_tx_class_log("TX_BYPASS_WAN_SEND_FAIL", "WORKER_L3L4", "bypass_wan_batch_reject",
+                                    job.local_idx, wan->ifname, wan_idx, flow_ok, src_ip, src_port, dst_ip, dst_port,
+                                    protocol, pkt_len, "interface_send_batch_queue");
                     __sync_fetch_and_add(&fwd->total_dropped, 1);
                 }
                 goto skip_encrypt_flush;
@@ -2683,6 +3201,9 @@ static void *worker_thread(void *arg) {
                     uint8_t f1[4096], f2[4096];
                     uint32_t l1, l2;
                     if (frag_split_and_encrypt_l2(use_ctx, pkt, pkt_len, f1, &l1, f2, &l2) != 0) {
+                        ne_tx_class_log("TX_L2_SPLIT_ENCRYPT_FAIL", "WORKER_L3L4", "frag_split_encrypt_l2_failed",
+                                        job.local_idx, wan->ifname, wan_idx, flow_ok, src_ip, src_port, dst_ip,
+                                        dst_port, protocol, cleartext_len, "frag_split_and_encrypt_l2");
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                         goto release_local;
                     }
@@ -2691,18 +3212,27 @@ static void *worker_thread(void *arg) {
                         __sync_fetch_and_add(&fwd->local_to_wan, 1);
                         wan_used[wan_idx] = 1;
                     } else {
+                        ne_tx_class_log("TX_WAN_SEND_FAIL", "WORKER_L3L4", "wan_queue_reject_cipher_part1",
+                                        job.local_idx, wan->ifname, wan_idx, flow_ok, src_ip, src_port, dst_ip,
+                                        dst_port, protocol, l1, "L2_split frag1");
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                     }
                     if (interface_send_batch_queue(wan, tq, f2, l2) == 0) {
                         __sync_fetch_and_add(&fwd->local_to_wan, 1);
                         wan_used[wan_idx] = 1;
                     } else {
+                        ne_tx_class_log("TX_WAN_SEND_FAIL", "WORKER_L3L4", "wan_queue_reject_cipher_part2",
+                                        job.local_idx, wan->ifname, wan_idx, flow_ok, src_ip, src_port, dst_ip,
+                                        dst_port, protocol, l2, "L2_split frag2");
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                     }
                 } else if (cp->action == POLICY_ACTION_ENCRYPT_L3 && frag_need_split(pkt_len)) {
                     uint8_t f1[4096], f2[4096];
                     uint32_t l1, l2;
                     if (frag_split_and_encrypt(use_ctx, pkt, pkt_len, f1, &l1, f2, &l2) != 0) {
+                        ne_tx_class_log("TX_L3_SPLIT_ENCRYPT_FAIL", "WORKER_L3L4", "frag_split_encrypt_l3_failed",
+                                        job.local_idx, wan->ifname, wan_idx, flow_ok, src_ip, src_port, dst_ip,
+                                        dst_port, protocol, cleartext_len, "frag_split_and_encrypt");
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                         goto release_local;
                     }
@@ -2711,18 +3241,27 @@ static void *worker_thread(void *arg) {
                         __sync_fetch_and_add(&fwd->local_to_wan, 1);
                         wan_used[wan_idx] = 1;
                     } else {
+                        ne_tx_class_log("TX_WAN_SEND_FAIL", "WORKER_L3L4", "wan_queue_reject_cipher_part1",
+                                        job.local_idx, wan->ifname, wan_idx, flow_ok, src_ip, src_port, dst_ip,
+                                        dst_port, protocol, l1, "L3_split frag1");
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                     }
                     if (interface_send_batch_queue(wan, tq, f2, l2) == 0) {
                         __sync_fetch_and_add(&fwd->local_to_wan, 1);
                         wan_used[wan_idx] = 1;
                     } else {
+                        ne_tx_class_log("TX_WAN_SEND_FAIL", "WORKER_L3L4", "wan_queue_reject_cipher_part2",
+                                        job.local_idx, wan->ifname, wan_idx, flow_ok, src_ip, src_port, dst_ip,
+                                        dst_port, protocol, l2, "L3_split frag2");
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                     }
                 } else if (cp->action == POLICY_ACTION_ENCRYPT_L4 && frag_need_split_l4(pkt_len)) {
                     uint8_t f1[4096], f2[4096];
                     uint32_t l1, l2;
                     if (frag_split_and_encrypt_l4(use_ctx, pkt, pkt_len, f1, &l1, f2, &l2) != 0) {
+                        ne_tx_class_log("TX_L4_SPLIT_ENCRYPT_FAIL", "WORKER_L3L4", "frag_split_encrypt_l4_failed",
+                                        job.local_idx, wan->ifname, wan_idx, flow_ok, src_ip, src_port, dst_ip,
+                                        dst_port, protocol, cleartext_len, "frag_split_and_encrypt_l4");
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                         goto release_local;
                     }
@@ -2731,12 +3270,18 @@ static void *worker_thread(void *arg) {
                         __sync_fetch_and_add(&fwd->local_to_wan, 1);
                         wan_used[wan_idx] = 1;
                     } else {
+                        ne_tx_class_log("TX_WAN_SEND_FAIL", "WORKER_L3L4", "wan_queue_reject_cipher_part1",
+                                        job.local_idx, wan->ifname, wan_idx, flow_ok, src_ip, src_port, dst_ip,
+                                        dst_port, protocol, l1, "L4_split frag1");
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                     }
                     if (interface_send_batch_queue(wan, tq, f2, l2) == 0) {
                         __sync_fetch_and_add(&fwd->local_to_wan, 1);
                         wan_used[wan_idx] = 1;
                     } else {
+                        ne_tx_class_log("TX_WAN_SEND_FAIL", "WORKER_L3L4", "wan_queue_reject_cipher_part2",
+                                        job.local_idx, wan->ifname, wan_idx, flow_ok, src_ip, src_port, dst_ip,
+                                        dst_port, protocol, l2, "L4_split frag2");
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                     }
                 }
@@ -2755,16 +3300,60 @@ static void *worker_thread(void *arg) {
                 }
 
                 if (new_len < 0) {
+                    const char *txk = "TX_ENCRYPT_FAIL";
+                    if (cp) {
+                        if (cp->action == POLICY_ACTION_ENCRYPT_L2)
+                            txk = "TX_L2_ENCRYPT_FAIL";
+                        else if (cp->action == POLICY_ACTION_ENCRYPT_L3)
+                            txk = "TX_L3_ENCRYPT_FAIL";
+                        else if (cp->action == POLICY_ACTION_ENCRYPT_L4)
+                            txk = "TX_L4_ENCRYPT_FAIL";
+                    }
+                    char dbuf[96];
+                    snprintf(dbuf, sizeof(dbuf), "new_len=%d action=%s", new_len,
+                             cp ? policy_action_name(cp->action) : "none");
+                    ne_tx_class_log(txk, "WORKER_L3L4", "crypto_layer_encrypt_returned_neg", job.local_idx,
+                                    wan->ifname, wan_idx, flow_ok, src_ip, src_port, dst_ip, dst_port, protocol,
+                                    cleartext_len, dbuf);
+                    if (g_tcp_diag_enabled && flow_ok && tcp_diag_want_log(protocol, src_port, dst_port)) {
+                        fprintf(stderr,
+                                "[TCP-DIAG][TX-ENC-FAIL] action=%s cleartext_len=%u new_len=%d\n",
+                                cp ? policy_action_name(cp->action) : "none",
+                                (unsigned)cleartext_len, new_len);
+                    }
                     __sync_fetch_and_add(&fwd->total_dropped, 1);
                     goto release_local;
                 }
                 pkt_len = (uint32_t)new_len;
 
-                if (interface_send_batch_queue(wan, tq, job.pkt_ptr, pkt_len) == 0) {
-                    __sync_fetch_and_add(&fwd->local_to_wan, 1);
-                    wan_used[wan_idx] = 1;
-                } else {
-                    __sync_fetch_and_add(&fwd->total_dropped, 1);
+                if (g_tcp_diag_enabled && flow_ok && is_ssh_flow(protocol, src_port, dst_port) && cp) {
+                    char fg[64];
+                    if (tcp_flags_ok)
+                        tcp_diag_flags_fmt(tcp_flags, fg, sizeof(fg));
+                    else
+                        snprintf(fg, sizeof(fg), "unk");
+                    fprintf(stderr,
+                            "[TCP-DIAG][SSH-TX-ENC-OK] action=%s cleartext_len=%u onwire_len=%u wan=%d(%s) tcp=[%s]\n",
+                            policy_action_name(cp->action), (unsigned)cleartext_len, (unsigned)pkt_len,
+                            wan_idx, wan->ifname, fg);
+                }
+
+                {
+                    int send_rc = interface_send_batch_queue(wan, tq, job.pkt_ptr, pkt_len);
+                    if (send_rc == 0) {
+                        __sync_fetch_and_add(&fwd->local_to_wan, 1);
+                        wan_used[wan_idx] = 1;
+                    } else {
+                        if (g_tcp_diag_enabled && flow_ok && tcp_diag_want_log(protocol, src_port, dst_port)) {
+                            fprintf(stderr,
+                                    "[TCP-DIAG][TX-SEND-FAIL] wan=%d(%s) enc_len=%u rc=%d\n",
+                                    wan_idx, wan->ifname, (unsigned)pkt_len, send_rc);
+                        }
+                        ne_tx_class_log("TX_WAN_SEND_FAIL", "WORKER_L3L4", "wan_batch_queue_reject_full_packet",
+                                        job.local_idx, wan->ifname, wan_idx, flow_ok, src_ip, src_port, dst_ip,
+                                        dst_port, protocol, pkt_len, "interface_send_batch_queue");
+                        __sync_fetch_and_add(&fwd->total_dropped, 1);
+                    }
                 }
             }
         }
@@ -2807,12 +3396,7 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg) {
 
     crypto_enabled = cfg->crypto_enabled;
     crypto_layer = cfg->encrypt_layer;
-    {
-        const char *diag = getenv("NE_TCP_DIAG");
-        g_tcp_diag_enabled = (diag && diag[0] == '1') ? 1 : 0;
-        if (g_tcp_diag_enabled)
-            fprintf(stderr, "[TCP-DIAG] enabled (NE_TCP_DIAG=1)\n");
-    }
+    forwarder_tcp_diag_apply_env();
     if (cfg->local_count > 0) {
         if (install_local_mac_table(fwd) != 0)
             return -1;

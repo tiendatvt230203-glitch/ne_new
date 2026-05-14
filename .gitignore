@@ -1,0 +1,8 @@
+bin/
+build/
+*.o
+src/*.o
+src/core/*.o
+src/crypto/*.o
+src/db/*.o
+bpf/*.o
