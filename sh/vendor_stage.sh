@@ -70,6 +70,16 @@ stage_one() {
   local dst="${LIB}/${base}"
   if [ ! -e "$dst" ]; then
     cp -L "$real" "$dst"
+    local sz
+    sz="$(stat -c%s "$dst" 2>/dev/null || echo 0)"
+    if [ "${sz:-0}" -lt 4096 ]; then
+      echo "[FATAL] copy too small (${sz}b): $dst <- $real" >&2
+      exit 1
+    fi
+    if ! file -b "$dst" | grep -q ELF; then
+      echo "[FATAL] not ELF after copy: $dst ($(file -b "$dst"))" >&2
+      exit 1
+    fi
     echo "  lib: ${base}"
   fi
 }
@@ -104,7 +114,9 @@ if command -v patchelf >/dev/null 2>&1; then
   echo "=== vendor_stage: patchelf RPATH \$ORIGIN ==="
   shopt -s nullglob
   for f in "${LIB}"/*.so*; do
+    [ -L "$f" ] && continue
     [ -f "$f" ] || continue
+    file -b "$f" | grep -q 'ELF' || continue
     patchelf --set-rpath '$ORIGIN' "$f" 2>/dev/null || true
   done
   shopt -u nullglob
@@ -128,6 +140,26 @@ for f in "${LIB}"/lib*.so*; do
   ln -sf "$bn" "${LIB}/${soname}"
 done
 shopt -u nullglob
+
+echo "=== vendor_stage: verify ==="
+for need in libxdp.so.1 libbpf.so.1; do
+  p="${LIB}/${need}"
+  if [ ! -e "$p" ]; then
+    echo "[FATAL] missing ${need} under ${LIB}" >&2
+    exit 1
+  fi
+  rp="$(readlink -f "$p" 2>/dev/null || true)"
+  [ -n "$rp" ] && [ -f "$rp" ] || { echo "[FATAL] broken or missing target for ${p}" >&2; exit 1; }
+  sz="$(stat -c%s "$rp" 2>/dev/null || echo 0)"
+  if [ "${sz:-0}" -lt 4096 ]; then
+    echo "[FATAL] ${need} resolves to short file ${rp} (${sz}b) — redo: make vendor-clean && make" >&2
+    exit 1
+  fi
+  if ! file -b "$rp" | grep -q ELF; then
+    echo "[FATAL] ${need} -> ${rp} is not ELF" >&2
+    exit 1
+  fi
+done
 
 : >"${ROOT}/vendor/.use_vendor"
 nlib="$(find "${LIB}" -maxdepth 1 \( -name '*.so' -o -name '*.so.*' \) 2>/dev/null | wc -l)"
