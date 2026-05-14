@@ -16,6 +16,13 @@
 #include <net/if.h>
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
+#if !defined(LIBBPF_MAJOR_VERSION)
+int bpf_xdp_attach(int ifindex, int prog_fd, unsigned int flags, const void *opts);
+int bpf_xdp_detach(int ifindex, unsigned int flags, const void *opts);
+#elif LIBBPF_MAJOR_VERSION < 1 || (LIBBPF_MAJOR_VERSION == 1 && LIBBPF_MINOR_VERSION < 2)
+int bpf_xdp_attach(int ifindex, int prog_fd, unsigned int flags, const void *opts);
+int bpf_xdp_detach(int ifindex, unsigned int flags, const void *opts);
+#endif
 #include <xdp/xsk.h>
 #include <errno.h>
 

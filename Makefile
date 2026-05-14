@@ -2,26 +2,22 @@ CC = gcc
 CLANG = clang
 AR = ar
 
-VENDOR_ROOT := $(abspath vendor)
+LIBS_ROOT := $(abspath libs)
 
-ifndef SKIP_VENDOR
-ifneq ($(wildcard $(VENDOR_ROOT)/.use_vendor),)
-USE_VENDOR := 1
-endif
-endif
-
-ifdef USE_VENDOR
-VENDOR_LINK := -L$(VENDOR_ROOT)/lib -Wl,-rpath,'$$ORIGIN/../vendor/lib' -Wl,--disable-new-dtags -L/usr/local/lib
-BPF_VENDOR_INC := -I$(VENDOR_ROOT)/include
+ifeq ($(SKIP_LIBS),1)
+LIB_PREREQ :=
+LDFLAGS_LIBS := -L/usr/local/lib
+BPF_LOCAL_INC :=
 else
-VENDOR_LINK := -L/usr/local/lib
-BPF_VENDOR_INC :=
+LIB_PREREQ := $(LIBS_ROOT)/.ready
+LDFLAGS_LIBS := -L$(LIBS_ROOT)/lib -Wl,-rpath,'$$ORIGIN/../libs/lib' -Wl,--disable-new-dtags -L/usr/local/lib
+BPF_LOCAL_INC := -I$(LIBS_ROOT)/include
 endif
 
 PG_INC := $(shell pg_config --includedir 2>/dev/null | xargs -I{} echo -I{})
 
 CFLAGS = -D_GNU_SOURCE -Iinc $(PG_INC) -I/usr/local/include -Wall -O2
-LDFLAGS = $(VENDOR_LINK) -lxdp -lbpf -lpthread -lssl -lcrypto -lpq
+LDFLAGS = $(LDFLAGS_LIBS) -lxdp -lbpf -lpthread -lssl -lcrypto -lpq
 
 BPF_CFLAGS = -O2 -target bpf -g
 KERNEL_HEADERS = /usr/include
@@ -41,22 +37,16 @@ BPF_OBJ = bpf/xdp_redirect.o bpf/xdp_wan_redirect.o
 
 MAKEFLAGS += --no-print-directory
 
-.PHONY: all build vendor vendor-clean clean run dirs
+.PHONY: all libs-clean clean run dirs
 
-all:
-	@if [ -z "$(SKIP_VENDOR)" ] && [ ! -f "$(VENDOR_ROOT)/.use_vendor" ]; then \
-	  echo "[make] vendor (first run): staging into $(VENDOR_ROOT)/"; \
-	  $(MAKE) vendor; fi
-	@$(MAKE) build
+all: $(LIB_PREREQ) dirs $(BPF_OBJ) $(DB_LIB) $(TARGET)
 
-build: dirs $(BPF_OBJ) $(DB_LIB) $(TARGET)
+$(LIBS_ROOT)/.ready:
+	@test -f "$(CURDIR)/sh/sync_xdp_libs.sh" || (echo "[FATAL] missing $(CURDIR)/sh/sync_xdp_libs.sh" >&2; exit 127)
+	@bash "$(CURDIR)/sh/sync_xdp_libs.sh"
 
-vendor:
-	@test -f "$(CURDIR)/sh/vendor_stage.sh" || (echo "[FATAL] Missing $(CURDIR)/sh/vendor_stage.sh — copy from repo or git pull." >&2; exit 127)
-	@bash "$(CURDIR)/sh/vendor_stage.sh"
-
-vendor-clean:
-	rm -rf "$(VENDOR_ROOT)/include" "$(VENDOR_ROOT)/lib" "$(VENDOR_ROOT)/.use_vendor"
+libs-clean:
+	rm -rf "$(LIBS_ROOT)/include" "$(LIBS_ROOT)/lib" "$(LIBS_ROOT)/.ready"
 
 dirs:
 	@mkdir -p $(BIN_DIR) $(OBJ_DIR)
@@ -71,7 +61,7 @@ $(TARGET): $(APP_OBJ) $(DB_LIB)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 bpf/%.o: bpf/%.c
-	$(CLANG) $(BPF_CFLAGS) -I$(KERNEL_HEADERS) $(BPF_VENDOR_INC) -I/usr/local/include -c $< -o $@
+	$(CLANG) $(BPF_CFLAGS) -I$(KERNEL_HEADERS) $(BPF_LOCAL_INC) -I/usr/local/include -c $< -o $@
 
 clean:
 	rm -rf $(BIN_DIR) $(OBJ_DIR) src/*.o src/core/*.o src/crypto/*.o src/db/*.o *.o $(BPF_OBJ)

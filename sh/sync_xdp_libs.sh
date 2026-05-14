@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# Copy libbpf/libxdp headers + minimal .so closure from this machine into libs/.
+# Run automatically via Makefile when not SKIP_LIBS=1.
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+INC="${ROOT}/libs/include"
+LIB="${ROOT}/libs/lib"
+mkdir -p "${INC}" "${LIB}"
+
+copy_tree() {
+  [ -d "$1" ] || return 0
+  mkdir -p "$2"
+  cp -R "$1/." "$2/"
+}
+
+for bpf in /usr/local/include/bpf /usr/include/bpf; do
+  [ -d "$bpf" ] && { copy_tree "$bpf" "${INC}/bpf"; break; }
+done
+for xdp in /usr/local/include/xdp /usr/include/xdp; do
+  [ -d "$xdp" ] && { copy_tree "$xdp" "${INC}/xdp"; break; }
+done
+[ -d "${INC}/bpf" ] && [ -d "${INC}/xdp" ] || { echo "[FATAL] need libbpf-dev libxdp-dev" >&2; exit 1; }
+
+declare -A seen
+skip_sys() {
+  case "$1" in
+    ld-linux-*.so*|linux-vdso.so*|libc.so*|libm.so*|libdl.so*|libpthread.so*|librt.so*|libresolv.so*|libnss_*.so*|libthread_db.so*|libutil.so*|libanl.so*|libBrokenLocale.so*) return 0 ;;
+  esac
+  return 1
+}
+skip_db() {
+  case "$1" in
+    libpq.so*|libssl.so*|libcrypto.so*|libldap*.so*|liblber*.so*|libsasl2*.so*|libkrb5*.so*|libgssapi*.so*|libk5crypto*.so*|libcom_err*.so*|libkrb5support*.so*|libgnutls*.so*|libgcrypt*.so*|libp11-kit*.so*|libtasn1*.so*|libnettle*.so*|libhogweed*.so*|libgmp*.so*|libidn2*.so*|libunistring*.so*|libkeyutils*.so*) return 0 ;;
+  esac
+  return 1
+}
+stage() {
+  local f="$1" real base dst sz
+  [ -n "${f:-}" ] && [ -f "$f" ] || return 0
+  real="$(readlink -f "$f" 2>/dev/null || echo "$f")"
+  [ -f "$real" ] || return 0
+  base="$(basename "$real")"
+  [[ "$base" == ld-linux-*.so.* ]] && return 0
+  skip_sys "$base" && return 0
+  skip_db "$base" && return 0
+  [[ -n "${seen[$real]:-}" ]] && return 0
+  seen[$real]=1
+  dst="${LIB}/${base}"
+  [ -e "$dst" ] && return 0
+  cp -L "$real" "$dst"
+  sz="$(stat -c%s "$dst" 2>/dev/null || echo 0)"
+  [ "${sz:-0}" -ge 4096 ] && file -b "$dst" | grep -q ELF || { echo "[FATAL] bad copy $dst" >&2; exit 1; }
+}
+
+for name in libbpf.so libxdp.so; do
+  p="$(cc -print-file-name="${name}" 2>/dev/null || true)"
+  [ -n "$p" ] && [ -f "$p" ] || { echo "[FATAL] missing $name" >&2; exit 1; }
+  stage "$p"
+done
+
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+  n="${#seen[@]}"
+  shopt -s nullglob
+  for so in "${LIB}"/*.so*; do
+    [ -f "$so" ] || continue
+    while IFS= read -r line; do
+      f="$(echo "$line" | sed -n 's/.* => \(.*\) (0x.*/\1/p')"
+      [ -n "$f" ] && stage "$f"
+    done < <(ldd "$so" 2>/dev/null || true)
+  done
+  shopt -u nullglob
+  [ "${#seen[@]}" = "$n" ] && break
+done
+
+if [ -n "${LIBS_PATCHELF:-}" ] && command -v patchelf >/dev/null 2>&1; then
+  shopt -s nullglob
+  for f in "${LIB}"/*.so*; do
+    [ -L "$f" ] && continue
+    [ -f "$f" ] || continue
+    file -b "$f" | grep -q ELF || continue
+    patchelf --set-rpath '$ORIGIN' "$f" 2>/dev/null || true
+  done
+  shopt -u nullglob
+fi
+
+shopt -s nullglob
+for f in "${LIB}"/lib*.so*; do
+  [ -f "$f" ] || continue
+  bn="$(basename "$f")"
+  [[ "$bn" =~ \.so\.[0-9] ]] || [[ "$bn" =~ -[0-9]+\.[0-9]+\.so$ ]] || continue
+  sn="$(objdump -p "$f" 2>/dev/null | awk '/SONAME/ {print $2; exit}')"
+  [ -n "$sn" ] && [ "$sn" != "$bn" ] && cp -fL "$f" "${LIB}/${sn}"
+done
+shopt -u nullglob
+
+for need in libxdp.so.1 libbpf.so.1; do
+  p="${LIB}/${need}"
+  [ -f "$p" ] || { echo "[FATAL] missing $need" >&2; exit 1; }
+  sz="$(stat -c%s "$p" 2>/dev/null || echo 0)"
+  [ "${sz:-0}" -ge 4096 ] && file -b "$p" | grep -q ELF || { echo "[FATAL] $need invalid" >&2; exit 1; }
+done
+
+: >"${ROOT}/libs/.ready"
