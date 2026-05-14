@@ -1021,11 +1021,63 @@ static int net_sysfs_bridge_master(const char *slave, char master[IFNAMSIZ]) {
     return 0;
 }
 
+static int merge_arp_device(const char *dev, uint8_t out[MAC_LEN], const uint8_t *skip_mac) {
+    FILE *fp = fopen("/proc/net/arp", "r");
+    if (!fp)
+        return -1;
+    char line[512];
+    uint8_t uniq[NE_LLADDR_MAX][MAC_LEN];
+    int n = 0;
+
+    if (!fgets(line, sizeof(line), fp)) {
+        fclose(fp);
+        return -1;
+    }
+    while (fgets(line, sizeof(line), fp)) {
+        char ip[64], htype[32], flags[32], macstr[32], mask[32], dname[IFNAMSIZ];
+        if (sscanf(line, "%63s %31s %31s %31s %31s %31s", ip, htype, flags, macstr, mask, dname) != 6)
+            continue;
+        if (strcmp(dname, dev) != 0)
+            continue;
+        if (strcmp(macstr, "00:00:00:00:00:00") == 0)
+            continue;
+        uint8_t m[MAC_LEN];
+        if (parse_mac(macstr, m) != 0)
+            continue;
+        if (mac_is_zero(m) || mac_is_broadcast(m) || mac_is_multicast(m))
+            continue;
+        if (skip_mac && memcmp(m, skip_mac, MAC_LEN) == 0)
+            continue;
+        int dup = 0;
+        for (int j = 0; j < n; j++) {
+            if (memcmp(uniq[j], m, MAC_LEN) == 0) {
+                dup = 1;
+                break;
+            }
+        }
+        if (dup)
+            continue;
+        if (n >= NE_LLADDR_MAX)
+            return -2;
+        memcpy(uniq[n++], m, MAC_LEN);
+    }
+    fclose(fp);
+    if (n == 1) {
+        memcpy(out, uniq[0], MAC_LEN);
+        return 0;
+    }
+    if (n == 0)
+        return -1;
+    return -2;
+}
+
 static int peer_mac_from_kernel(const char *ifname, uint8_t mac_out[MAC_LEN]) {
     char cmd[384];
     FILE *fp;
     uint8_t local_hw[MAC_LEN];
     int have_local = (read_local_iface_hwaddr(ifname, local_hw, NULL) == 0);
+    char brm[IFNAMSIZ];
+    int have_br = (net_sysfs_bridge_master(ifname, brm) == 0);
 
     snprintf(cmd, sizeof(cmd), "ip neigh show dev %s 2>/dev/null", ifname);
     fp = popen(cmd, "r");
@@ -1041,8 +1093,7 @@ static int peer_mac_from_kernel(const char *ifname, uint8_t mac_out[MAC_LEN]) {
         }
     }
 
-    char brm[IFNAMSIZ];
-    if (net_sysfs_bridge_master(ifname, brm) == 0) {
+    if (have_br) {
         snprintf(cmd, sizeof(cmd), "ip neigh show dev %s 2>/dev/null", brm);
         fp = popen(cmd, "r");
         if (fp) {
@@ -1068,6 +1119,20 @@ static int peer_mac_from_kernel(const char *ifname, uint8_t mac_out[MAC_LEN]) {
         return 0;
     if (r == -2)
         fprintf(stderr, "[FATAL][LOCAL-MAC] %s bridge fdb multiple MAC\n", ifname);
+
+    if (have_br) {
+        int ar = merge_arp_device(brm, mac_out, have_local ? local_hw : NULL);
+        if (ar == 0)
+            return 0;
+        if (ar == -2) {
+            fprintf(stderr,
+                    "[LOCAL-MAC][WARN] %s: /proc/net/arp on %s has multiple MAC; try NE_LOCAL_MAC_PRELOAD\n",
+                    ifname, brm);
+        }
+    }
+    if (merge_arp_device(ifname, mac_out, have_local ? local_hw : NULL) == 0)
+        return 0;
+
     return -1;
 }
 
@@ -1077,7 +1142,7 @@ static int mac_load_from_kernel(struct app_config *cfg, uint64_t *out_n) {
     for (int i = 0; i < cfg->local_count; i++) {
         if (peer_mac_from_kernel(cfg->locals[i].ifname, macs[i]) != 0) {
             fprintf(stderr,
-                    "[LOCAL-MAC] %s peer not in kernel neigh/fdb (need traffic or NE_LOCAL_MAC_PRELOAD)\n",
+                    "[LOCAL-MAC] %s peer not in kernel neigh/fdb/arp (need traffic or NE_LOCAL_MAC_PRELOAD)\n",
                     cfg->locals[i].ifname);
             return -1;
         }
@@ -1202,7 +1267,7 @@ int forwarder_prepare_local_peer_macs(struct app_config *cfg) {
     }
 
     fprintf(stderr,
-            "[FATAL][LOCAL-MAC] kernel neigh/fdb empty or ambiguous for some local; set NE_LOCAL_MAC_PRELOAD\n");
+            "[FATAL][LOCAL-MAC] kernel neigh/fdb/arp empty or ambiguous for some local; set NE_LOCAL_MAC_PRELOAD\n");
     return -1;
 
 done:
