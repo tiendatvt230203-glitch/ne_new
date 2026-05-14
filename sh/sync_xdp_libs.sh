@@ -7,6 +7,54 @@ INC="${ROOT}/libs/include"
 LIB="${ROOT}/libs/lib"
 mkdir -p "${INC}" "${LIB}"
 
+deb_lib_dirs() {
+  local m d
+  m="$(cc -print-multiarch 2>/dev/null || true)"
+  [[ -n "${m:-}" && -d "/usr/lib/${m}" ]] && echo "/usr/lib/${m}"
+  for d in /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu /usr/lib/riscv64-linux-gnu \
+           /usr/lib/s390x-linux-gnu /usr/local/lib /usr/lib; do
+    [[ -d "$d" ]] && echo "$d"
+  done
+}
+
+# Print absolute path to libbpf.so / libxdp.so (or .so.1) for staging.
+resolve_packaged_so() {
+  local want="$1" p d stem cand
+  p="$(cc -print-file-name="$want" 2>/dev/null || true)"
+  if [[ -n "${p:-}" && "$p" == /* && -f "$p" ]]; then
+    readlink -f "$p"
+    return 0
+  fi
+  stem="${want%.so}"
+  while IFS= read -r d; do
+    [[ -d "$d" ]] || continue
+    for cand in "$d/$want" "$d/${stem}.so.1" "$d/${stem}.so.0"; do
+      [[ -f "$cand" ]] || continue
+      readlink -f "$cand"
+      return 0
+    done
+  done < <(deb_lib_dirs | sort -u)
+  return 1
+}
+
+fatal_headers() {
+  echo "[FATAL] Missing /usr/include/bpf and/or /usr/include/xdp (need dev headers)." >&2
+  echo "  Ubuntu 22.04+:  sudo apt-get update && sudo apt-get install -y libbpf-dev libxdp-dev" >&2
+  echo "  If 'libxdp-dev' not found:  sudo apt-add-repository universe && sudo apt-get update && sudo apt-get install -y libxdp-dev libbpf-dev" >&2
+  echo "  (Also: sudo apt-get install -y build-essential clang libssl-dev libpq-dev)" >&2
+  echo "  Debian: sudo apt-get install -y libbpf-dev libxdp-dev" >&2
+  exit 1
+}
+
+fatal_so() {
+  local name="$1"
+  echo "[FATAL] Cannot find ${name} under /usr/lib (and gcc does not resolve it)." >&2
+  echo "  Install runtime + dev, e.g. Ubuntu:" >&2
+  echo "    sudo apt-get install -y libbpf1 libbpf-dev libxdp1 libxdp-dev" >&2
+  echo "  If libxdp-dev is missing, enable universe then apt-get update (see fatal_headers)." >&2
+  exit 1
+}
+
 copy_tree() {
   [ -d "$1" ] || return 0
   mkdir -p "$2"
@@ -19,7 +67,7 @@ done
 for xdp in /usr/local/include/xdp /usr/include/xdp; do
   [ -d "$xdp" ] && { copy_tree "$xdp" "${INC}/xdp"; break; }
 done
-[ -d "${INC}/bpf" ] && [ -d "${INC}/xdp" ] || { echo "[FATAL] need libbpf-dev libxdp-dev" >&2; exit 1; }
+[ -d "${INC}/bpf" ] && [ -d "${INC}/xdp" ] || fatal_headers
 
 declare -A seen
 skip_sys() {
@@ -53,8 +101,8 @@ stage() {
 }
 
 for name in libbpf.so libxdp.so; do
-  p="$(cc -print-file-name="${name}" 2>/dev/null || true)"
-  [ -n "$p" ] && [ -f "$p" ] || { echo "[FATAL] missing $name" >&2; exit 1; }
+  p="$(resolve_packaged_so "$name" || true)"
+  [[ -n "${p:-}" ]] || fatal_so "$name"
   stage "$p"
 done
 

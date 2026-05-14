@@ -49,7 +49,7 @@ BPF_OBJ = bpf/xdp_redirect.o bpf/xdp_wan_redirect.o
 
 MAKEFLAGS += --no-print-directory
 
-.PHONY: all libs-clean libs-glibc-report verify-libs build-on-2204 clean run dirs
+.PHONY: all libs-clean libs-glibc-report verify-libs pack-deploy build-on-2204 clean run dirs
 
 all: $(LIB_PREREQ) dirs $(BPF_OBJ) $(DB_LIB) $(TARGET)
 
@@ -75,6 +75,16 @@ libs-glibc-report:
 # Run on deploy machine (e.g. NE1): fails if libs/lib was bundled on newer glibc than this host.
 verify-libs:
 	@bash "$(CURDIR)/sh/verify_bundled_glibc.sh"
+
+# One tarball: bin + bundled XDP/BPF libs. Build once on oldest Ubuntu (or make build-on-2204), copy to same-CPU devices.
+pack-deploy: $(TARGET)
+	@if [ "$(SKIP_LIBS)" = 1 ]; then echo "pack-deploy: need bundled libs (do not set SKIP_LIBS=1)." >&2; exit 1; fi
+	@test -f "$(LIBS_ROOT)/lib/libxdp.so.1" || (echo "pack-deploy: run make first (missing libs/lib)." >&2; exit 1)
+	@arch=$$(uname -m); \
+	rm -f "$(CURDIR)/network-encryptor-deploy-$$arch.tar.gz"; \
+	tar czf "$(CURDIR)/network-encryptor-deploy-$$arch.tar.gz" -C "$(CURDIR)" bin/network-encryptor libs/lib; \
+	echo "Wrote $(CURDIR)/network-encryptor-deploy-$$arch.tar.gz"; \
+	echo "Deploy: same CPU ($$arch), glibc same or newer than this build host. Extract, run ./bin/network-encryptor"
 
 # Build inside ubuntu:22.04; copies bin/network-encryptor + libs/ into this tree.
 build-on-2204:
