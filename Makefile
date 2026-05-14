@@ -49,6 +49,7 @@ all:
 build: dirs $(BPF_OBJ) $(DB_LIB) $(TARGET)
 
 vendor:
+	@test -f "$(CURDIR)/sh/vendor_stage.sh" || (echo "[FATAL] Missing $(CURDIR)/sh/vendor_stage.sh — copy from repo or git pull." >&2; exit 127)
 	@bash "$(CURDIR)/sh/vendor_stage.sh"
 
 vendor-clean:
