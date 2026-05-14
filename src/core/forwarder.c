@@ -140,6 +140,10 @@ static void forwarder_tcp_diag_apply_env(void) {
         fprintf(stderr,
                 "[NE-RX] CLASS=... ; [NE-CHAIN] root=... tren cung dong NE-RX/NE-TX de biet: "
                 "khong_toi_local vs sai_sau_ma_hoa_giai_ma_reasm vs loi_TX\n");
+        fprintf(stderr,
+                "[TCP-DIAG] WAN RX: moi goi nhan tren WAN in [NE-RX][RX_PKT]; decrypt OK/err xem "
+                "[TCP-DIAG] RX-DEC-OK / RX-*FAIL va [NE-RX][CLASS=RX_*]. Im lang != client khong nhan — "
+                "truoc day enc_l3 (fake proto) bi loc khoi log; gio khong loc RX_PKT/CLASS theo tuple wire.\n");
         forwarder_tcp_diag_print_ssh_hypothesis_banner();
     }
 }
@@ -355,8 +359,9 @@ static void ne_rx_class_log(const char *klass,
                             const char *detail) {
     if (!g_tcp_diag_enabled)
         return;
-    if (wire_have_flow && !tcp_diag_want_log(proto, sport, dport))
-        return;
+    /* Do not gate on tcp_diag_want_log(wire tuple): enc_l3 wire uses fake IP
+     * proto (e.g. 99), so SSH never "looks like" SSH on wire and errors were
+     * invisible. */
     fprintf(stderr, "[NE-RX][CLASS=%s][wan=%s#%d][phase=%s] why=%s",
             klass, wan_if && wan_if[0] ? wan_if : "?", wan_idx,
             phase && phase[0] ? phase : "-", why && why[0] ? why : "-");
@@ -390,8 +395,8 @@ static void ne_rx_pkt_recv_log(const struct xsk_interface *wan,
                                uint8_t proto) {
     if (!g_tcp_diag_enabled)
         return;
-    if (wire_have_flow && !tcp_diag_want_log(proto, sport, dport))
-        return;
+    /* Log every WAN frame when diag is on; wire tuple is often not TCP/22
+     * under enc_l3 (fake protocol), so SSH-only filtering hid all RX_PKT. */
     unsigned eth = 0;
     if (pkt && pkt_len >= 14)
         eth = ((unsigned)pkt[12] << 8) | pkt[13];
@@ -2753,6 +2758,16 @@ static void *wan_queue_thread_l3l4(void *arg) {
                     }
                 }
 
+                int wan_rx_cleartext_ssh = 0;
+                {
+                    uint32_t cx_sip, cx_dip;
+                    uint16_t cx_sport, cx_dport;
+                    uint8_t cx_proto;
+                    if (parse_flow(pkt, pkt_len, &cx_sip, &cx_dip, &cx_sport, &cx_dport, &cx_proto) == 0 &&
+                        tcp_diag_want_log(cx_proto, cx_sport, cx_dport))
+                        wan_rx_cleartext_ssh = 1;
+                }
+
                 uint16_t l4_frag_pid;
                 uint8_t l4_frag_idx;
                 if (frag_is_fragment_l4(pkt, pkt_len, &l4_frag_pid, &l4_frag_idx)) {
@@ -2828,7 +2843,8 @@ static void *wan_queue_thread_l3l4(void *arg) {
                     }
                     __sync_fetch_and_add(&fwd->total_dropped, 1);
                     continue;
-                } else if (wire_flow_ok && tcp_diag_want_log(wire_proto, wire_src_port, wire_dst_port)) {
+                } else if ((wire_flow_ok && tcp_diag_want_log(wire_proto, wire_src_port, wire_dst_port)) ||
+                           wan_rx_cleartext_ssh) {
                     uint32_t ps = 0, pd = 0;
                     uint16_t psp = 0, pdp = 0;
                     uint8_t pp = 0;
