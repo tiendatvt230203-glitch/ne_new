@@ -25,6 +25,10 @@ int ne_l2_trace_enabled(void) {
     return g_ne_l2_trace;
 }
 
+int ne_l2_pkt_is_wire_enc(const uint8_t *pkt, uint32_t len) {
+    return pkt && len >= 14U && pkt[12] == 0x88U;
+}
+
 static void trace_flow_tail(const uint8_t *pkt, uint32_t len) {
     if (len < 14U + 20U)
         return;

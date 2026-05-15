@@ -1928,7 +1928,6 @@ static int decrypt_packet_auto_l2(struct forwarder *fwd,
             ne_l2_trace_event("S6-DEC-FAIL", NULL, pkt, *pkt_len, d);
             return -1;
         }
-        ne_l2_trace_event("S6-DEC-SKIP", NULL, pkt, *pkt_len, "not_ne_l2");
         return 0;
     }
 
@@ -2658,7 +2657,10 @@ static void *wan_queue_thread_l2(void *arg) {
             uint8_t *final_pkt = pkt;
             uint32_t final_len = pkt_len;
 
-            ne_l2_trace_event("S5-RX-WAN", wan->ifname, pkt, pkt_len, NULL);
+            const int ne_l2_wire = ne_l2_pkt_is_wire_enc(pkt, pkt_len);
+
+            if (ne_l2_wire)
+                ne_l2_trace_event("S5-RX-WAN", wan->ifname, pkt, pkt_len, NULL);
 
             if (decrypt_packet_auto_l2(fwd, pkt, &pkt_len,
                                         decrypt_scratch, sizeof(decrypt_scratch)) != 0) {
@@ -2666,14 +2668,16 @@ static void *wan_queue_thread_l2(void *arg) {
                 continue;
             }
 
-            ne_l2_trace_event("S6-RX-DEC", wan->ifname, pkt, pkt_len, NULL);
+            if (ne_l2_wire)
+                ne_l2_trace_event("S6-RX-DEC", wan->ifname, pkt, pkt_len, NULL);
 
             {
                 uint16_t fpid;
                 uint8_t fidx;
                 if (frag_is_fragment_l2(pkt, pkt_len, &fpid, &fidx)) {
-                    ne_l2_trace_frag("S7-FRAG-RX", wan->ifname, fpid, fidx, 1, pkt, pkt_len,
-                                     "after L2 decrypt");
+                    if (ne_l2_wire)
+                        ne_l2_trace_frag("S7-FRAG-RX", wan->ifname, fpid, fidx, 1, pkt, pkt_len,
+                                         "after L2 decrypt");
                     uint8_t reass_buf[4096];
                     uint32_t reass_len = 0;
                     int rr = frag_try_reassemble_l2(&g_wan_frag_l2, pkt, pkt_len, fpid, fidx,
@@ -2681,10 +2685,12 @@ static void *wan_queue_thread_l2(void *arg) {
                     if (rr == 0)
                         continue;
                     if (rr != 1) {
-                        char detail[80];
-                        snprintf(detail, sizeof(detail), "reasm_fail rr=%d", rr);
-                        ne_l2_trace_frag("S8-FRAG-REASM", wan->ifname, fpid, fidx, 1, pkt, pkt_len,
-                                         detail);
+                        if (ne_l2_wire) {
+                            char detail[80];
+                            snprintf(detail, sizeof(detail), "reasm_fail rr=%d", rr);
+                            ne_l2_trace_frag("S8-FRAG-REASM", wan->ifname, fpid, fidx, 1, pkt,
+                                             pkt_len, detail);
+                        }
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                         continue;
                     }
@@ -2747,17 +2753,22 @@ static void *wan_queue_thread_l2(void *arg) {
             }
 
             ne_wan_rx_normalize_eth_ipv4_before_local_inject(final_pkt, final_len);
-            if (final_len >= 14U && final_pkt[12] == 0x88U)
-                ne_l2_trace_event("S9-TX-PFSENSE", local_iface->ifname, final_pkt, final_len,
-                                  "LEAK still_encrypted");
-            else
-                ne_l2_trace_event("S9-TX-PFSENSE", local_iface->ifname, final_pkt, final_len, NULL);
+            if (ne_l2_wire) {
+                if (final_len >= 14U && final_pkt[12] == 0x88U)
+                    ne_l2_trace_event("S9-TX-PFSENSE", local_iface->ifname, final_pkt, final_len,
+                                      "LEAK still_encrypted");
+                else
+                    ne_l2_trace_event("S9-TX-PFSENSE", local_iface->ifname, final_pkt, final_len, NULL);
+            }
             if (interface_send_to_local_batch_queue(local_iface, tq, local_cfg, final_pkt, final_len) == 0) {
                 __sync_fetch_and_add(&fwd->wan_to_local, 1);
                 if (tq < 32)
                     local_used_queues[local_idx] |= (1u << tq);
-            } else {
+            } else if (ne_l2_wire) {
                 ne_l2_trace_plain("S9-TX-PFSENSE", local_iface->ifname, "FAIL inject local");
+                __sync_fetch_and_add(&fwd->total_dropped, 1);
+                __sync_fetch_and_add(&fwd->dropped_local_tx_fail, 1);
+            } else {
                 __sync_fetch_and_add(&fwd->total_dropped, 1);
                 __sync_fetch_and_add(&fwd->dropped_local_tx_fail, 1);
             }

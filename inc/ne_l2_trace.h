@@ -15,6 +15,9 @@
 
 int ne_l2_trace_enabled(void);
 
+/* Gói NE L2 trên dây (byte 12 = 0x88). Cleartext 0x0800 pass-through không log. */
+int ne_l2_pkt_is_wire_enc(const uint8_t *pkt, uint32_t len);
+
 void ne_l2_trace_event(const char *stage, const char *iface,
                        const uint8_t *pkt, uint32_t len, const char *detail);
 
