@@ -2,6 +2,7 @@
 #include "../../inc/config.h"
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
 
 #define NE_L2_POLICY_EXTRA (NE_WIRE_POLICY_U32 - 1)
 
@@ -111,9 +112,26 @@ int crypto_layer2_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
     uint8_t *work_ptr = packet + l2_enc_start;
 
     if (likely(is_gcm)) {
-        if (likely(crypto_aes_gcm_decrypt(key, nonce, nonce_len, work_ptr, (int)enc_len, tag) == 0)) {
+        int gcm_rc = crypto_aes_gcm_decrypt(key, nonce, nonce_len, work_ptr, (int)enc_len, tag);
+        if (likely(gcm_rc == 0)) {
             goto decrypt_success;
         }
+        // #region agent log
+        {
+            FILE *df = fopen("/home/tiendat/CODE/network-encryptor/.cursor/debug-eefb96.log", "a");
+            if (df) {
+                struct timespec ts;
+                clock_gettime(CLOCK_REALTIME, &ts);
+                long long ms = (long long)ts.tv_sec * 1000LL + (long long)(ts.tv_nsec / 1000000);
+                fprintf(df,
+                        "{\"sessionId\":\"eefb96\",\"hypothesisId\":\"H2\",\"location\":\"crypto_layer2.c:gcm\","
+                        "\"message\":\"gcm_decrypt_fail\",\"data\":{\"pkt_len\":%zu,\"enc_len\":%zu,"
+                        "\"l2_enc_start\":%d,\"gcm_rc\":%d},\"timestamp\":%lld}\n",
+                        pkt_len, enc_len, l2_enc_start, gcm_rc, ms);
+                fclose(df);
+            }
+        }
+        // #endregion
     }
     else {
         uint8_t iv[AES128_IV_SIZE];

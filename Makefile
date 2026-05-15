@@ -28,15 +28,21 @@ MAKEFLAGS += --no-print-directory
 CRYPTO_STUB_SRC = src/crypto/packet_crypto.c src/crypto/crypto_layer2.c \
                   src/crypto/crypto_layer3.c src/crypto/crypto_layer4.c
 L2_ONCE_BIN = $(BIN_DIR)/ne_l2_once
+SEND_ONE_BIN = $(BIN_DIR)/ne_send_one
 
-.PHONY: all clean run dirs ne_l2_once
+.PHONY: all clean run dirs ne_l2_once ne_send_one
 
 all: dirs $(BPF_OBJ) $(DB_LIB) $(TARGET)
 
 ne_l2_once: dirs $(L2_ONCE_BIN)
 
+ne_send_one: dirs $(SEND_ONE_BIN)
+
 $(L2_ONCE_BIN): tools/ne_l2_once.c $(CRYPTO_STUB_SRC)
 	$(CC) $(CFLAGS) -o $@ tools/ne_l2_once.c $(CRYPTO_STUB_SRC) -lssl -lcrypto
+
+$(SEND_ONE_BIN): tools/ne_send_one.c
+	$(CC) $(CFLAGS) -o $@ tools/ne_send_one.c
 
 dirs:
 	@mkdir -p $(BIN_DIR) $(OBJ_DIR)

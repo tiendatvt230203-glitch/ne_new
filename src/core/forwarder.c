@@ -69,6 +69,13 @@ static uint64_t g_profile_miss_hits;
 static uint64_t g_profile_log_seq;
 static int g_tcp_diag_enabled = 0;
 static int g_tcp_diag_all_tcp = 0;
+static int g_l2_diag_enabled = -1;
+
+static int ne_l2_diag_enabled(void) {
+    if (g_l2_diag_enabled < 0)
+        g_l2_diag_enabled = getenv("NE_L2_DIAG") ? 1 : 0;
+    return g_l2_diag_enabled;
+}
 
 
 static struct app_config *g_cfg_ptr = NULL;
@@ -451,6 +458,25 @@ static void ne_tx_class_log(const char *klass,
     ne_chain_append_tx(klass);
     fprintf(stderr, " | TX_path_peer_may_be_silent\n");
 }
+
+// #region agent log
+static void ne_agent_log_l2(const char *hyp, const char *loc, const char *msg,
+                            uint32_t policy_wire, int pi, uint32_t pkt_len,
+                            uint8_t marker, int rc) {
+    FILE *df = fopen("/home/tiendat/CODE/network-encryptor/.cursor/debug-eefb96.log", "a");
+    if (!df)
+        return;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    long long ms = (long long)ts.tv_sec * 1000LL + (long long)(ts.tv_nsec / 1000000);
+    fprintf(df,
+            "{\"sessionId\":\"eefb96\",\"hypothesisId\":\"%s\",\"location\":\"%s\","
+            "\"message\":\"%s\",\"data\":{\"policy_wire\":%u,\"pi\":%d,\"pkt_len\":%u,"
+            "\"marker\":%u,\"rc\":%d},\"timestamp\":%lld}\n",
+            hyp, loc, msg, policy_wire, pi, pkt_len, (unsigned)marker, rc, ms);
+    fclose(df);
+}
+// #endregion
 
 static int prev_policy_grace_active(void) {
     if (g_prev_policy_count <= 0)
@@ -1917,14 +1943,29 @@ static int decrypt_packet_auto_l2(struct forwarder *fwd,
         fake_ipv4 = NE_DEFAULT_FAKE_ETHERTYPE_IPV4;
     if (pkt_marker != (uint8_t)(fake_ipv4 >> 8)) {
         /* 0x88xx = NE L2-on-wire; never forward undecrypted (L3 thread no-op was leaking ciphertext). */
-        if (pkt_marker == 0x88U)
+        if (pkt_marker == 0x88U) {
+            // #region agent log
+            ne_agent_log_l2("H3", "forwarder.c:decrypt_packet_auto_l2", "marker_88_no_ctx", 0, -1,
+                            *pkt_len, pkt_marker, -1);
+            // #endregion
+            if (ne_l2_diag_enabled())
+                fprintf(stderr, "[L2-DIAG] decrypt FAIL marker_88_mismatch fake=0x%04x len=%u\n",
+                        (unsigned)fake_ipv4, (unsigned)*pkt_len);
             return -1;
+        }
+        if (ne_l2_diag_enabled())
+            fprintf(stderr, "[L2-DIAG] skip decrypt (not NE L2) marker=0x%02x len=%u -> pass-through\n",
+                    pkt_marker, (unsigned)*pkt_len);
         return 0;
     }
 
     if (fwd->cfg->policy_count <= 0) {
         apply_default_crypto_params(fwd);
         int new_len = crypto_layer2_decrypt(&crypto_ctx, pkt, *pkt_len);
+        // #region agent log
+        ne_agent_log_l2("H5", "forwarder.c:decrypt_packet_auto_l2", "default_ctx_decrypt", 0, -1,
+                        *pkt_len, pkt_marker, new_len);
+        // #endregion
         if (new_len < 0) return -1;
         *pkt_len = (uint32_t)new_len;
         return 0;
@@ -1937,13 +1978,30 @@ static int decrypt_packet_auto_l2(struct forwarder *fwd,
     policy_wire = ((uint32_t)pkt[13] << 24) | ((uint32_t)pkt[14] << 16) | ((uint32_t)pkt[15] << 8) |
                    (uint32_t)pkt[16];
     int pi = fwd_pi_for_action_wire(fwd, POLICY_ACTION_ENCRYPT_L2, policy_wire);
+    // #region agent log
+    ne_agent_log_l2("H1", "forwarder.c:decrypt_packet_auto_l2", "policy_lookup", policy_wire, pi,
+                    *pkt_len, pkt_marker, pi >= 0 ? 0 : -1);
+    // #endregion
     if (pi >= 0 && pi < fwd->cfg->policy_count && g_policy_crypto_ctx_ready[pi]) {
         const struct crypto_policy *cp = &fwd->cfg->policies[pi];
         apply_crypto_params_from_policy(cp);
         int new_len = crypto_layer2_decrypt(&g_policy_crypto_ctx[pi], pkt, *pkt_len);
-        if (new_len < 0)
+        // #region agent log
+        ne_agent_log_l2("H2", "forwarder.c:decrypt_packet_auto_l2", "per_policy_decrypt", policy_wire,
+                        pi, *pkt_len, pkt_marker, new_len);
+        // #endregion
+        if (new_len < 0) {
+            if (ne_l2_diag_enabled())
+                fprintf(stderr, "[L2-DIAG] decrypt FAIL GCM/policy policy_wire=%u pi=%d len=%u\n",
+                        policy_wire, pi, (unsigned)*pkt_len);
             return -1;
+        }
         *pkt_len = (uint32_t)new_len;
+        if (ne_l2_diag_enabled()) {
+            uint16_t et = ((uint16_t)pkt[12] << 8) | pkt[13];
+            fprintf(stderr, "[L2-DIAG] decrypt OK policy_wire=%u pi=%d len_out=%u ethertype=0x%04x\n",
+                    policy_wire, pi, (unsigned)*pkt_len, (unsigned)et);
+        }
         return 0;
     }
 
@@ -1953,14 +2011,27 @@ static int decrypt_packet_auto_l2(struct forwarder *fwd,
             const struct crypto_policy *cp_prev = &g_prev_policies[ppi];
             apply_crypto_params_from_policy(cp_prev);
             int new_len = crypto_layer2_decrypt(&g_prev_policy_crypto_ctx[ppi], pkt, *pkt_len);
+            // #region agent log
+            ne_agent_log_l2("H1", "forwarder.c:decrypt_packet_auto_l2", "grace_decrypt", policy_wire,
+                            ppi, *pkt_len, pkt_marker, new_len);
+            // #endregion
             if (new_len < 0)
                 return -1;
             *pkt_len = (uint32_t)new_len;
+            if (ne_l2_diag_enabled())
+                fprintf(stderr, "[L2-DIAG] decrypt OK (grace) policy_wire=%u ppi=%d len_out=%u\n",
+                        policy_wire, ppi, (unsigned)*pkt_len);
             return 0;
         }
     }
 
-
+    // #region agent log
+    ne_agent_log_l2("H1", "forwarder.c:decrypt_packet_auto_l2", "no_policy_ctx", policy_wire, pi,
+                    *pkt_len, pkt_marker, -1);
+    // #endregion
+    if (ne_l2_diag_enabled())
+        fprintf(stderr, "[L2-DIAG] decrypt FAIL no_policy_ctx policy_wire=%u pi=%d len=%u marker=0x%02x\n",
+                policy_wire, pi, (unsigned)*pkt_len, pkt_marker);
     return -1;
 }
 
@@ -2735,6 +2806,9 @@ static void *wan_queue_thread_l2(void *arg) {
             }
 
             ne_wan_rx_normalize_eth_ipv4_before_local_inject(final_pkt, final_len);
+            if (ne_l2_diag_enabled() && final_len >= 14U && final_pkt[12] == 0x88U)
+                fprintf(stderr, "[L2-DIAG] LEAK? inject local still marker 0x88 len=%u wan=%s\n",
+                        (unsigned)final_len, wan->ifname);
             if (interface_send_to_local_batch_queue(local_iface, tq, local_cfg, final_pkt, final_len) == 0) {
                 __sync_fetch_and_add(&fwd->wan_to_local, 1);
                 if (tq < 32)
@@ -3193,6 +3267,9 @@ static void *wan_queue_thread_l3l4(void *arg) {
             }
 
             ne_wan_rx_normalize_eth_ipv4_before_local_inject(final_pkt, final_len);
+            if (ne_l2_diag_enabled() && final_len >= 14U && final_pkt[12] == 0x88U)
+                fprintf(stderr, "[L2-DIAG] LEAK? inject local still marker 0x88 len=%u wan=%s (L3 thread)\n",
+                        (unsigned)final_len, wan->ifname);
             if (interface_send_to_local_batch_queue(local_iface, tq, local_cfg, final_pkt, final_len) == 0) {
                 __sync_fetch_and_add(&fwd->wan_to_local, 1);
                 if (tq < 32)
