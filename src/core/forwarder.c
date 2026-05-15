@@ -4,6 +4,7 @@
 #include "../../inc/config.h"
 #include "../../inc/crypto_layer2.h"
 #include "../../inc/ne_l2_trace.h"
+#include "../../inc/ne_agent_dbg.h"
 #include "../../inc/crypto_layer3.h"
 #include "../../inc/crypto_layer4.h"
 #include "../../inc/crypto_policy_utils.h"
@@ -2691,6 +2692,15 @@ static void *wan_queue_thread_l2(void *arg) {
                             ne_l2_trace_frag("S8-FRAG-REASM", wan->ifname, fpid, fidx, 1, pkt,
                                              pkt_len, detail);
                         }
+                        // #region agent log
+                        if (rr < 0 && fidx == 1) {
+                            char kv[80];
+                            snprintf(kv, sizeof(kv), "\"pkt_id\":%u,\"wan\":\"%s\"",
+                                     (unsigned)fpid, wan->ifname);
+                            ne_agent_dbg("H3", "forwarder.c:wan_l2", "frag1_reasm_fail", "pre-fix",
+                                         kv);
+                        }
+                        // #endregion
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                         continue;
                     }

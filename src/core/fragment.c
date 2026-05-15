@@ -3,6 +3,7 @@
 #include "../../inc/packet_crypto.h"
 #include "../../inc/crypto_layer2.h"
 #include "../../inc/ne_l2_trace.h"
+#include "../../inc/ne_agent_dbg.h"
 #include "../../inc/crypto_layer3.h"
 #include "../../inc/crypto_layer4.h"
 #include "../../inc/config.h"
@@ -709,6 +710,23 @@ int frag_is_fragment_l2(const uint8_t *pkt_data, uint32_t pkt_len,
     return 1;
 }
 
+/* Match L3 reasm: per-fragment IP total/checksum differ; compare identity fields only. */
+static int frag_l2_ip_hdr_identity_match(const uint8_t *a, const uint8_t *b, int len) {
+    if (len < 20)
+        return 0;
+    if (a[0] != b[0] || a[1] != b[1])
+        return 0;
+    if (a[4] != b[4] || a[5] != b[5] || a[6] != b[6] || a[7] != b[7])
+        return 0;
+    if (a[8] != b[8] || a[9] != b[9])
+        return 0;
+    if (memcmp(a + 12, b + 12, 8) != 0)
+        return 0;
+    if (len > 20 && memcmp(a + 20, b + 20, (size_t)(len - 20)) != 0)
+        return 0;
+    return 1;
+}
+
 int frag_try_reassemble_l2(struct frag_table *ft,
                            const uint8_t *pkt_data, uint32_t pkt_len,
                            uint16_t pkt_id, uint8_t frag_index,
@@ -734,6 +752,15 @@ int frag_try_reassemble_l2(struct frag_table *ft,
         const uint8_t *payload = pkt_data + 14 + FRAG_HDR_SIZE + ip_hdr_len;
         uint32_t payload_len = pkt_len - (14 + FRAG_HDR_SIZE + ip_hdr_len);
 
+        // #region agent log
+        if (entry->valid && entry->pkt_id != pkt_id) {
+            char kv[96];
+            snprintf(kv, sizeof(kv),
+                     "\"slot\":%d,\"old_id\":%u,\"new_id\":%u", idx,
+                     (unsigned)entry->pkt_id, (unsigned)pkt_id);
+            ne_agent_dbg("H2", "fragment.c:reasm_l2", "opid_slot_overwrite", "pre-fix", kv);
+        }
+        // #endregion
         entry->pkt_id = pkt_id;
         entry->data_len = payload_len;
         if (payload_len > sizeof(entry->data))
@@ -767,10 +794,44 @@ int frag_try_reassemble_l2(struct frag_table *ft,
             return -1;
         }
 
-        if (ip_hdr_len != entry->ip_hdr_len ||
-            memcmp(ip_hdr, entry->ip_hdr, (size_t)ip_hdr_len) != 0) {
+        if (ip_hdr_len != entry->ip_hdr_len) {
+            // #region agent log
+            {
+                char kv[96];
+                snprintf(kv, sizeof(kv),
+                         "\"pkt_id\":%u,\"reason\":\"ip_hdr_len\",\"got\":%d,\"want\":%d",
+                         (unsigned)pkt_id, ip_hdr_len, entry->ip_hdr_len);
+                ne_agent_dbg("H4", "fragment.c:reasm_l2", "reasm_reject", "pre-fix", kv);
+            }
+            // #endregion
             entry->valid = 0;
             return -1;
+        }
+
+        {
+            int id_ok = frag_l2_ip_hdr_identity_match(ip_hdr, entry->ip_hdr, ip_hdr_len);
+            int full_ok = (memcmp(ip_hdr, entry->ip_hdr, (size_t)ip_hdr_len) == 0);
+            // #region agent log
+            if (!full_ok && id_ok) {
+                uint16_t t0 = (uint16_t)(((uint16_t)entry->ip_hdr[2] << 8) | entry->ip_hdr[3]);
+                uint16_t t1 = (uint16_t)(((uint16_t)ip_hdr[2] << 8) | ip_hdr[3]);
+                char kv[128];
+                snprintf(kv, sizeof(kv),
+                         "\"pkt_id\":%u,\"tot_frag0\":%u,\"tot_frag1\":%u,\"payload0\":%u",
+                         (unsigned)pkt_id, (unsigned)t0, (unsigned)t1,
+                         (unsigned)entry->data_len);
+                ne_agent_dbg("H4", "fragment.c:reasm_l2", "ip_hdr_totlen_mismatch_old_memcmp",
+                             "pre-fix", kv);
+            }
+            if (!id_ok) {
+                char kv[64];
+                snprintf(kv, sizeof(kv), "\"pkt_id\":%u", (unsigned)pkt_id);
+                ne_agent_dbg("H4", "fragment.c:reasm_l2", "ip_hdr_identity_mismatch", "pre-fix",
+                             kv);
+                entry->valid = 0;
+                return -1;
+            }
+            // #endregion
         }
 
         const uint8_t *payload = pkt_data + 14 + FRAG_HDR_SIZE + ip_hdr_len;
@@ -841,6 +902,14 @@ int frag_try_reassemble_l2(struct frag_table *ft,
 
         *out_len = (uint32_t)off;
         entry->valid = 0;
+        // #region agent log
+        {
+            char kv[96];
+            snprintf(kv, sizeof(kv), "\"pkt_id\":%u,\"out_len\":%u", (unsigned)pkt_id,
+                     (unsigned)*out_len);
+            ne_agent_dbg("H4", "fragment.c:reasm_l2", "reasm_ok", "post-fix", kv);
+        }
+        // #endregion
         ne_l2_trace_frag("S8-FRAG-REASM", NULL, pkt_id, 1, 1, out_buf, *out_len,
                          "merged frag0+1");
         return 1;
