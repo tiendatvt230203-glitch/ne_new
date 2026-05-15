@@ -73,7 +73,7 @@ CREATE TABLE IF NOT EXISTS xdp_profile_crypto_policy_matches (
 );
 
 COMMENT ON TABLE xdp_profile_crypto_policies IS
-    'Crypto rules per profile. Rows with action encrypt_l2 / encrypt_l3 / encrypt_l4 embed policies.id on the wire as 4-byte big-endian cleartext (not inside AES ciphertext) so the receiver selects crypto_key. bypass leaves packets unchanged for crypto.';
+    'Crypto rules per profile. For encrypt_l2 / encrypt_l3 / encrypt_l4, policy id is on the wire and crypto_mode / aes_bits / nonce_size / crypto_key apply. For action bypass, only id, priority, protocol, and policy matches matter; crypto columns are unused (schema defaults may fill them).';
 COMMENT ON COLUMN xdp_profile_crypto_policies.id IS
     'Primary key and on-wire policy id for encrypt_* actions (same value loaded into NE and matched on RX). Use stable ids agreed between peers.';
 COMMENT ON TABLE xdp_profile_crypto_policy_matches IS

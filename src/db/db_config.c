@@ -303,28 +303,36 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
                 const char *nonce = PQgetvalue(res, r, 6);
                 const char *key_hex = PQgetvalue(res, r, 7);
 
-                cp_base.crypto_mode = (mode && (strcasecmp(mode, "gcm") == 0)) ? CRYPTO_MODE_GCM : CRYPTO_MODE_CTR;
-                cp_base.aes_bits = bits ? atoi(bits) : 128;
-                cp_base.nonce_size = nonce ? atoi(nonce) : 12;
-                if (cp_base.aes_bits != 128 && cp_base.aes_bits != 256) {
-                    fprintf(stderr,
-                            "[DB CRYPTO] policy id=%d has invalid aes_bits=%d (allowed: 128,256)\n",
-                            cp_base.id, cp_base.aes_bits);
-                    PQclear(res);
-                    return -1;
-                }
-                if (cp_base.nonce_size < 4 || cp_base.nonce_size > 16) {
-                    fprintf(stderr,
-                            "[DB CRYPTO] policy id=%d has invalid nonce_size=%d (allowed: 4..16)\n",
-                            cp_base.id, cp_base.nonce_size);
-                    PQclear(res);
-                    return -1;
-                }
+                if (cp_base.action == POLICY_ACTION_BYPASS) {
+                    /* Stable policy id + traffic selectors only; no wire crypto. */
+                    memset(cp_base.key, 0, sizeof(cp_base.key));
+                    cp_base.crypto_mode = CRYPTO_MODE_GCM;
+                    cp_base.aes_bits = 128;
+                    cp_base.nonce_size = 12;
+                } else {
+                    cp_base.crypto_mode = (mode && (strcasecmp(mode, "gcm") == 0)) ? CRYPTO_MODE_GCM : CRYPTO_MODE_CTR;
+                    cp_base.aes_bits = bits ? atoi(bits) : 128;
+                    cp_base.nonce_size = nonce ? atoi(nonce) : 12;
+                    if (cp_base.aes_bits != 128 && cp_base.aes_bits != 256) {
+                        fprintf(stderr,
+                                "[DB CRYPTO] policy id=%d has invalid aes_bits=%d (allowed: 128,256)\n",
+                                cp_base.id, cp_base.aes_bits);
+                        PQclear(res);
+                        return -1;
+                    }
+                    if (cp_base.nonce_size < 4 || cp_base.nonce_size > 16) {
+                        fprintf(stderr,
+                                "[DB CRYPTO] policy id=%d has invalid nonce_size=%d (allowed: 4..16)\n",
+                                cp_base.id, cp_base.nonce_size);
+                        PQclear(res);
+                        return -1;
+                    }
 
-                if (key_hex && key_hex[0] != '\0') {
-                    int key_len = (cp_base.aes_bits == 256) ? 32 : 16;
-                    if (parse_hex_bytes_pub(key_hex, cp_base.key, key_len) != 0) {
-                        memset(cp_base.key, 0, sizeof(cp_base.key));
+                    if (key_hex && key_hex[0] != '\0') {
+                        int key_len = (cp_base.aes_bits == 256) ? 32 : 16;
+                        if (parse_hex_bytes_pub(key_hex, cp_base.key, key_len) != 0) {
+                            memset(cp_base.key, 0, sizeof(cp_base.key));
+                        }
                     }
                 }
 
