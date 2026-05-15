@@ -660,28 +660,9 @@ int frag_split_and_encrypt_l2(struct packet_crypto_ctx *ctx,
             uint16_t cksum = crypto_calc_ip_checksum(frag2 + 14 + FRAG_HDR_SIZE, ip_hdr_len);
             frag2[14 + FRAG_HDR_SIZE + 10] = (uint8_t)(cksum >> 8);
             frag2[14 + FRAG_HDR_SIZE + 11] = (uint8_t)(cksum & 0xFF);
-
-            {
-                uint8_t *ipb = frag2 + 14 + FRAG_HDR_SIZE;
-                int ip_pld_len = (int)off - (14 + (int)FRAG_HDR_SIZE + ip_hdr_len);
-                if (ipb[9] == 6 && ip_pld_len >= 20) {
-                    uint8_t *tcp = ipb + ip_hdr_len;
-                    tcp[16] = 0;
-                    tcp[17] = 0;
-                    uint16_t tck = crypto_calc_tcp_checksum(ipb, ip_hdr_len, tcp, ip_pld_len);
-                    tcp[16] = (uint8_t)(tck >> 8);
-                    tcp[17] = (uint8_t)(tck & 0xFF);
-                } else if (ipb[9] == 17 && ip_pld_len >= 8) {
-                    uint8_t *udp = ipb + ip_hdr_len;
-                    udp[4] = (uint8_t)((unsigned)ip_pld_len >> 8);
-                    udp[5] = (uint8_t)(ip_pld_len & 0xFF);
-                    udp[6] = 0;
-                    udp[7] = 0;
-                    uint16_t uck = crypto_calc_udp_checksum(ipb, ip_hdr_len, udp, ip_pld_len);
-                    udp[6] = (uint8_t)(uck >> 8);
-                    udp[7] = (uint8_t)(uck & 0xFF);
-                }
-            }
+            /* frag1: payload is TCP/UDP body continuation only — no L4 hdr; do not
+             * touch bytes 16–17 as TCP cksum (corrupts SSH/KEX mid-stream). Full L4
+             * cksum is recalculated after reasm on the merged segment. */
         }
 
         int enc_len = crypto_layer2_encrypt(ctx, frag2, off);

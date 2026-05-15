@@ -55,6 +55,8 @@ static struct flow_table g_flow_table;
 static struct frag_table g_wan_frag_l2;
 static struct frag_table g_wan_frag_l3;
 static struct frag_table g_wan_frag_l4;
+/* enp7/enp8 WAN RX threads share g_wan_frag_l2 — must serialize reasm + gc */
+static pthread_mutex_t g_wan_frag_l2_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static struct packet_crypto_ctx g_policy_crypto_ctx[MAX_CRYPTO_POLICIES];
 static int g_policy_crypto_ctx_ready[MAX_CRYPTO_POLICIES];
@@ -2650,7 +2652,9 @@ static void *wan_queue_thread_l2(void *arg) {
 
         uint32_t local_used_queues[MAX_INTERFACES] = {0};
 
+        pthread_mutex_lock(&g_wan_frag_l2_mu);
         frag_table_gc(&g_wan_frag_l2);
+        pthread_mutex_unlock(&g_wan_frag_l2_mu);
 
         for (int i = 0; i < rcvd; i++) {
             uint8_t *pkt = (uint8_t *)pkt_ptrs[i];
@@ -2681,8 +2685,11 @@ static void *wan_queue_thread_l2(void *arg) {
                                          "after L2 decrypt");
                     uint8_t reass_buf[4096];
                     uint32_t reass_len = 0;
-                    int rr = frag_try_reassemble_l2(&g_wan_frag_l2, pkt, pkt_len, fpid, fidx,
-                                                    reass_buf, &reass_len);
+                    int rr;
+                    pthread_mutex_lock(&g_wan_frag_l2_mu);
+                    rr = frag_try_reassemble_l2(&g_wan_frag_l2, pkt, pkt_len, fpid, fidx,
+                                                reass_buf, &reass_len);
+                    pthread_mutex_unlock(&g_wan_frag_l2_mu);
                     if (rr == 0)
                         continue;
                     if (rr != 1) {
