@@ -1832,6 +1832,9 @@ static int decrypt_packet_auto_l2(struct forwarder *fwd,
     uint8_t pkt_marker = pkt[12];
     uint16_t fake_ipv4 = packet_crypto_get_fake_ethertype_ipv4();
     if (!(fake_ipv4 && pkt_marker == (uint8_t)(fake_ipv4 >> 8))) {
+        /* 0x88xx = NE L2-on-wire; never forward undecrypted (L3 thread no-op was leaking ciphertext). */
+        if (pkt_marker == 0x88U)
+            return -1;
         return 0;
     }
 
@@ -2741,6 +2744,18 @@ static void *wan_queue_thread_l3l4(void *arg) {
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                         continue;
                     }
+                }
+            }
+
+            {
+                uint16_t et = ((uint16_t)pkt[12] << 8) | pkt[13];
+                if (et != 0x0800 && pkt_len >= 14U && pkt[12] == 0x88U) {
+                    ne_rx_class_log("RX_WAN_NE_ETH_NOT_IPV4", wan->ifname, wan_idx, "RX_WAN_GIBBERISH",
+                                    "eth_88xx_not_decrypted_to_0800", wire_len, wire_flow_ok,
+                                    wire_src_ip, wire_src_port, wire_dst_ip, wire_dst_port, wire_proto,
+                                    "block_forward_ciphertext");
+                    __sync_fetch_and_add(&fwd->total_dropped, 1);
+                    continue;
                 }
             }
 

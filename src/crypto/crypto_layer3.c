@@ -113,17 +113,6 @@ int crypto_layer3_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
                                   nonce, &rd_proto_flag, &pol_wire, &orig_proto);
     (void)pol_wire;
 
-    packet[IPV4_PROTO_OFF] = orig_proto;
-
-    int nonce_len;
-    if (is_gcm) {
-        nonce_len = nonce_size;
-    } 
-    
-    else {
-        nonce_len = AES128_IV_SIZE;
-    }
-
     int enc_off = tunnel_off + tunnel_hdr_size;
     size_t total_after_tunnel = pkt_len - enc_off;
     size_t enc_len;
@@ -137,84 +126,74 @@ int crypto_layer3_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
     
     else enc_len = total_after_tunnel;
 
-    uint8_t backup[2048];
-    int has_backup = 0;
-    if (enc_len <= sizeof(backup)) {
-        memcpy(backup, packet + enc_off, enc_len);
-        has_backup = 1;
-    }
+    const uint8_t *key = packet_crypto_get_key(ctx, KEY_SLOT_CURRENT);
+    if (!key)
+        return -1;
 
-    int key_order[] = { KEY_SLOT_CURRENT, KEY_SLOT_PREV, KEY_SLOT_NEXT };
     int total_overhead = tunnel_hdr_size + (is_gcm ? AES128_GCM_TAG_SIZE : 0);
 
-    for (int k = 0; k < KEY_SLOT_COUNT; k++) {
-        const uint8_t *key = packet_crypto_get_key(ctx, key_order[k]);
-        if (!key) continue;
+    uint8_t *work_ptr = packet + enc_off;
 
-        uint8_t *work_ptr = packet + enc_off;
-        if (k > 0 && has_backup) memcpy(work_ptr, backup, enc_len);
-
-        if (is_gcm) {
-            if (crypto_aes_gcm_decrypt(key, nonce, nonce_len, work_ptr, (int)enc_len, tag) != 0) continue;
-        } 
-        
-        else {
-            uint8_t iv[AES128_IV_SIZE];
-            crypto_nonce_to_iv(nonce, nonce_size, iv);
-            if (crypto_aes_ctr_with_key(key, iv, work_ptr, (int)enc_len) != 0) continue;
-            if (!verify_decrypted_payload(work_ptr, enc_len, orig_proto)) continue;
-        }
-
-        memmove(packet + tunnel_off, work_ptr, enc_len);
-
-        packet[IPV4_PROTO_OFF] = orig_proto;
-        uint16_t old_totlen = ((uint16_t)packet[IPV4_TOTLEN_OFF] << 8) | packet[IPV4_TOTLEN_OFF + 1];
-        if (old_totlen < (uint16_t)total_overhead)
+    if (is_gcm) {
+        if (crypto_aes_gcm_decrypt(key, nonce, nonce_size, work_ptr, (int)enc_len, tag) != 0)
             return -1;
-        uint16_t new_totlen = old_totlen - (uint16_t)total_overhead;
-        packet[IPV4_TOTLEN_OFF] = (uint8_t)(new_totlen >> 8);
-        packet[IPV4_TOTLEN_OFF + 1] = (uint8_t)(new_totlen & 0xFF);
-        packet[IPV4_CKSUM_OFF] = 0; packet[IPV4_CKSUM_OFF + 1] = 0;
-        uint16_t cksum = crypto_calc_ip_checksum(packet + ETH_HEADER_SIZE, IPV4_HDR_SIZE);
-        packet[IPV4_CKSUM_OFF] = (uint8_t)(cksum >> 8);
-        packet[IPV4_CKSUM_OFF + 1] = (uint8_t)(cksum & 0xFF);
-
-        size_t dec_pkt_len = pkt_len - (size_t)total_overhead;
-        if (dec_pkt_len < ETH_HEADER_SIZE + (size_t)new_totlen)
+    } else {
+        uint8_t iv[AES128_IV_SIZE];
+        crypto_nonce_to_iv(nonce, nonce_size, iv);
+        if (crypto_aes_ctr_with_key(key, iv, work_ptr, (int)enc_len) != 0)
             return -1;
-        int ip_hdr_len = (packet[ETH_HEADER_SIZE] & 0x0F) * 4;
-        size_t transport_off = (size_t)ETH_HEADER_SIZE + (size_t)ip_hdr_len;
+        if (!verify_decrypted_payload(work_ptr, enc_len, orig_proto))
+            return -1;
+    }
 
-        if (dec_pkt_len > transport_off) {
-            if (orig_proto == 6) {
-                size_t tcp_seg_len = dec_pkt_len - transport_off;
-                if (tcp_seg_len >= 20) {
-                    uint8_t *tcp_seg = packet + transport_off;
-                    tcp_seg[TCP_CKSUM_OFF] = 0;
-                    tcp_seg[TCP_CKSUM_OFF + 1] = 0;
-                    uint16_t tcp_cksum = crypto_calc_tcp_checksum(packet + ETH_HEADER_SIZE,
-                                                                  ip_hdr_len,
-                                                                  tcp_seg,
-                                                                  (int)tcp_seg_len);
-                    tcp_seg[TCP_CKSUM_OFF] = (uint8_t)(tcp_cksum >> 8);
-                    tcp_seg[TCP_CKSUM_OFF + 1] = (uint8_t)(tcp_cksum & 0xFF);
-                }
-            } else if (orig_proto == 17) {
-                size_t udp_seg_len = dec_pkt_len - transport_off;
-                if (udp_seg_len >= 8) {
-                    uint8_t *udp_seg = packet + transport_off;
-                    udp_seg[UDP_CKSUM_OFF] = 0;
-                    udp_seg[UDP_CKSUM_OFF + 1] = 0;
-                    uint16_t udp_cksum = crypto_calc_udp_checksum(packet + ETH_HEADER_SIZE,
-                                                                  ip_hdr_len,
-                                                                  udp_seg,
-                                                                  (int)udp_seg_len);
-                    udp_seg[UDP_CKSUM_OFF] = (uint8_t)(udp_cksum >> 8);
-                    udp_seg[UDP_CKSUM_OFF + 1] = (uint8_t)(udp_cksum & 0xFF);
-                }
+    memmove(packet + tunnel_off, work_ptr, enc_len);
+
+    packet[IPV4_PROTO_OFF] = orig_proto;
+    uint16_t old_totlen = ((uint16_t)packet[IPV4_TOTLEN_OFF] << 8) | packet[IPV4_TOTLEN_OFF + 1];
+    if (old_totlen < (uint16_t)total_overhead)
+        return -1;
+    uint16_t new_totlen = old_totlen - (uint16_t)total_overhead;
+    packet[IPV4_TOTLEN_OFF] = (uint8_t)(new_totlen >> 8);
+    packet[IPV4_TOTLEN_OFF + 1] = (uint8_t)(new_totlen & 0xFF);
+    packet[IPV4_CKSUM_OFF] = 0; packet[IPV4_CKSUM_OFF + 1] = 0;
+    uint16_t cksum = crypto_calc_ip_checksum(packet + ETH_HEADER_SIZE, IPV4_HDR_SIZE);
+    packet[IPV4_CKSUM_OFF] = (uint8_t)(cksum >> 8);
+    packet[IPV4_CKSUM_OFF + 1] = (uint8_t)(cksum & 0xFF);
+
+    size_t dec_pkt_len = pkt_len - (size_t)total_overhead;
+    if (dec_pkt_len < ETH_HEADER_SIZE + (size_t)new_totlen)
+        return -1;
+    int ip_hdr_len = (packet[ETH_HEADER_SIZE] & 0x0F) * 4;
+    size_t transport_off = (size_t)ETH_HEADER_SIZE + (size_t)ip_hdr_len;
+
+    if (dec_pkt_len > transport_off) {
+        if (orig_proto == 6) {
+            size_t tcp_seg_len = dec_pkt_len - transport_off;
+            if (tcp_seg_len >= 20) {
+                uint8_t *tcp_seg = packet + transport_off;
+                tcp_seg[TCP_CKSUM_OFF] = 0;
+                tcp_seg[TCP_CKSUM_OFF + 1] = 0;
+                uint16_t tcp_cksum = crypto_calc_tcp_checksum(packet + ETH_HEADER_SIZE,
+                                                              ip_hdr_len,
+                                                              tcp_seg,
+                                                              (int)tcp_seg_len);
+                tcp_seg[TCP_CKSUM_OFF] = (uint8_t)(tcp_cksum >> 8);
+                tcp_seg[TCP_CKSUM_OFF + 1] = (uint8_t)(tcp_cksum & 0xFF);
+            }
+        } else if (orig_proto == 17) {
+            size_t udp_seg_len = dec_pkt_len - transport_off;
+            if (udp_seg_len >= 8) {
+                uint8_t *udp_seg = packet + transport_off;
+                udp_seg[UDP_CKSUM_OFF] = 0;
+                udp_seg[UDP_CKSUM_OFF + 1] = 0;
+                uint16_t udp_cksum = crypto_calc_udp_checksum(packet + ETH_HEADER_SIZE,
+                                                              ip_hdr_len,
+                                                              udp_seg,
+                                                              (int)udp_seg_len);
+                udp_seg[UDP_CKSUM_OFF] = (uint8_t)(udp_cksum >> 8);
+                udp_seg[UDP_CKSUM_OFF + 1] = (uint8_t)(udp_cksum & 0xFF);
             }
         }
-        return (int)(pkt_len - total_overhead);
     }
-    return -1;
+    return (int)(pkt_len - total_overhead);
 }

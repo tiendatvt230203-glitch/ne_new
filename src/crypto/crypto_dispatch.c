@@ -185,8 +185,20 @@ int crypto_decrypt_packet_auto_by_action(
 
     if (action_layer == POLICY_ACTION_ENCRYPT_L3) {
         uint32_t policy_id = 0;
-        if (crypto_l3_extract_policy_id(pkt, *pkt_len, &policy_id) != 0)
+        if (crypto_l3_extract_policy_id(pkt, *pkt_len, &policy_id) != 0) {
+            /* Do not treat as cleartext if IPv4 still uses the NE fake next-header (encrypted shape). */
+            if (*pkt_len >= 34U) {
+                uint16_t et = ((uint16_t)pkt[12] << 8) | pkt[13];
+                if (et == 0x0800) {
+                    uint8_t marker = packet_crypto_get_fake_protocol();
+                    if (marker == 0)
+                        marker = 99;
+                    if (pkt[14 + 9] == marker)
+                        return -1;
+                }
+            }
             return 0;
+        }
         int pi = lookup_policy_index(dctx->policies, dctx->policy_count,
                                      POLICY_ACTION_ENCRYPT_L3, policy_id);
         if (pi >= 0 && dctx->per_policy_ready && dctx->per_policy_ready[pi]) {
