@@ -27,8 +27,8 @@ int crypto_layer2_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
     if (unlikely(!ctx || !ctx->initialized || !packet || pkt_len < MIN_ETH_PKT)) return -1;
 
     const int nonce_size = packet_crypto_get_nonce_size();
-    const int l2_hdr_extra = nonce_size + NE_L2_POLICY_EXTRA;
     const int l2_enc_start = ETH_HEADER_SIZE + 2 + NE_L2_POLICY_EXTRA + nonce_size;
+    const int l2_wire_extra = l2_enc_start - ETH_HEADER_SIZE; /* marker+policy+nonce before ciphertext */
 
     uint16_t ether_type = ((uint16_t)packet[12] << 8) | packet[13];
     uint8_t proto_flag;
@@ -61,7 +61,7 @@ int crypto_layer2_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
                                             packet + l2_enc_start, (int)payload_len, tag) != 0))
             return -1;
         memcpy(packet + l2_enc_start + payload_len, tag, AES128_GCM_TAG_SIZE);
-        return (int)(pkt_len + l2_hdr_extra + AES128_GCM_TAG_SIZE);
+        return (int)(pkt_len + l2_wire_extra + AES128_GCM_TAG_SIZE);
     }
     else {
         uint8_t iv[AES128_IV_SIZE];
@@ -69,7 +69,7 @@ int crypto_layer2_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
         if (unlikely(crypto_aes_ctr_with_key(key, iv,
                                              packet + l2_enc_start, (int)payload_len) != 0))
             return -1;
-        return (int)(pkt_len + l2_hdr_extra);
+        return (int)(pkt_len + l2_wire_extra);
     }
 }
 

@@ -25,9 +25,18 @@ BPF_OBJ = bpf/xdp_redirect.o bpf/xdp_wan_redirect.o
 
 MAKEFLAGS += --no-print-directory
 
-.PHONY: all clean run dirs
+CRYPTO_STUB_SRC = src/crypto/packet_crypto.c src/crypto/crypto_layer2.c \
+                  src/crypto/crypto_layer3.c src/crypto/crypto_layer4.c
+L2_ONCE_BIN = $(BIN_DIR)/ne_l2_once
+
+.PHONY: all clean run dirs ne_l2_once
 
 all: dirs $(BPF_OBJ) $(DB_LIB) $(TARGET)
+
+ne_l2_once: dirs $(L2_ONCE_BIN)
+
+$(L2_ONCE_BIN): tools/ne_l2_once.c $(CRYPTO_STUB_SRC)
+	$(CC) $(CFLAGS) -o $@ tools/ne_l2_once.c $(CRYPTO_STUB_SRC) -lssl -lcrypto
 
 dirs:
 	@mkdir -p $(BIN_DIR) $(OBJ_DIR)
