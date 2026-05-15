@@ -21,6 +21,8 @@ static __thread int g_aes_bits = 128;
 
 
 static __thread uint32_t g_policy_wire_u32 = 0;
+/* L3 decrypt: if DB policy protocol is TCP(6) or UDP(17), restore IPv4 next-header from DB; 0 = use tunnel byte. */
+static __thread uint8_t g_l3_restore_ipproto_from_db = 0;
 
 static atomic_uint_fast32_t g_nonce_counter = 0;
 
@@ -499,3 +501,11 @@ uint8_t packet_crypto_get_fake_protocol(void) { return g_fake_protocol; }
 
 void packet_crypto_set_policy_wire_u32(uint32_t policy_id) { g_policy_wire_u32 = policy_id; }
 uint32_t packet_crypto_get_policy_wire_u32(void) { return g_policy_wire_u32; }
+
+void packet_crypto_set_l3_restore_ipproto_from_db(uint8_t proto) {
+    g_l3_restore_ipproto_from_db = (proto == 6 || proto == 17) ? proto : 0;
+}
+
+uint8_t packet_crypto_get_l3_restore_ipproto_from_db(void) {
+    return g_l3_restore_ipproto_from_db;
+}

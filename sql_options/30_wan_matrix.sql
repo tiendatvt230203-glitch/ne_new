@@ -1,3 +1,6 @@
+-- Config 30: bonding + weighted WAN split. Crypto policies stay in DB with stable policy_id (421 UDP, 422 TCP)
+-- for matrix / tooling; action=bypass => no encrypt_* => crypto_enabled=0 in C (passthrough, no NE wire overhead).
+
 DELETE FROM xdp_profile_crypto_policies WHERE profile_id IN (SELECT id FROM xdp_profiles WHERE config_id = 30);
 DELETE FROM xdp_profile_locals          WHERE profile_id IN (SELECT id FROM xdp_profiles WHERE config_id = 30);
 DELETE FROM xdp_profile_wans            WHERE profile_id IN (SELECT id FROM xdp_profiles WHERE config_id = 30);
@@ -18,7 +21,7 @@ INSERT INTO xdp_wan_configs (config_id, ifname) VALUES
 (30, 'enp8s0');
 
 INSERT INTO xdp_profiles (config_id, profile_name, enabled, description) VALUES
-(30, 'wan_enp7s0_enp8s0_70_30', 1, '');
+(30, 'wan_enp7s0_enp8s0_70_30', 1, 'Bonding baseline: policy_id 421/422 in DB (bypass); C crypto_enabled=0, no packet crypto overhead.');
 
 INSERT INTO xdp_profile_locals (profile_id, ifname)
 SELECT p.id, 'enp5s0'
@@ -42,14 +45,14 @@ INSERT INTO xdp_profile_crypto_policies (
     id, profile_id, priority, action, protocol,
     crypto_mode, aes_bits, nonce_size, crypto_key
 )
-SELECT 421, p.id, 20, 'encrypt_l2', 'udp', 'gcm', 128, 12, '2b7e151628aed2a6abf7158809cf4f3c'
+SELECT 421, p.id, 20, 'bypass', 'udp', 'gcm', 128, 12, ''
 FROM xdp_profiles p WHERE p.config_id = 30 AND p.profile_name = 'wan_enp7s0_enp8s0_70_30';
 
 INSERT INTO xdp_profile_crypto_policies (
     id, profile_id, priority, action, protocol,
     crypto_mode, aes_bits, nonce_size, crypto_key
 )
-SELECT 422, p.id, 20, 'encrypt_l3', 'tcp', 'gcm', 128, 12, '5b95b6540e1785f1797661e2413becd5'
+SELECT 422, p.id, 20, 'bypass', 'tcp', 'gcm', 128, 12, ''
 FROM xdp_profiles p WHERE p.config_id = 30 AND p.profile_name = 'wan_enp7s0_enp8s0_70_30';
 
 INSERT INTO xdp_profile_crypto_policy_matches (policy_id, src_cidr, src_port, dst_cidr, dst_port) VALUES

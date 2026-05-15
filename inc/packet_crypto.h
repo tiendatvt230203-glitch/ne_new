@@ -52,12 +52,21 @@ void packet_crypto_set_ethertype(uint16_t fake_ipv4, uint16_t fake_ipv6);
 uint16_t packet_crypto_get_fake_ethertype_ipv4(void);
 uint16_t packet_crypto_get_fake_ethertype_ipv6(void);
 
+/* NE L2-on-wire: default fake EtherType when DB/config leaves ipv4 field unset (high byte 0x88). */
+#ifndef NE_DEFAULT_FAKE_ETHERTYPE_IPV4
+#define NE_DEFAULT_FAKE_ETHERTYPE_IPV4 0x88B5u
+#endif
+
 void packet_crypto_set_fake_protocol(uint8_t proto);
 uint8_t packet_crypto_get_fake_protocol(void);
 
 
 void packet_crypto_set_policy_wire_u32(uint32_t policy_id);
 uint32_t packet_crypto_get_policy_wire_u32(void);
+
+/* L3 RX: after policy_id match, if policy row protocol is tcp/udp, use it for IPv4 next-header (not only tunnel byte). */
+void packet_crypto_set_l3_restore_ipproto_from_db(uint8_t proto);
+uint8_t packet_crypto_get_l3_restore_ipproto_from_db(void);
 
 #define AES128_GCM_TAG_SIZE  16
 

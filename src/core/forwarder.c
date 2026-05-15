@@ -1809,11 +1809,9 @@ static void ne_wan_rx_normalize_eth_ipv4_before_local_inject(uint8_t *pkt, uint3
         return;
 
     uint16_t fake4 = packet_crypto_get_fake_ethertype_ipv4();
-    int ne_wireish = 0;
-    if (fake4 && pkt[12] == (uint8_t)(fake4 >> 8))
-        ne_wireish = 1;
-    else if (!fake4 && pkt[12] == 0x88)
-        ne_wireish = 1;
+    if (fake4 == 0)
+        fake4 = NE_DEFAULT_FAKE_ETHERTYPE_IPV4;
+    int ne_wireish = (pkt[12] == (uint8_t)(fake4 >> 8)) ? 1 : 0;
 
     if (!ne_wireish)
         return;
@@ -1831,7 +1829,9 @@ static int decrypt_packet_auto_l2(struct forwarder *fwd,
 
     uint8_t pkt_marker = pkt[12];
     uint16_t fake_ipv4 = packet_crypto_get_fake_ethertype_ipv4();
-    if (!(fake_ipv4 && pkt_marker == (uint8_t)(fake_ipv4 >> 8))) {
+    if (fake_ipv4 == 0)
+        fake_ipv4 = NE_DEFAULT_FAKE_ETHERTYPE_IPV4;
+    if (pkt_marker != (uint8_t)(fake_ipv4 >> 8)) {
         /* 0x88xx = NE L2-on-wire; never forward undecrypted (L3 thread no-op was leaking ciphertext). */
         if (pkt_marker == 0x88U)
             return -1;
@@ -1914,9 +1914,39 @@ static int decrypt_packet_auto_by_action(struct forwarder *fwd,
                                                 scratch, scratch_sz);
 }
 
+/*
+ * wan_queue_thread_l2 only strips outer L2 NE + L2 reasm. Any inner NE L3/L4 must still
+ * go through crypto_decrypt_packet_auto_by_action: that path reads on-wire policy_id from
+ * the L3/L4 tunnel header, maps it to the DB policy row, then apply_crypto_params_from_policy
+ * (mode, nonce size, AES bits) before crypto_layer3_decrypt / crypto_layer4_decrypt — same
+ * as wan_queue_thread_l3l4, not ad-hoc key guessing.
+ *
+ * For cleartext TCP/UDP after L2, those calls no-op (success, unchanged packet).
+ */
+static int wan_rx_inner_ne_after_outer_l2(struct forwarder *fwd,
+                                          uint8_t *pkt, uint32_t *pkt_len,
+                                          uint8_t *scratch, size_t scratch_sz) {
+    if (!crypto_enabled || !fwd || !fwd->cfg || !pkt || !pkt_len)
+        return 0;
+    if (*pkt_len < (uint32_t)(ETH_HEADER_SIZE + 20))
+        return 0;
+    uint16_t et = ((uint16_t)pkt[12] << 8) | pkt[13];
+    if (et != 0x0800)
+        return 0;
+
+    if (decrypt_packet_auto_by_action(fwd, pkt, pkt_len, POLICY_ACTION_ENCRYPT_L3,
+                                      scratch, scratch_sz) != 0)
+        return -1;
+    if (decrypt_packet_auto_by_action(fwd, pkt, pkt_len, POLICY_ACTION_ENCRYPT_L4,
+                                      scratch, scratch_sz) != 0)
+        return -1;
+    return 0;
+}
+
 static struct packet_crypto_ctx *forwarder_resolve_l3_decrypt_ctx(struct forwarder *fwd,
                                                                    uint8_t *pkt,
                                                                    uint32_t pkt_len) {
+    packet_crypto_set_l3_restore_ipproto_from_db(0);
     if (!fwd || !fwd->cfg)
         return NULL;
 
@@ -1931,13 +1961,19 @@ static struct packet_crypto_ctx *forwarder_resolve_l3_decrypt_ctx(struct forward
 
     int pi = fwd_pi_for_action_wire(fwd, POLICY_ACTION_ENCRYPT_L3, policy_id);
     if (pi >= 0 && pi < fwd->cfg->policy_count && g_policy_crypto_ctx_ready[pi]) {
-        apply_crypto_params_from_policy(&fwd->cfg->policies[pi]);
+        const struct crypto_policy *cp = &fwd->cfg->policies[pi];
+        apply_crypto_params_from_policy(cp);
+        if (cp->protocol == 6 || cp->protocol == 17)
+            packet_crypto_set_l3_restore_ipproto_from_db((uint8_t)cp->protocol);
         return &g_policy_crypto_ctx[pi];
     }
     if (prev_policy_grace_active()) {
         int ppi = fwd_prev_pi_for_action_wire(POLICY_ACTION_ENCRYPT_L3, policy_id);
         if (ppi >= 0 && ppi < g_prev_policy_count && g_prev_policy_crypto_ctx_ready[ppi]) {
-            apply_crypto_params_from_policy(&g_prev_policies[ppi]);
+            const struct crypto_policy *cp_prev = &g_prev_policies[ppi];
+            apply_crypto_params_from_policy(cp_prev);
+            if (cp_prev->protocol == 6 || cp_prev->protocol == 17)
+                packet_crypto_set_l3_restore_ipproto_from_db((uint8_t)cp_prev->protocol);
             return &g_prev_policy_crypto_ctx[ppi];
         }
     }
@@ -2561,6 +2597,19 @@ static void *wan_queue_thread_l2(void *arg) {
                 }
             }
 
+            if (wan_rx_inner_ne_after_outer_l2(fwd, pkt, &pkt_len, decrypt_scratch,
+                                               sizeof(decrypt_scratch)) != 0) {
+                uint32_t sip = 0, dip = 0;
+                uint16_t sp = 0, dp = 0;
+                uint8_t pr = 0;
+                int wf = (parse_flow(pkt, pkt_len, &sip, &dip, &sp, &dp, &pr) == 0);
+                ne_rx_class_log("RX_L2_WAN_INNER_NE_FAIL", wan->ifname, wan_idx, "RX_L2_WAN",
+                                "inner_L3_or_L4_decrypt_fail_after_L2", pkt_len, wf, sip, sp, dip, dp, pr,
+                                "wan_rx_inner_ne_after_outer_l2");
+                __sync_fetch_and_add(&fwd->total_dropped, 1);
+                continue;
+            }
+
             final_pkt = pkt;
             final_len = pkt_len;
 
@@ -2730,9 +2779,10 @@ static void *wan_queue_thread_l3l4(void *arg) {
 
             {
                 uint8_t pkt_marker = pkt[12];
-                uint16_t fake_ipv4 = packet_crypto_get_fake_ethertype_ipv4();
-                int has_l2_marker =
-                    (fake_ipv4 && pkt_marker == (uint8_t)(fake_ipv4 >> 8));
+                uint16_t f4 = packet_crypto_get_fake_ethertype_ipv4();
+                if (f4 == 0)
+                    f4 = NE_DEFAULT_FAKE_ETHERTYPE_IPV4;
+                int has_l2_marker = (pkt_marker == (uint8_t)(f4 >> 8));
                 if (has_l2_marker) {
                     if (decrypt_packet_auto_l2(fwd, pkt, &pkt_len,
                                                decrypt_scratch,
@@ -2784,6 +2834,7 @@ static void *wan_queue_thread_l3l4(void *arg) {
                     uint16_t opid;
                     uint8_t ofidx;
                     int nd = frag_decrypt_fragment(l3ctx, pkt, pkt_len, &opid, &ofidx);
+                    packet_crypto_set_l3_restore_ipproto_from_db(0);
                     if (nd < 0) {
                         char detail[96];
                         snprintf(detail, sizeof(detail), "L3_frag opid=%u idx=%u frag_decrypt rc=%d", opid, ofidx,
@@ -3540,7 +3591,7 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg) {
         packet_crypto_set_nonce_size(cfg->nonce_size);
         if (has_encrypt_l2) {
             if (cfg->fake_ethertype_ipv4 == 0)
-                cfg->fake_ethertype_ipv4 = 0x88b5;
+                cfg->fake_ethertype_ipv4 = NE_DEFAULT_FAKE_ETHERTYPE_IPV4;
             cfg->fake_ethertype_ipv6 = 0;
             packet_crypto_set_ethertype(cfg->fake_ethertype_ipv4, 0);
         }
@@ -3654,7 +3705,7 @@ int forwarder_reload_config(struct forwarder *fwd, struct app_config *cfg) {
         packet_crypto_set_nonce_size(cfg->nonce_size);
         if (has_encrypt_l2) {
             if (cfg->fake_ethertype_ipv4 == 0)
-                cfg->fake_ethertype_ipv4 = 0x88b5;
+                cfg->fake_ethertype_ipv4 = NE_DEFAULT_FAKE_ETHERTYPE_IPV4;
             cfg->fake_ethertype_ipv6 = 0;
             packet_crypto_set_ethertype(cfg->fake_ethertype_ipv4, 0);
         }

@@ -113,6 +113,11 @@ int crypto_layer3_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
                                   nonce, &rd_proto_flag, &pol_wire, &orig_proto);
     (void)pol_wire;
 
+    uint8_t pol_ip = packet_crypto_get_l3_restore_ipproto_from_db();
+    uint8_t rest_proto = orig_proto;
+    if (pol_ip == 6 || pol_ip == 17)
+        rest_proto = pol_ip;
+
     int enc_off = tunnel_off + tunnel_hdr_size;
     size_t total_after_tunnel = pkt_len - enc_off;
     size_t enc_len;
@@ -148,7 +153,7 @@ int crypto_layer3_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
 
     memmove(packet + tunnel_off, work_ptr, enc_len);
 
-    packet[IPV4_PROTO_OFF] = orig_proto;
+    packet[IPV4_PROTO_OFF] = rest_proto;
     uint16_t old_totlen = ((uint16_t)packet[IPV4_TOTLEN_OFF] << 8) | packet[IPV4_TOTLEN_OFF + 1];
     if (old_totlen < (uint16_t)total_overhead)
         return -1;
@@ -167,7 +172,7 @@ int crypto_layer3_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
     size_t transport_off = (size_t)ETH_HEADER_SIZE + (size_t)ip_hdr_len;
 
     if (dec_pkt_len > transport_off) {
-        if (orig_proto == 6) {
+        if (rest_proto == 6) {
             size_t tcp_seg_len = dec_pkt_len - transport_off;
             if (tcp_seg_len >= 20) {
                 uint8_t *tcp_seg = packet + transport_off;
@@ -180,7 +185,7 @@ int crypto_layer3_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
                 tcp_seg[TCP_CKSUM_OFF] = (uint8_t)(tcp_cksum >> 8);
                 tcp_seg[TCP_CKSUM_OFF + 1] = (uint8_t)(tcp_cksum & 0xFF);
             }
-        } else if (orig_proto == 17) {
+        } else if (rest_proto == 17) {
             size_t udp_seg_len = dec_pkt_len - transport_off;
             if (udp_seg_len >= 8) {
                 uint8_t *udp_seg = packet + transport_off;

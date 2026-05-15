@@ -11,6 +11,13 @@
 
 #define L4_TUNNEL_MAGIC    0xA5
 
+static void ne_set_l3_restore_proto_from_policy(const struct crypto_policy *cp) {
+    if (cp && (cp->protocol == 6 || cp->protocol == 17))
+        packet_crypto_set_l3_restore_ipproto_from_db((uint8_t)cp->protocol);
+    else
+        packet_crypto_set_l3_restore_ipproto_from_db(0);
+}
+
 /* Match crypto_layer4.c l4_is_tunnel_header: magic + nonce[0] MSB clear (IPv4 proto flag). */
 static int l4_extract_tunnel_magic_ok(const uint8_t *tunnel_base, int nonce_size) {
     if (nonce_size < 0)
@@ -204,7 +211,9 @@ int crypto_decrypt_packet_auto_by_action(
         if (pi >= 0 && dctx->per_policy_ready && dctx->per_policy_ready[pi]) {
             const struct crypto_policy *cp = &dctx->policies[pi];
             crypto_apply_from_policy(cp);
+            ne_set_l3_restore_proto_from_policy(cp);
             int new_len = crypto_layer3_decrypt(&dctx->per_policy_ctx[pi], pkt, *pkt_len);
+            packet_crypto_set_l3_restore_ipproto_from_db(0);
             if (new_len >= 0 && new_len < (int)*pkt_len) {
                 *pkt_len = (uint32_t)new_len;
                 return 0;
@@ -217,7 +226,9 @@ int crypto_decrypt_packet_auto_by_action(
             if (ppi >= 0 && dctx->prev_per_policy_ready && dctx->prev_per_policy_ready[ppi]) {
                 const struct crypto_policy *cp_prev = &dctx->prev_policies[ppi];
                 crypto_apply_from_policy(cp_prev);
+                ne_set_l3_restore_proto_from_policy(cp_prev);
                 int new_len = crypto_layer3_decrypt(&dctx->prev_per_policy_ctx[ppi], pkt, *pkt_len);
+                packet_crypto_set_l3_restore_ipproto_from_db(0);
                 if (new_len >= 0 && new_len < (int)*pkt_len) {
                     *pkt_len = (uint32_t)new_len;
                     return 0;
@@ -302,9 +313,11 @@ int crypto_decrypt_packet_auto_by_action(
         int new_len = -1;
         if (action_layer == POLICY_ACTION_ENCRYPT_L2)
             new_len = crypto_layer2_decrypt(&dctx->per_policy_ctx[pi], pkt, *pkt_len);
-        else if (action_layer == POLICY_ACTION_ENCRYPT_L3)
+        else if (action_layer == POLICY_ACTION_ENCRYPT_L3) {
+            ne_set_l3_restore_proto_from_policy(cp);
             new_len = crypto_layer3_decrypt(&dctx->per_policy_ctx[pi], pkt, *pkt_len);
-        else if (action_layer == POLICY_ACTION_ENCRYPT_L4)
+            packet_crypto_set_l3_restore_ipproto_from_db(0);
+        } else if (action_layer == POLICY_ACTION_ENCRYPT_L4)
             new_len = crypto_layer4_decrypt(&dctx->per_policy_ctx[pi], pkt, *pkt_len);
         if (new_len < 0) {
             if (scratch)

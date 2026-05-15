@@ -292,6 +292,11 @@ int frag_decrypt_fragment(struct packet_crypto_ctx *ctx,
 
     uint8_t orig_proto = orig_proto_raw & ~FRAG_FLAG_BIT;
 
+    uint8_t pol_ip = packet_crypto_get_l3_restore_ipproto_from_db();
+    uint8_t rest_proto = orig_proto;
+    if (pol_ip == 6 || pol_ip == 17)
+        rest_proto = pol_ip;
+
     frag_read_hdr(packet + tunnel_off + tunnel_hdr_size, out_pkt_id, out_frag_index);
 
     int enc_off = tunnel_off + tunnel_hdr_size + FRAG_HDR_SIZE;
@@ -338,7 +343,7 @@ int frag_decrypt_fragment(struct packet_crypto_ctx *ctx,
 
     memmove(packet + tunnel_off, packet + enc_off, enc_len);
 
-    packet[14 + 9] = orig_proto;
+    packet[14 + 9] = rest_proto;
     {
         uint16_t old_totlen = ((uint16_t)packet[14 + 2] << 8) | packet[14 + 3];
         if (old_totlen < (uint16_t)hdr_overhead)
@@ -358,7 +363,7 @@ int frag_decrypt_fragment(struct packet_crypto_ctx *ctx,
         size_t dec_pkt_len = pkt_len - (size_t)hdr_overhead;
         size_t transport_off = (size_t)14 + (size_t)ip_hdr_len;
         if (*out_frag_index == 0 && dec_pkt_len > transport_off) {
-            if (orig_proto == 6) {
+            if (rest_proto == 6) {
                 size_t tcp_seg_len = dec_pkt_len - transport_off;
                 if (tcp_seg_len >= 20) {
                     uint8_t *tcp_seg = packet + transport_off;
@@ -371,7 +376,7 @@ int frag_decrypt_fragment(struct packet_crypto_ctx *ctx,
                     tcp_seg[16] = (uint8_t)(tcp_cksum >> 8);
                     tcp_seg[17] = (uint8_t)(tcp_cksum & 0xFF);
                 }
-            } else if (orig_proto == 17) {
+            } else if (rest_proto == 17) {
                 size_t udp_seg_len = dec_pkt_len - transport_off;
                 if (udp_seg_len >= 8) {
                     uint8_t *udp_seg = packet + transport_off;

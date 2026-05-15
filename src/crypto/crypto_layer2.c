@@ -32,15 +32,13 @@ int crypto_layer2_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
 
     uint16_t ether_type = ((uint16_t)packet[12] << 8) | packet[13];
     uint8_t proto_flag;
-    uint16_t fake_etype;
-
     if (unlikely(ether_type != 0x0800))
         return (int)pkt_len;
 
     proto_flag = PROTO_FLAG_IPV4;
-    fake_etype = packet_crypto_get_fake_ethertype_ipv4();
-
-    if (unlikely(fake_etype == 0)) return (int)pkt_len;
+    uint16_t fake_etype = packet_crypto_get_fake_ethertype_ipv4();
+    if (fake_etype == 0)
+        fake_etype = NE_DEFAULT_FAKE_ETHERTYPE_IPV4;
 
     uint32_t counter = packet_crypto_next_counter();
     uint8_t nonce[16];
@@ -83,10 +81,12 @@ int crypto_layer2_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
 
     if (unlikely(pkt_len < (size_t)l2_enc_start)) return -1;
 
-    const uint16_t fake_ipv4 = packet_crypto_get_fake_ethertype_ipv4();
+    uint16_t fake_ipv4 = packet_crypto_get_fake_ethertype_ipv4();
+    if (fake_ipv4 == 0)
+        fake_ipv4 = NE_DEFAULT_FAKE_ETHERTYPE_IPV4;
     const uint8_t pkt_marker = packet[12];
 
-    if (!(fake_ipv4 && pkt_marker == (uint8_t)(fake_ipv4 >> 8)))
+    if (pkt_marker != (uint8_t)(fake_ipv4 >> 8))
         return (int)pkt_len;
 
     uint8_t proto_flag;
