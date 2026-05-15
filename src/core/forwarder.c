@@ -1154,6 +1154,36 @@ static int local_mac_lookup(const uint8_t mac[MAC_LEN]) {
     return -1;
 }
 
+static void local_mac_log_iface_and_peer(const char *ifname, const uint8_t peer[MAC_LEN], uint8_t *store_src_mac);
+
+static pthread_mutex_t g_peer_dst_mac_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static void apply_peer_dst_mac(struct forwarder *fwd, int local_idx, const uint8_t mac[MAC_LEN],
+                               const char *reason) {
+    if (!fwd || !fwd->cfg || !mac || local_idx < 0 || local_idx >= fwd->local_count)
+        return;
+    if (mac_is_zero(mac) || mac_is_broadcast(mac) || mac_is_multicast(mac))
+        return;
+
+    pthread_mutex_lock(&g_peer_dst_mac_mu);
+    if (memcmp(fwd->cfg->locals[local_idx].dst_mac, mac, MAC_LEN) == 0) {
+        pthread_mutex_unlock(&g_peer_dst_mac_mu);
+        return;
+    }
+    local_mac_learn(local_idx, mac);
+    memcpy(fwd->cfg->locals[local_idx].dst_mac, mac, MAC_LEN);
+    memcpy(fwd->locals[local_idx].dst_mac, mac, MAC_LEN);
+    pthread_mutex_unlock(&g_peer_dst_mac_mu);
+
+    fprintf(stderr,
+            "[LOCAL-MAC-LEARN][%s] local_if=%s peer=%02x:%02x:%02x:%02x:%02x:%02x\n",
+            reason ? reason : "?",
+            fwd->cfg->locals[local_idx].ifname,
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    local_mac_log_iface_and_peer(fwd->cfg->locals[local_idx].ifname, mac,
+                                 fwd->cfg->locals[local_idx].src_mac);
+}
+
 static void learn_local_src_mac(struct forwarder *fwd, int local_idx, const uint8_t *pkt,
                                 uint32_t pkt_len) {
     if (!fwd || !pkt || pkt_len < sizeof(struct ether_header))
@@ -1161,11 +1191,7 @@ static void learn_local_src_mac(struct forwarder *fwd, int local_idx, const uint
     const uint8_t *sm = pkt + 6;
     if (mac_is_zero(sm) || mac_is_broadcast(sm) || mac_is_multicast(sm))
         return;
-    if (memcmp(fwd->cfg->locals[local_idx].dst_mac, sm, MAC_LEN) == 0)
-        return;
-    local_mac_learn(local_idx, sm);
-    memcpy(fwd->cfg->locals[local_idx].dst_mac, sm, MAC_LEN);
-    memcpy(fwd->locals[local_idx].dst_mac, sm, MAC_LEN);
+    apply_peer_dst_mac(fwd, local_idx, sm, "rx_eth_src");
 }
 
 static int local_idx_from_dst_mac(struct forwarder *fwd, const uint8_t *pkt, uint32_t pkt_len) {
@@ -1477,7 +1503,7 @@ static int peer_mac_from_full_bridge_fdb(const char *ifname, const char *brm,
     return -1;
 }
 
-static int peer_mac_from_kernel(const char *ifname, uint8_t mac_out[MAC_LEN]) {
+static int peer_mac_from_kernel(const char *ifname, uint8_t mac_out[MAC_LEN], int quiet) {
     char cmd[384];
     FILE *fp;
     uint8_t local_hw[MAC_LEN];
@@ -1488,16 +1514,20 @@ static int peer_mac_from_kernel(const char *ifname, uint8_t mac_out[MAC_LEN]) {
     if (have_br) {
         int bf = peer_mac_from_full_bridge_fdb(ifname, brm, have_local ? local_hw : NULL, mac_out);
         if (bf == 0) {
-            fprintf(stderr,
-                    "[LOCAL-MAC] %s peer from bridge fdb (dev %s master %s, learned or single candidate)\n",
-                    ifname, ifname, brm);
+            if (!quiet) {
+                fprintf(stderr,
+                        "[LOCAL-MAC] %s peer from bridge fdb (dev %s master %s, learned or single candidate)\n",
+                        ifname, ifname, brm);
+            }
             return 0;
         }
         if (bf == -2) {
-            fprintf(stderr,
-                    "[LOCAL-MAC][WARN] %s: multiple MAC in `bridge fdb show` for dev %s master %s; "
-                    "try NE_LOCAL_MAC_PRELOAD or reduce hosts on segment\n",
-                    ifname, ifname, brm);
+            if (!quiet) {
+                fprintf(stderr,
+                        "[LOCAL-MAC][WARN] %s: multiple MAC in `bridge fdb show` for dev %s master %s; "
+                        "try NE_LOCAL_MAC_PRELOAD or reduce hosts on segment\n",
+                        ifname, ifname, brm);
+            }
         }
     }
 
@@ -1509,9 +1539,11 @@ static int peer_mac_from_kernel(const char *ifname, uint8_t mac_out[MAC_LEN]) {
         if (r == 0)
             return 0;
         if (r == -2) {
-            fprintf(stderr,
-                    "[LOCAL-MAC][WARN] %s: ip neigh has multiple lladdr; trying bridge master / fdb\n",
-                    ifname);
+            if (!quiet) {
+                fprintf(stderr,
+                        "[LOCAL-MAC][WARN] %s: ip neigh has multiple lladdr; trying bridge master / fdb\n",
+                        ifname);
+            }
         }
     }
 
@@ -1524,9 +1556,11 @@ static int peer_mac_from_kernel(const char *ifname, uint8_t mac_out[MAC_LEN]) {
             if (r == 0)
                 return 0;
             if (r == -2) {
-                fprintf(stderr,
-                        "[LOCAL-MAC][WARN] %s: bridge %s neigh has multiple lladdr; trying bridge fdb\n",
-                        ifname, brm);
+                if (!quiet) {
+                    fprintf(stderr,
+                            "[LOCAL-MAC][WARN] %s: bridge %s neigh has multiple lladdr; trying bridge fdb\n",
+                            ifname, brm);
+                }
             }
         }
     }
@@ -1539,7 +1573,7 @@ static int peer_mac_from_kernel(const char *ifname, uint8_t mac_out[MAC_LEN]) {
     pclose(fp);
     if (r == 0)
         return 0;
-    if (r == -2)
+    if (r == -2 && !quiet)
         fprintf(stderr, "[FATAL][LOCAL-MAC] %s bridge fdb multiple MAC\n", ifname);
 
     if (have_br) {
@@ -1547,15 +1581,65 @@ static int peer_mac_from_kernel(const char *ifname, uint8_t mac_out[MAC_LEN]) {
         if (ar == 0)
             return 0;
         if (ar == -2) {
-            fprintf(stderr,
-                    "[LOCAL-MAC][WARN] %s: /proc/net/arp on %s has multiple MAC; try NE_LOCAL_MAC_PRELOAD\n",
-                    ifname, brm);
+            if (!quiet) {
+                fprintf(stderr,
+                        "[LOCAL-MAC][WARN] %s: /proc/net/arp on %s has multiple MAC; try NE_LOCAL_MAC_PRELOAD\n",
+                        ifname, brm);
+            }
         }
     }
     if (merge_arp_device(ifname, mac_out, have_local ? local_hw : NULL) == 0)
         return 0;
 
     return -1;
+}
+
+static void local_ms_sleep(unsigned ms) {
+    struct timespec ts;
+    ts.tv_sec = (time_t)(ms / 1000u);
+    ts.tv_nsec = (long)(ms % 1000u) * 1000000L;
+    while (nanosleep(&ts, &ts) < 0 && errno == EINTR) {
+    }
+}
+
+static void *local_peer_mac_poll_thread(void *arg) {
+    struct forwarder *fwd = (struct forwarder *)arg;
+    if (!fwd || !fwd->cfg || fwd->local_count <= 0)
+        return NULL;
+
+    unsigned fast_ms = 500;
+    const char *ef = getenv("NE_LOCAL_MAC_POLL_MS");
+    if (ef && ef[0]) {
+        unsigned v = (unsigned)strtoul(ef, NULL, 10);
+        if (v >= 50u && v <= 60000u)
+            fast_ms = v;
+    }
+    unsigned slow_ms = 5000;
+    const char *es = getenv("NE_LOCAL_MAC_POLL_SLOW_MS");
+    if (es && es[0]) {
+        unsigned v = (unsigned)strtoul(es, NULL, 10);
+        if (v >= 200u && v <= 300000u)
+            slow_ms = v;
+    }
+
+    fprintf(stderr,
+            "[LOCAL-MAC-POLL] kernel resync active (NE_LOCAL_MAC_POLL_MS=%u NE_LOCAL_MAC_POLL_SLOW_MS=%u)\n",
+            fast_ms, slow_ms);
+
+    while (running) {
+        int all_known = 1;
+        for (int li = 0; li < fwd->local_count; li++) {
+            if (mac_is_zero(fwd->cfg->locals[li].dst_mac))
+                all_known = 0;
+
+            uint8_t mac[MAC_LEN];
+            if (peer_mac_from_kernel(fwd->cfg->locals[li].ifname, mac, 1) != 0)
+                continue;
+            apply_peer_dst_mac(fwd, li, mac, "kernel_sync");
+        }
+        local_ms_sleep(all_known ? slow_ms : fast_ms);
+    }
+    return NULL;
 }
 
 static int mac_load_from_kernel(struct app_config *cfg, uint64_t *out_n) {
@@ -1577,7 +1661,7 @@ static int mac_load_from_kernel(struct app_config *cfg, uint64_t *out_n) {
     int n_ok = 0;
     for (int i = 0; i < cfg->local_count; i++) {
         memset(macs[i], 0, MAC_LEN);
-        if (peer_mac_from_kernel(cfg->locals[i].ifname, macs[i]) != 0) {
+        if (peer_mac_from_kernel(cfg->locals[i].ifname, macs[i], 0) != 0) {
             fprintf(stderr,
                     "[LOCAL-MAC] %s peer not resolved yet (will learn from RX when link has traffic)\n",
                     cfg->locals[i].ifname);
@@ -4053,6 +4137,16 @@ void forwarder_run(struct forwarder *fwd) {
             "[RUNTIME] single_core cpu=%d xsk_queue_id=%d queues_per_iface=%d (all worker threads pin here)\n",
             FORWARDER_CPU_CORE, FORWARDER_XSK_QUEUE_ID, FORWARDER_XSK_QUEUE_COUNT);
 
+    pthread_t mac_poll_tid;
+    int mac_poll_on = 0;
+    if (fwd && fwd->local_count > 0) {
+        if (pthread_create(&mac_poll_tid, NULL, local_peer_mac_poll_thread, fwd) != 0) {
+            fprintf(stderr, "[LOCAL-MAC-POLL] pthread_create failed (continuing without kernel resync thread)\n");
+        } else {
+            mac_poll_on = 1;
+        }
+    }
+
     if (!crypto_enabled) {
         forwarder_run_no_crypto(fwd);
     } else if (crypto_layer == 2) {
@@ -4064,6 +4158,9 @@ void forwarder_run(struct forwarder *fwd) {
     } else {
         forwarder_run_l3(fwd);
     }
+
+    if (mac_poll_on)
+        pthread_join(mac_poll_tid, NULL);
 }
 
 void forwarder_stop(void) {
