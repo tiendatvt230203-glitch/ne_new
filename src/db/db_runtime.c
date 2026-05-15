@@ -237,6 +237,7 @@ int build_merged_config(struct app_config *out_cfg, const int *ids, int id_count
     struct app_config merged;
     memset(&merged, 0, sizeof(merged));
     strncpy(merged.bpf_file, "bpf/xdp_redirect.o", sizeof(merged.bpf_file) - 1);
+    strncpy(merged.bpf_wan_file, "bpf/xdp_wan_redirect.o", sizeof(merged.bpf_wan_file) - 1);
     merged.global_frame_size = DEFAULT_FRAME_SIZE;
     merged.global_batch_size = DEFAULT_BATCH_SIZE;
 

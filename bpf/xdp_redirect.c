@@ -18,6 +18,11 @@
 #define XDP_RL_MAX_BYTES_PER_WINDOW 62500ULL
 
 #define NE_XSK_QUEUE_ID 0
+/* Must match NE_DEFAULT_FAKE_ETHERTYPE_IPV4 (0x88B5): high byte on wire. */
+#define NE_L2_WIRE_ETHERTYPE_MASK 0xFF00
+#define NE_L2_WIRE_ETHERTYPE_HI   0x8800
+
+#define STAT_NE_L2_DROP_LOCAL  11
 
 struct xdp_encrypt_rule {
     __u32 src_net;
@@ -169,6 +174,13 @@ int xdp_redirect_prog(struct xdp_md *ctx)
     if ((void *)(eth + 1) > data_end) {
         inc_stat(1);
         return XDP_PASS;
+    }
+
+    /* Ciphertext bridged WAN->local must not reach firewall (userspace decrypt only). */
+    if ((eth->h_proto & bpf_htons(NE_L2_WIRE_ETHERTYPE_MASK)) ==
+        bpf_htons(NE_L2_WIRE_ETHERTYPE_HI)) {
+        inc_stat(STAT_NE_L2_DROP_LOCAL);
+        return XDP_DROP;
     }
 
     if (eth->h_proto == bpf_htons(ETH_P_ARP_VAL)) {

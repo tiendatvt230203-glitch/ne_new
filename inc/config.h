@@ -132,6 +132,7 @@ struct app_config {
     int wan_count;
 
     char bpf_file[256];
+    char bpf_wan_file[256];
 
     int crypto_enabled;
     uint8_t crypto_key[AES_KEY_LEN];

@@ -92,7 +92,8 @@ redirect:
     ;
 
     int queue_id = NE_XSK_QUEUE_ID;
-    int ret = bpf_redirect_map(&wan_xsks_map, queue_id, XDP_PASS);
+    /* If AF_XDP is down, do not PASS into bridge (would leak ciphertext to local/FW). */
+    int ret = bpf_redirect_map(&wan_xsks_map, queue_id, XDP_DROP);
 
     if (ret == XDP_REDIRECT) {
         inc_stat(STAT_REDIRECT);

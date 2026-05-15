@@ -737,6 +737,7 @@ int config_load_from_db(struct app_config *cfg, int config_id, const char *conn_
 
     memset(cfg, 0, sizeof(*cfg));
     strncpy(cfg->bpf_file, "bpf/xdp_redirect.o", sizeof(cfg->bpf_file) - 1);
+    strncpy(cfg->bpf_wan_file, "bpf/xdp_wan_redirect.o", sizeof(cfg->bpf_wan_file) - 1);
     cfg->global_frame_size = DEFAULT_FRAME_SIZE;
     cfg->global_batch_size = DEFAULT_BATCH_SIZE;
 

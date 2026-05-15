@@ -665,9 +665,6 @@ int interface_init_wan_rx(struct xsk_interface *iface,
     struct bpf_map *map;
     int prog_fd, xsk_map_fd = -1;
 
-    (void)fake_ethertype_ipv4;
-    (void)fake_ethertype_ipv6;
-
     memset(iface, 0, sizeof(*iface));
     iface->ifindex = if_nametoindex(wan_cfg->ifname);
     strncpy(iface->ifname, wan_cfg->ifname, IF_NAMESIZE - 1);
@@ -704,37 +701,42 @@ int interface_init_wan_rx(struct xsk_interface *iface,
         return -1;
     }
 
-    prog = bpf_object__find_program_by_name(wan_bpf_obj, "xdp_redirect_prog");
+    prog = bpf_object__find_program_by_name(wan_bpf_obj, "xdp_wan_redirect_prog");
     if (!prog) {
-        fprintf(stderr, "WAN XDP program xdp_redirect_prog not found in %s\n", bpf_file);
+        fprintf(stderr,
+                "WAN XDP program xdp_wan_redirect_prog not found in %s "
+                "(rebuild bpf/xdp_wan_redirect.o)\n",
+                bpf_file);
         bpf_object__close(wan_bpf_obj);
         return -1;
     }
     prog_fd = bpf_program__fd(prog);
 
-    map = bpf_object__find_map_by_name(wan_bpf_obj, "xsks_map");
+    map = bpf_object__find_map_by_name(wan_bpf_obj, "wan_xsks_map");
     if (!map) {
-        fprintf(stderr, "WAN xsks_map not found\n");
+        fprintf(stderr, "WAN wan_xsks_map not found in %s\n", bpf_file);
         bpf_object__close(wan_bpf_obj);
         return -1;
     }
     xsk_map_fd = bpf_map__fd(map);
 
-    map = bpf_object__find_map_by_name(wan_bpf_obj, "encrypt_ctrl_map");
-    int enc_ctrl_fd = map ? bpf_map__fd(map) : -1;
-    map = bpf_object__find_map_by_name(wan_bpf_obj, "profile_meta_map");
-    int pm_fd = map ? bpf_map__fd(map) : -1;
-    map = bpf_object__find_map_by_name(wan_bpf_obj, "encrypt_rules_map");
-    int ep_fd = map ? bpf_map__fd(map) : -1;
-    map = bpf_object__find_map_by_name(wan_bpf_obj, "ingress_profile_map");
-    int ip_fd = map ? bpf_map__fd(map) : -1;
-    if (enc_ctrl_fd >= 0 && pm_fd >= 0 && ep_fd >= 0)
-        register_encrypt_bundle(enc_ctrl_fd, pm_fd, ep_fd, ip_fd,
-                                iface->ifindex ? (unsigned int)iface->ifindex : 0U);
-    else if (enc_ctrl_fd >= 0 || pm_fd >= 0 || ep_fd >= 0)
-        fprintf(stderr,
-                "[XDP] WAN WARN: incomplete encrypt bundle (ctrl=%d meta=%d enc=%d)\n",
-                enc_ctrl_fd, pm_fd, ep_fd);
+    if (fake_ethertype_ipv4 != 0) {
+        map = bpf_object__find_map_by_name(wan_bpf_obj, "wan_config_map");
+        if (map) {
+            int cfg_key = 0;
+            int wcfg_fd = bpf_map__fd(map);
+            uint16_t fe = fake_ethertype_ipv4;
+            if (bpf_map_update_elem(wcfg_fd, &cfg_key, &fe, BPF_ANY) != 0)
+                fprintf(stderr, "[XDP] WAN wan_config_map update failed (fake4=0x%04x)\n",
+                        (unsigned)fake_ethertype_ipv4);
+            else
+                fprintf(stderr, "[XDP] WAN %s: L2 redirect ethertype 0x%04x -> AF_XDP\n",
+                        iface->ifname, (unsigned)fake_ethertype_ipv4);
+        } else {
+            fprintf(stderr, "[XDP] WARN: wan_config_map missing in %s\n", bpf_file);
+        }
+    }
+    (void)fake_ethertype_ipv6;
 
     size_t wan_umem_size = (size_t)wan_cfg->umem_mb * 1024 * 1024;
     iface->umem_size = wan_umem_size;
@@ -818,8 +820,6 @@ int interface_init_wan_rx(struct xsk_interface *iface,
         iface->queue_count++;
     }
 
-    prog = bpf_object__find_program_by_name(wan_bpf_obj, "xdp_redirect_prog");
-    prog_fd = bpf_program__fd(prog);
     ret = bpf_xdp_attach(iface->ifindex, prog_fd, XDP_FLAGS_SKB_MODE, NULL);
     if (ret) {
         fprintf(stderr, "WAN bpf_set_link_xdp_fd failed: %d\n", ret);

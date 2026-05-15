@@ -3807,7 +3807,8 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg) {
 
     for (int i = 0; i < cfg->wan_count; i++) {
         uint16_t wan_fake4 = (crypto_enabled && has_encrypt_l2) ? cfg->fake_ethertype_ipv4 : 0;
-        if (interface_init_wan_rx(&fwd->wans[i], &cfg->wans[i], cfg->bpf_file, wan_fake4, 0) != 0) {
+        const char *wan_bpf = (cfg->bpf_wan_file[0]) ? cfg->bpf_wan_file : "bpf/xdp_wan_redirect.o";
+        if (interface_init_wan_rx(&fwd->wans[i], &cfg->wans[i], wan_bpf, wan_fake4, 0) != 0) {
             fprintf(stderr, "Failed to init WAN %s\n", cfg->wans[i].ifname);
             goto err_wans;
         }
