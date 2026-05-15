@@ -2,6 +2,7 @@
 #include "../../inc/fragment.h"
 #include "../../inc/packet_crypto.h"
 #include "../../inc/crypto_layer2.h"
+#include "../../inc/ne_l2_trace.h"
 #include "../../inc/crypto_layer3.h"
 #include "../../inc/crypto_layer4.h"
 #include "../../inc/config.h"
@@ -571,6 +572,15 @@ int frag_split_and_encrypt_l2(struct packet_crypto_ctx *ctx,
 
     uint16_t pkt_id = frag_next_pkt_id();
 
+    ne_l2_trace_frag("S2-FRAG-SPLIT", NULL, pkt_id, 0, 0, pkt_data, pkt_len,
+                     NULL);
+    {
+        char ex[48];
+        snprintf(ex, sizeof(ex), "payload=%u half1=%u half2=%u",
+                 (unsigned)payload_len, (unsigned)half1, (unsigned)half2);
+        ne_l2_trace_plain("S2-FRAG-SPLIT", NULL, ex);
+    }
+
     {
         uint32_t off = 0;
         memcpy(frag1, eth_hdr, 14);
@@ -622,6 +632,7 @@ int frag_split_and_encrypt_l2(struct packet_crypto_ctx *ctx,
         int enc_len = crypto_layer2_encrypt(ctx, frag1, off);
         if (enc_len < 0) return -1;
         *frag1_len = (uint32_t)enc_len;
+        ne_l2_trace_frag("S3-FRAG-ENC", NULL, pkt_id, 0, 1, frag1, *frag1_len, "wire");
     }
 
     {
@@ -675,6 +686,7 @@ int frag_split_and_encrypt_l2(struct packet_crypto_ctx *ctx,
         int enc_len = crypto_layer2_encrypt(ctx, frag2, off);
         if (enc_len < 0) return -1;
         *frag2_len = (uint32_t)enc_len;
+        ne_l2_trace_frag("S3-FRAG-ENC", NULL, pkt_id, 1, 1, frag2, *frag2_len, "wire");
     }
 
     return 0;
@@ -733,6 +745,8 @@ int frag_try_reassemble_l2(struct frag_table *ft,
         entry->orig_proto = ip_hdr[9];
         entry->timestamp_ns = now;
         entry->valid = 1;
+        ne_l2_trace_frag("S8-FRAG-WAIT", NULL, pkt_id, 0, 1, pkt_data, pkt_len,
+                         "stored frag0");
         return 0;
     }
 
@@ -827,6 +841,8 @@ int frag_try_reassemble_l2(struct frag_table *ft,
 
         *out_len = (uint32_t)off;
         entry->valid = 0;
+        ne_l2_trace_frag("S8-FRAG-REASM", NULL, pkt_id, 1, 1, out_buf, *out_len,
+                         "merged frag0+1");
         return 1;
     }
 

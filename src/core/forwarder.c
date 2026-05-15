@@ -3,6 +3,7 @@
 #include "../../inc/flow_table.h"
 #include "../../inc/config.h"
 #include "../../inc/crypto_layer2.h"
+#include "../../inc/ne_l2_trace.h"
 #include "../../inc/crypto_layer3.h"
 #include "../../inc/crypto_layer4.h"
 #include "../../inc/crypto_policy_utils.h"
@@ -69,13 +70,6 @@ static uint64_t g_profile_miss_hits;
 static uint64_t g_profile_log_seq;
 static int g_tcp_diag_enabled = 0;
 static int g_tcp_diag_all_tcp = 0;
-static int g_l2_diag_enabled = -1;
-
-static int ne_l2_diag_enabled(void) {
-    if (g_l2_diag_enabled < 0)
-        g_l2_diag_enabled = getenv("NE_L2_DIAG") ? 1 : 0;
-    return g_l2_diag_enabled;
-}
 
 
 static struct app_config *g_cfg_ptr = NULL;
@@ -362,6 +356,8 @@ static void ne_rx_class_log(const char *klass,
                             uint16_t dport,
                             uint8_t proto,
                             const char *detail) {
+    if (ne_l2_trace_enabled())
+        return;
     if (!g_tcp_diag_enabled)
         return;
     /* Do not gate on tcp_diag_want_log(wire tuple): enc_l3 wire uses fake IP
@@ -436,6 +432,8 @@ static void ne_tx_class_log(const char *klass,
                             uint8_t proto,
                             uint32_t len,
                             const char *detail) {
+    if (ne_l2_trace_enabled())
+        return;
     if (!g_tcp_diag_enabled)
         return;
     if (flow_ok && !tcp_diag_want_log(proto, sport, dport))
@@ -458,25 +456,6 @@ static void ne_tx_class_log(const char *klass,
     ne_chain_append_tx(klass);
     fprintf(stderr, " | TX_path_peer_may_be_silent\n");
 }
-
-// #region agent log
-static void ne_agent_log_l2(const char *hyp, const char *loc, const char *msg,
-                            uint32_t policy_wire, int pi, uint32_t pkt_len,
-                            uint8_t marker, int rc) {
-    FILE *df = fopen("/home/tiendat/CODE/network-encryptor/.cursor/debug-eefb96.log", "a");
-    if (!df)
-        return;
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    long long ms = (long long)ts.tv_sec * 1000LL + (long long)(ts.tv_nsec / 1000000);
-    fprintf(df,
-            "{\"sessionId\":\"eefb96\",\"hypothesisId\":\"%s\",\"location\":\"%s\","
-            "\"message\":\"%s\",\"data\":{\"policy_wire\":%u,\"pi\":%d,\"pkt_len\":%u,"
-            "\"marker\":%u,\"rc\":%d},\"timestamp\":%lld}\n",
-            hyp, loc, msg, policy_wire, pi, pkt_len, (unsigned)marker, rc, ms);
-    fclose(df);
-}
-// #endregion
 
 static int prev_policy_grace_active(void) {
     if (g_prev_policy_count <= 0)
@@ -1944,33 +1923,25 @@ static int decrypt_packet_auto_l2(struct forwarder *fwd,
     if (pkt_marker != (uint8_t)(fake_ipv4 >> 8)) {
         /* 0x88xx = NE L2-on-wire; never forward undecrypted (L3 thread no-op was leaking ciphertext). */
         if (pkt_marker == 0x88U) {
-            // #region agent log
-            ne_agent_log_l2("H3", "forwarder.c:decrypt_packet_auto_l2", "marker_88_no_ctx", 0, -1,
-                            *pkt_len, pkt_marker, -1);
-            // #endregion
-            if (ne_l2_diag_enabled())
-                fprintf(stderr, "[L2-DIAG] decrypt FAIL marker_88_mismatch fake=0x%04x len=%u\n",
-                        (unsigned)fake_ipv4, (unsigned)*pkt_len);
+            char d[64];
+            snprintf(d, sizeof(d), "marker_88 fake=0x%04x", (unsigned)fake_ipv4);
+            ne_l2_trace_event("S6-DEC-FAIL", NULL, pkt, *pkt_len, d);
             return -1;
         }
-        if (ne_l2_diag_enabled())
-            fprintf(stderr, "[L2-DIAG] skip decrypt (not NE L2) marker=0x%02x len=%u -> pass-through\n",
-                    pkt_marker, (unsigned)*pkt_len);
+        ne_l2_trace_event("S6-DEC-SKIP", NULL, pkt, *pkt_len, "not_ne_l2");
         return 0;
     }
 
     if (fwd->cfg->policy_count <= 0) {
         apply_default_crypto_params(fwd);
         int new_len = crypto_layer2_decrypt(&crypto_ctx, pkt, *pkt_len);
-        // #region agent log
-        ne_agent_log_l2("H5", "forwarder.c:decrypt_packet_auto_l2", "default_ctx_decrypt", 0, -1,
-                        *pkt_len, pkt_marker, new_len);
-        // #endregion
-        if (new_len < 0) return -1;
+        if (new_len < 0) {
+            ne_l2_trace_plain("S6-DEC-FAIL", NULL, "default_ctx gcm");
+            return -1;
+        }
         *pkt_len = (uint32_t)new_len;
         return 0;
     }
-
 
     uint32_t policy_wire = 0;
     if (*pkt_len < 17U)
@@ -1978,30 +1949,17 @@ static int decrypt_packet_auto_l2(struct forwarder *fwd,
     policy_wire = ((uint32_t)pkt[13] << 24) | ((uint32_t)pkt[14] << 16) | ((uint32_t)pkt[15] << 8) |
                    (uint32_t)pkt[16];
     int pi = fwd_pi_for_action_wire(fwd, POLICY_ACTION_ENCRYPT_L2, policy_wire);
-    // #region agent log
-    ne_agent_log_l2("H1", "forwarder.c:decrypt_packet_auto_l2", "policy_lookup", policy_wire, pi,
-                    *pkt_len, pkt_marker, pi >= 0 ? 0 : -1);
-    // #endregion
     if (pi >= 0 && pi < fwd->cfg->policy_count && g_policy_crypto_ctx_ready[pi]) {
         const struct crypto_policy *cp = &fwd->cfg->policies[pi];
         apply_crypto_params_from_policy(cp);
         int new_len = crypto_layer2_decrypt(&g_policy_crypto_ctx[pi], pkt, *pkt_len);
-        // #region agent log
-        ne_agent_log_l2("H2", "forwarder.c:decrypt_packet_auto_l2", "per_policy_decrypt", policy_wire,
-                        pi, *pkt_len, pkt_marker, new_len);
-        // #endregion
         if (new_len < 0) {
-            if (ne_l2_diag_enabled())
-                fprintf(stderr, "[L2-DIAG] decrypt FAIL GCM/policy policy_wire=%u pi=%d len=%u\n",
-                        policy_wire, pi, (unsigned)*pkt_len);
+            char d[48];
+            snprintf(d, sizeof(d), "gcm policy=%u pi=%d", (unsigned)policy_wire, pi);
+            ne_l2_trace_event("S6-DEC-FAIL", NULL, pkt, *pkt_len, d);
             return -1;
         }
         *pkt_len = (uint32_t)new_len;
-        if (ne_l2_diag_enabled()) {
-            uint16_t et = ((uint16_t)pkt[12] << 8) | pkt[13];
-            fprintf(stderr, "[L2-DIAG] decrypt OK policy_wire=%u pi=%d len_out=%u ethertype=0x%04x\n",
-                    policy_wire, pi, (unsigned)*pkt_len, (unsigned)et);
-        }
         return 0;
     }
 
@@ -2011,27 +1969,20 @@ static int decrypt_packet_auto_l2(struct forwarder *fwd,
             const struct crypto_policy *cp_prev = &g_prev_policies[ppi];
             apply_crypto_params_from_policy(cp_prev);
             int new_len = crypto_layer2_decrypt(&g_prev_policy_crypto_ctx[ppi], pkt, *pkt_len);
-            // #region agent log
-            ne_agent_log_l2("H1", "forwarder.c:decrypt_packet_auto_l2", "grace_decrypt", policy_wire,
-                            ppi, *pkt_len, pkt_marker, new_len);
-            // #endregion
-            if (new_len < 0)
+            if (new_len < 0) {
+                ne_l2_trace_plain("S6-DEC-FAIL", NULL, "grace gcm");
                 return -1;
+            }
             *pkt_len = (uint32_t)new_len;
-            if (ne_l2_diag_enabled())
-                fprintf(stderr, "[L2-DIAG] decrypt OK (grace) policy_wire=%u ppi=%d len_out=%u\n",
-                        policy_wire, ppi, (unsigned)*pkt_len);
             return 0;
         }
     }
 
-    // #region agent log
-    ne_agent_log_l2("H1", "forwarder.c:decrypt_packet_auto_l2", "no_policy_ctx", policy_wire, pi,
-                    *pkt_len, pkt_marker, -1);
-    // #endregion
-    if (ne_l2_diag_enabled())
-        fprintf(stderr, "[L2-DIAG] decrypt FAIL no_policy_ctx policy_wire=%u pi=%d len=%u marker=0x%02x\n",
-                policy_wire, pi, (unsigned)*pkt_len, pkt_marker);
+    {
+        char d[56];
+        snprintf(d, sizeof(d), "no_policy_ctx policy=%u pi=%d", (unsigned)policy_wire, pi);
+        ne_l2_trace_event("S6-DEC-FAIL", NULL, pkt, *pkt_len, d);
+    }
     return -1;
 }
 
@@ -2535,53 +2486,58 @@ static void *local_queue_thread_l2(void *arg) {
 
             int split_done = 0;
             if (cp && cp->action == POLICY_ACTION_ENCRYPT_L2 && frag_need_split_l2(pkt_len)) {
+                char fd[32];
+                snprintf(fd, sizeof(fd), "policy=%u", (unsigned)cp->id);
+                ne_l2_trace_event("S1-LOCAL-IN", local->ifname, pkt, pkt_len, fd);
                 uint8_t f1[4096], f2[4096];
                 uint32_t l1, l2;
                 if (frag_split_and_encrypt_l2(use_ctx, pkt, pkt_len, f1, &l1, f2, &l2) == 0) {
                     split_done = 1;
+                    ne_l2_trace_event("S4-TX-WAN", wan->ifname, f1, l1, "part=0");
                     if (interface_send_batch_queue(wan, tq, f1, l1) == 0) {
                         __sync_fetch_and_add(&fwd->local_to_wan, 1);
                         wan_used[wan_idx] = 1;
                     } else {
-                        ne_tx_class_log("TX_L2_WAN_SEND_FAIL", "LOCAL_L2_THREAD", "wan_batch_queue_reject_part1",
-                                        local_idx, wan->ifname, wan_idx, flow_ok, src_ip, src_port, dst_ip,
-                                        dst_port, protocol, l1, "frag1");
+                        ne_l2_trace_plain("S4-TX-WAN", wan->ifname, "FAIL send part=0");
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                     }
+                    ne_l2_trace_event("S4-TX-WAN", wan->ifname, f2, l2, "part=1");
                     if (interface_send_batch_queue(wan, tq, f2, l2) == 0) {
                         __sync_fetch_and_add(&fwd->local_to_wan, 1);
                         wan_used[wan_idx] = 1;
                     } else {
-                        ne_tx_class_log("TX_L2_WAN_SEND_FAIL", "LOCAL_L2_THREAD", "wan_batch_queue_reject_part2",
-                                        local_idx, wan->ifname, wan_idx, flow_ok, src_ip, src_port, dst_ip,
-                                        dst_port, protocol, l2, "frag2");
+                        ne_l2_trace_plain("S4-TX-WAN", wan->ifname, "FAIL send part=1");
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                     }
                 } else {
+                    ne_l2_trace_plain("S2-FRAG-SPLIT", local->ifname, "FAIL split+encrypt");
                     __sync_fetch_and_add(&fwd->total_dropped, 1);
-                    ne_tx_class_log("TX_L2_SPLIT_ENCRYPT_FAIL", "LOCAL_L2_THREAD", "L2_split_encrypt_failed",
-                                    local_idx, wan->ifname, wan_idx, flow_ok, src_ip, src_port, dst_ip, dst_port,
-                                    protocol, pkt_len, "frag_split_and_encrypt_l2");
                     continue;
                 }
             }
 
             if (!split_done) {
+                {
+                    char fd[32];
+                    if (cp)
+                        snprintf(fd, sizeof(fd), "policy=%u", (unsigned)cp->id);
+                    else
+                        fd[0] = '\0';
+                    ne_l2_trace_event("S1-LOCAL-IN", local->ifname, pkt, pkt_lens[i],
+                                      cp ? fd : NULL);
+                }
                 if (encrypt_packet_with_ctx(use_ctx, pkt_ptrs[i], &pkt_len) != 0) {
-                    ne_tx_class_log("TX_L2_ENCRYPT_FAIL", "LOCAL_L2_THREAD", "L2_encrypt_packet_with_ctx_failed",
-                                    local_idx, wan->ifname, wan_idx, flow_ok, src_ip, src_port, dst_ip, dst_port,
-                                    protocol, pkt_lens[i], "encrypt_packet_with_ctx");
+                    ne_l2_trace_plain("S3-FRAG-ENC", local->ifname, "FAIL encrypt_packet_with_ctx");
                     __sync_fetch_and_add(&fwd->total_dropped, 1);
                     continue;
                 }
 
+                ne_l2_trace_event("S4-TX-WAN", wan->ifname, pkt_ptrs[i], pkt_len, "single");
                 if (interface_send_batch_queue(wan, tq, pkt_ptrs[i], pkt_len) == 0) {
                     __sync_fetch_and_add(&fwd->local_to_wan, 1);
                     wan_used[wan_idx] = 1;
                 } else {
-                    ne_tx_class_log("TX_L2_WAN_SEND_FAIL", "LOCAL_L2_THREAD", "wan_batch_queue_reject",
-                                    local_idx, wan->ifname, wan_idx, flow_ok, src_ip, src_port, dst_ip, dst_port,
-                                    protocol, pkt_len, "interface_send_batch_queue");
+                    ne_l2_trace_plain("S4-TX-WAN", wan->ifname, "FAIL send single");
                     __sync_fetch_and_add(&fwd->total_dropped, 1);
                 }
             }
@@ -2702,48 +2658,33 @@ static void *wan_queue_thread_l2(void *arg) {
             uint8_t *final_pkt = pkt;
             uint32_t final_len = pkt_len;
 
-            {
-                uint32_t sip = 0, dip = 0;
-                uint16_t sp = 0, dp = 0;
-                uint8_t pr = 0;
-                int wf = (parse_flow(pkt, pkt_len, &sip, &dip, &sp, &dp, &pr) == 0);
-                ne_rx_pkt_recv_log(wan, wan_idx, pkt, pkt_len, wf, sip, sp, dip, dp, pr);
-            }
-
+            ne_l2_trace_event("S5-RX-WAN", wan->ifname, pkt, pkt_len, NULL);
 
             if (decrypt_packet_auto_l2(fwd, pkt, &pkt_len,
                                         decrypt_scratch, sizeof(decrypt_scratch)) != 0) {
-                uint32_t sip = 0, dip = 0;
-                uint16_t sp = 0, dp = 0;
-                uint8_t pr = 0;
-                int wf = (parse_flow(pkt, pkt_lens[i], &sip, &dip, &sp, &dp, &pr) == 0);
-                ne_rx_class_log("RX_L2_WAN_DECRYPT_FAIL", wan->ifname, wan_idx, "RX_L2_WAN",
-                                "L2_decrypt_fail_on_WAN", pkt_lens[i], wf, sip, sp, dip, dp, pr,
-                                "decrypt_packet_auto_l2");
                 __sync_fetch_and_add(&fwd->total_dropped, 1);
                 continue;
             }
+
+            ne_l2_trace_event("S6-RX-DEC", wan->ifname, pkt, pkt_len, NULL);
 
             {
                 uint16_t fpid;
                 uint8_t fidx;
                 if (frag_is_fragment_l2(pkt, pkt_len, &fpid, &fidx)) {
+                    ne_l2_trace_frag("S7-FRAG-RX", wan->ifname, fpid, fidx, 1, pkt, pkt_len,
+                                     "after L2 decrypt");
                     uint8_t reass_buf[4096];
                     uint32_t reass_len = 0;
                     int rr = frag_try_reassemble_l2(&g_wan_frag_l2, pkt, pkt_len, fpid, fidx,
                                                     reass_buf, &reass_len);
-                    if (rr == 0) {
+                    if (rr == 0)
                         continue;
-                    }
                     if (rr != 1) {
                         char detail[80];
-                        snprintf(detail, sizeof(detail), "L2_frag opid=%u idx=%u rr=%d", fpid, fidx, rr);
-                        uint32_t sip = 0, dip = 0;
-                        uint16_t sp = 0, dp = 0;
-                        uint8_t pr = 0;
-                        int wf = (parse_flow(pkt, pkt_len, &sip, &dip, &sp, &dp, &pr) == 0);
-                        ne_rx_class_log("RX_L2_REASSEMBLE_FAIL", wan->ifname, wan_idx, "RX_L2_FRAG",
-                                        "L2_reassemble_fail", pkt_len, wf, sip, sp, dip, dp, pr, detail);
+                        snprintf(detail, sizeof(detail), "reasm_fail rr=%d", rr);
+                        ne_l2_trace_frag("S8-FRAG-REASM", wan->ifname, fpid, fidx, 1, pkt, pkt_len,
+                                         detail);
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                         continue;
                     }
@@ -2806,26 +2747,17 @@ static void *wan_queue_thread_l2(void *arg) {
             }
 
             ne_wan_rx_normalize_eth_ipv4_before_local_inject(final_pkt, final_len);
-            if (ne_l2_diag_enabled() && final_len >= 14U && final_pkt[12] == 0x88U)
-                fprintf(stderr, "[L2-DIAG] LEAK? inject local still marker 0x88 len=%u wan=%s\n",
-                        (unsigned)final_len, wan->ifname);
+            if (final_len >= 14U && final_pkt[12] == 0x88U)
+                ne_l2_trace_event("S9-TX-PFSENSE", local_iface->ifname, final_pkt, final_len,
+                                  "LEAK still_encrypted");
+            else
+                ne_l2_trace_event("S9-TX-PFSENSE", local_iface->ifname, final_pkt, final_len, NULL);
             if (interface_send_to_local_batch_queue(local_iface, tq, local_cfg, final_pkt, final_len) == 0) {
                 __sync_fetch_and_add(&fwd->wan_to_local, 1);
                 if (tq < 32)
                     local_used_queues[local_idx] |= (1u << tq);
             } else {
-                uint32_t fs = 0, fd = 0;
-                uint16_t fsp = 0, fdp = 0;
-                uint8_t fp = 0;
-                int pf = (parse_flow(final_pkt, final_len, &fs, &fd, &fsp, &fdp, &fp) == 0);
-                if (pf && tcp_diag_want_log(fp, fsp, fdp)) {
-                    fprintf(stderr, "[TCP-DIAG][DROP-LOCAL-TX] local=%s q=%d flow=%u:%u -> %u:%u len=%u\n",
-                            local_iface->ifname, tq,
-                            ntohl(fs), (unsigned)fsp, ntohl(fd), (unsigned)fdp, (unsigned)final_len);
-                }
-                ne_rx_class_log("RX_LOCAL_INJECT_BATCH_FAIL", wan->ifname, wan_idx, "TO_LOCAL",
-                                "af_xdp_local_queue_reject", final_len, pf, fs, fsp, fd, fdp, fp,
-                                "L2_only_WAN_RX_path");
+                ne_l2_trace_plain("S9-TX-PFSENSE", local_iface->ifname, "FAIL inject local");
                 __sync_fetch_and_add(&fwd->total_dropped, 1);
                 __sync_fetch_and_add(&fwd->dropped_local_tx_fail, 1);
             }
@@ -3267,9 +3199,9 @@ static void *wan_queue_thread_l3l4(void *arg) {
             }
 
             ne_wan_rx_normalize_eth_ipv4_before_local_inject(final_pkt, final_len);
-            if (ne_l2_diag_enabled() && final_len >= 14U && final_pkt[12] == 0x88U)
-                fprintf(stderr, "[L2-DIAG] LEAK? inject local still marker 0x88 len=%u wan=%s (L3 thread)\n",
-                        (unsigned)final_len, wan->ifname);
+            if (final_len >= 14U && final_pkt[12] == 0x88U)
+                ne_l2_trace_event("S9-TX-PFSENSE", local_iface->ifname, final_pkt, final_len,
+                                  "LEAK still_encrypted L3path");
             if (interface_send_to_local_batch_queue(local_iface, tq, local_cfg, final_pkt, final_len) == 0) {
                 __sync_fetch_and_add(&fwd->wan_to_local, 1);
                 if (tq < 32)
