@@ -11,6 +11,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <net/if.h>
+//1
 int parse_mac(const char *str, uint8_t *mac) {
     int values[6];
     if (sscanf(str, "%x:%x:%x:%x:%x:%x",
