@@ -20,7 +20,7 @@ static __thread int g_nonce_size = 12;
 static __thread int g_aes_bits = 128;
 
 
-static __thread uint8_t g_policy_id = 0;
+static __thread uint32_t g_policy_wire_u32 = 0;
 
 static atomic_uint_fast32_t g_nonce_counter = 0;
 
@@ -58,24 +58,31 @@ static EVP_CIPHER_CTX *get_gcm_dec_ctx(void) {
 }
 
 int packet_crypto_get_tunnel_hdr_size(void) {
-    return g_nonce_size + 2;
+    return g_nonce_size + NE_WIRE_POLICY_U32 + 1;
 }
 
 void crypto_write_l3_tunnel_header(uint8_t *buf, const uint8_t *nonce,
-                                    int nonce_size, uint8_t policy_id,
+                                    int nonce_size, uint32_t policy_wire_host,
                                     uint8_t orig_proto) {
+    /* Cleartext tunnel: NE_WIRE_POLICY_U32-byte DB policy id (BE) then orig_proto; ciphertext follows. */
     memcpy(buf, nonce, nonce_size);
-    buf[nonce_size] = policy_id;
-    buf[nonce_size + 1] = orig_proto;
+    buf[nonce_size + 0] = (uint8_t)(policy_wire_host >> 24);
+    buf[nonce_size + 1] = (uint8_t)(policy_wire_host >> 16);
+    buf[nonce_size + 2] = (uint8_t)(policy_wire_host >> 8);
+    buf[nonce_size + 3] = (uint8_t)policy_wire_host;
+    buf[nonce_size + NE_WIRE_POLICY_U32] = orig_proto;
 }
 
 void crypto_read_l3_tunnel_header(const uint8_t *buf, int nonce_size,
                                    uint8_t *nonce_out, uint8_t *proto_flag,
-                                   uint8_t *policy_id, uint8_t *orig_proto) {
+                                   uint32_t *policy_id_out, uint8_t *orig_proto) {
     memcpy(nonce_out, buf, nonce_size);
     if (proto_flag) *proto_flag = buf[0] >> 7;
-    if (policy_id) *policy_id = buf[nonce_size];
-    if (orig_proto) *orig_proto = buf[nonce_size + 1];
+    if (policy_id_out) {
+        *policy_id_out = ((uint32_t)buf[nonce_size + 0] << 24) | ((uint32_t)buf[nonce_size + 1] << 16) |
+                         ((uint32_t)buf[nonce_size + 2] << 8) | (uint32_t)buf[nonce_size + 3];
+    }
+    if (orig_proto) *orig_proto = buf[nonce_size + NE_WIRE_POLICY_U32];
 }
 
 void packet_crypto_set_ethertype(uint16_t fake_ipv4, uint16_t fake_ipv6) {
@@ -351,17 +358,23 @@ void crypto_nonce_to_iv(const uint8_t *nonce, int nonce_size,
 }
 
 void crypto_write_counter(uint8_t *packet, const uint8_t *nonce,
-                          int nonce_size, uint8_t marker_byte, uint8_t policy_id) {
+                          int nonce_size, uint8_t marker_byte, uint32_t policy_wire_host) {
+    /* L2: marker @12, cleartext DB policy id BE @13..16, nonce @17; AES from l2_enc_start. */
     packet[12] = marker_byte;
-    packet[13] = policy_id;
-    memcpy(packet + 14, nonce, nonce_size);
+    packet[13] = (uint8_t)(policy_wire_host >> 24);
+    packet[14] = (uint8_t)(policy_wire_host >> 16);
+    packet[15] = (uint8_t)(policy_wire_host >> 8);
+    packet[16] = (uint8_t)policy_wire_host;
+    memcpy(packet + 17, nonce, nonce_size);
 }
 
 void crypto_read_counter(const uint8_t *packet, int nonce_size,
-                         uint8_t *nonce_out, uint8_t *policy_id, uint8_t *proto_flag) {
-    if (policy_id)
-        *policy_id = packet[13];
-    memcpy(nonce_out, packet + 14, nonce_size);
+                         uint8_t *nonce_out, uint32_t *policy_id_out, uint8_t *proto_flag) {
+    if (policy_id_out) {
+        *policy_id_out = ((uint32_t)packet[13] << 24) | ((uint32_t)packet[14] << 16) |
+                         ((uint32_t)packet[15] << 8) | (uint32_t)packet[16];
+    }
+    memcpy(nonce_out, packet + 17, nonce_size);
     if (proto_flag)
         *proto_flag = nonce_out[0] >> 7;
 }
@@ -484,5 +497,5 @@ int packet_decrypt(struct packet_crypto_ctx *ctx,
 void packet_crypto_set_fake_protocol(uint8_t proto) { g_fake_protocol = proto; }
 uint8_t packet_crypto_get_fake_protocol(void) { return g_fake_protocol; }
 
-void packet_crypto_set_policy_id(uint8_t policy_id) { g_policy_id = policy_id; }
-uint8_t packet_crypto_get_policy_id(void) { return g_policy_id; }
+void packet_crypto_set_policy_wire_u32(uint32_t policy_id) { g_policy_wire_u32 = policy_id; }
+uint32_t packet_crypto_get_policy_wire_u32(void) { return g_policy_wire_u32; }

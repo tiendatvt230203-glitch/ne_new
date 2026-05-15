@@ -151,20 +151,10 @@ static int append_wan_unique(struct app_config *dst, const struct wan_config *sr
     return dst->wan_count++;
 }
 
-static void collect_used_wire_ids(const struct app_config *dst, uint8_t used[256]) {
-    memset(used, 0, 256);
-    for (int i = 0; i < dst->policy_count; i++) {
-        int wid = dst->policies[i].id;
-        if (wid >= 1 && wid <= 255)
-            used[(size_t)wid] = 1;
-    }
-}
-
 static int append_policy_unique(struct app_config *dst, const struct crypto_policy *src_cp) {
     if (!dst || !src_cp)
         return -1;
 
-    /* Rows from xdp_profile_crypto_policies.id are globally unique; wire ids are re-used per config when DB id > 255. */
     if (src_cp->db_id != 0) {
         for (int i = 0; i < dst->policy_count; i++) {
             if (dst->policies[i].db_id == src_cp->db_id)
@@ -175,24 +165,7 @@ static int append_policy_unique(struct app_config *dst, const struct crypto_poli
     if (dst->policy_count >= MAX_CRYPTO_POLICIES)
         return -1;
 
-    struct crypto_policy cp = *src_cp;
-    uint8_t used[256];
-    collect_used_wire_ids(dst, used);
-    int wid = cp.id;
-    if (wid < 1 || wid > 255 || used[(size_t)wid]) {
-        int found = -1;
-        for (int j = 1; j <= 255; j++) {
-            if (!used[(size_t)j]) {
-                found = j;
-                break;
-            }
-        }
-        if (found < 0)
-            return -1;
-        cp.id = found;
-    }
-
-    dst->policies[dst->policy_count] = cp;
+    dst->policies[dst->policy_count] = *src_cp;
     return dst->policy_count++;
 }
 

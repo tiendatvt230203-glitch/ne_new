@@ -58,7 +58,8 @@ static inline int frag_need_split_l4(uint32_t pkt_len) {
 
 static inline int frag_need_split_l2(uint32_t pkt_len) {
     int nonce_size = packet_crypto_get_nonce_size();
-    int overhead = nonce_size;
+    /* Match crypto_layer2: extra bytes before ciphertext = nonce + (4-byte policy - former 1-byte). */
+    int overhead = nonce_size + (NE_WIRE_POLICY_U32 - 1);
     if (packet_crypto_get_mode() == 1)
         overhead += 16;
     return (pkt_len + overhead) > FRAG_MTU;

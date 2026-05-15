@@ -56,19 +56,22 @@ void packet_crypto_set_fake_protocol(uint8_t proto);
 uint8_t packet_crypto_get_fake_protocol(void);
 
 
-void packet_crypto_set_policy_id(uint8_t policy_id);
-uint8_t packet_crypto_get_policy_id(void);
+void packet_crypto_set_policy_wire_u32(uint32_t policy_id);
+uint32_t packet_crypto_get_policy_wire_u32(void);
 
 #define AES128_GCM_TAG_SIZE  16
+
+/* DB policy id (e.g. 420) on wire as 4-byte big-endian after nonce (L3/L4 tunnel). */
+#define NE_WIRE_POLICY_U32 4
 
 int packet_crypto_get_tunnel_hdr_size(void);
 
 void crypto_write_l3_tunnel_header(uint8_t *buf, const uint8_t *nonce,
-                                    int nonce_size, uint8_t policy_id,
+                                    int nonce_size, uint32_t policy_wire_host,
                                     uint8_t orig_proto);
 void crypto_read_l3_tunnel_header(const uint8_t *buf, int nonce_size,
                                    uint8_t *nonce_out, uint8_t *proto_flag,
-                                   uint8_t *policy_id, uint8_t *orig_proto);
+                                   uint32_t *policy_id_out, uint8_t *orig_proto);
 
 void packet_crypto_set_encrypt_layer(int layer);
 
@@ -102,9 +105,9 @@ int crypto_aes_ctr_with_key(const uint8_t key[AES_MAX_KEY_SIZE],
                             uint8_t *data, int len);
 
 void crypto_write_counter(uint8_t *packet, const uint8_t *nonce,
-                          int nonce_size, uint8_t marker_byte, uint8_t policy_id);
+                          int nonce_size, uint8_t marker_byte, uint32_t policy_wire_host);
 void crypto_read_counter(const uint8_t *packet, int nonce_size,
-                         uint8_t *nonce_out, uint8_t *policy_id, uint8_t *proto_flag);
+                         uint8_t *nonce_out, uint32_t *policy_id_out, uint8_t *proto_flag);
 
 void crypto_restore_ipv4_header(uint8_t *packet, size_t pkt_len);
 void crypto_restore_ipv6_header(uint8_t *packet, size_t pkt_len);

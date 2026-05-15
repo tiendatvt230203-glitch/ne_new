@@ -18,28 +18,39 @@
 
 static void l4_write_tunnel_header(uint8_t *buf, const uint8_t *nonce,
                                     int nonce_size) {
+    uint32_t pid = packet_crypto_get_policy_wire_u32();
     memcpy(buf, nonce, nonce_size);
-    buf[nonce_size] = packet_crypto_get_policy_id();
-    buf[nonce_size + 1] = L4_TUNNEL_MAGIC;
+    buf[nonce_size + 0] = (uint8_t)(pid >> 24);
+    buf[nonce_size + 1] = (uint8_t)(pid >> 16);
+    buf[nonce_size + 2] = (uint8_t)(pid >> 8);
+    buf[nonce_size + 3] = (uint8_t)pid;
+    buf[nonce_size + NE_WIRE_POLICY_U32] = L4_TUNNEL_MAGIC;
 }
 
 static void l4_read_tunnel_header(const uint8_t *buf, int nonce_size,
-                                   uint8_t *nonce_out, uint8_t *policy_id,
+                                   uint8_t *nonce_out, uint32_t *policy_id_out,
                                    uint8_t *proto_flag) {
     memcpy(nonce_out, buf, nonce_size);
-    if (policy_id) *policy_id = buf[nonce_size];
+    if (policy_id_out) {
+        *policy_id_out = ((uint32_t)buf[nonce_size + 0] << 24) | ((uint32_t)buf[nonce_size + 1] << 16) |
+                         ((uint32_t)buf[nonce_size + 2] << 8) | (uint32_t)buf[nonce_size + 3];
+    }
     if (proto_flag) *proto_flag = nonce_out[0] >> 7;
 }
 
 static void l4_write_tunnel_header_frag(uint8_t *buf, const uint8_t *nonce,
                                          int nonce_size) {
+    uint32_t pid = packet_crypto_get_policy_wire_u32();
     memcpy(buf, nonce, nonce_size);
-    buf[nonce_size] = packet_crypto_get_policy_id();
-    buf[nonce_size + 1] = L4_FRAG_MAGIC;
+    buf[nonce_size + 0] = (uint8_t)(pid >> 24);
+    buf[nonce_size + 1] = (uint8_t)(pid >> 16);
+    buf[nonce_size + 2] = (uint8_t)(pid >> 8);
+    buf[nonce_size + 3] = (uint8_t)pid;
+    buf[nonce_size + NE_WIRE_POLICY_U32] = L4_FRAG_MAGIC;
 }
 
 static int l4_is_tunnel_header(const uint8_t *buf, int nonce_size) {
-    if (buf[nonce_size + 1] != L4_TUNNEL_MAGIC) return 0;
+    if (buf[nonce_size + NE_WIRE_POLICY_U32] != L4_TUNNEL_MAGIC) return 0;
     if ((buf[0] & 0x80) != 0) return 0;
     return 1;
 }
@@ -203,10 +214,11 @@ int crypto_layer4_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
         !l4_is_tunnel_header(packet + tunnel_off, nonce_size))
         return (int)pkt_len;
 
-    uint8_t policy_id, proto_flag;
+    uint32_t policy_wire = 0;
+    uint8_t proto_flag;
     uint8_t nonce[16];
-    l4_read_tunnel_header(packet + tunnel_off, nonce_size, nonce, &policy_id, &proto_flag);
-    (void)policy_id;
+    l4_read_tunnel_header(packet + tunnel_off, nonce_size, nonce, &policy_wire, &proto_flag);
+    (void)policy_wire;
     int is_gcm = (packet_crypto_get_mode() == CRYPTO_MODE_GCM);
 
     int nonce_len;
@@ -434,7 +446,7 @@ int crypto_layer4_decrypt_fragment(struct packet_crypto_ctx *ctx,
 
     if (pkt_len < (size_t)(tunnel_off + tunnel_hdr_size + FRAG_L4_HDR_SIZE))
         return -1;
-    if (packet[tunnel_off + nonce_size + 1] != L4_FRAG_MAGIC)
+    if (packet[tunnel_off + nonce_size + NE_WIRE_POLICY_U32] != L4_FRAG_MAGIC)
         return -1;
 
     l4_read_frag_tag(packet + tunnel_off + tunnel_hdr_size, out_pkt_id, out_frag_index);

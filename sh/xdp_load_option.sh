@@ -8,12 +8,13 @@ network_encryptor_load_db_env
 SQL_DIR="${NETWORK_ENCRYPTOR_ROOT}/sql_options"
 
 usage() {
-  echo "Usage: $0 <config_id>"
-  echo "  Loads one file from ${SQL_DIR}/<NN>_*.sql (NN = zero-padded id)."
-  echo "  If several match, set NETWORK_ENCRYPTOR_SQL_FILE to the path to load."
+  echo "Usage: $0 <config_id> [basename.sql]"
+  echo "  Loads from ${SQL_DIR}/ — default: single match for <NN>_*.sql (NN = zero-padded id)."
+  echo "  If several match: pass basename, e.g. $0 30 30_wan_matrix_peer.sql"
+  echo "  Or set NETWORK_ENCRYPTOR_SQL_FILE to an absolute path."
 }
 
-if [ "$#" -ne 1 ]; then
+if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
   usage
   exit 1
 fi
@@ -24,14 +25,33 @@ if ! [[ "${CONFIG_ID}" =~ ^[0-9]+$ ]]; then
   exit 1
 fi
 
+ID_PADDED=$(printf "%02d" "$((10#${CONFIG_ID}))")
+
 if [ -n "${NETWORK_ENCRYPTOR_SQL_FILE:-}" ]; then
   SQL_FILE="${NETWORK_ENCRYPTOR_SQL_FILE}"
   if [ ! -f "${SQL_FILE}" ]; then
     echo "NETWORK_ENCRYPTOR_SQL_FILE not found: ${SQL_FILE}" >&2
     exit 1
   fi
+elif [ "$#" -eq 2 ]; then
+  SQL_BASENAME="$2"
+  if [[ "${SQL_BASENAME}" == *"/"* ]] || [[ "${SQL_BASENAME}" == *".."* ]]; then
+    echo "Second arg must be a basename only (no path): got ${SQL_BASENAME}" >&2
+    exit 1
+  fi
+  SQL_FILE="${SQL_DIR}/${SQL_BASENAME}"
+  if [ ! -f "${SQL_FILE}" ]; then
+    echo "SQL file not found: ${SQL_FILE}" >&2
+    exit 1
+  fi
+  case "${SQL_BASENAME}" in
+    "${ID_PADDED}"_*.sql) ;;
+    *)
+      echo "Basename must start with ${ID_PADDED}_ (config_id=${CONFIG_ID}): ${SQL_BASENAME}" >&2
+      exit 1
+      ;;
+  esac
 else
-  ID_PADDED=$(printf "%02d" "$((10#${CONFIG_ID}))")
   SQL_FILE_GLOB="${SQL_DIR}/${ID_PADDED}_*.sql"
 
   shopt -s nullglob
@@ -49,7 +69,7 @@ else
   if [ "${#SQL_FILES_SORTED[@]}" -gt 1 ]; then
     echo "Multiple SQL files match ${SQL_FILE_GLOB}:" >&2
     printf '  %s\n' "${SQL_FILES_SORTED[@]}" >&2
-    echo "Set NETWORK_ENCRYPTOR_SQL_FILE to the file to load, or keep a single file per id." >&2
+    echo "Pick one: $0 ${CONFIG_ID} <basename.sql>  or  NETWORK_ENCRYPTOR_SQL_FILE=/path/to/file.sql" >&2
     exit 1
   fi
   SQL_FILE="${SQL_FILES_SORTED[0]}"

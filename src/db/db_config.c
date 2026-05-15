@@ -61,28 +61,6 @@ static uint8_t parse_protocol_name(const char *v) {
     return (uint8_t)atoi(v);
 }
 
-static int alloc_wire_policy_id(int db_row_id, uint8_t *used) {
-    if (db_row_id >= 1 && db_row_id <= 255 && !used[(size_t)db_row_id]) {
-        used[(size_t)db_row_id] = 1;
-        return db_row_id;
-    }
-    for (int j = 1; j <= 255; j++) {
-        if (!used[(size_t)j]) {
-            used[(size_t)j] = 1;
-            if (db_row_id < 1 || db_row_id > 255)
-                fprintf(stderr,
-                        "[DB CRYPTO] policy db id=%d not in wire range 1..255; assigned wire id=%d\n",
-                        db_row_id, j);
-            else
-                fprintf(stderr,
-                        "[DB CRYPTO] policy db id=%d: wire id %d already in use; assigned wire id=%d\n",
-                        db_row_id, db_row_id, j);
-            return j;
-        }
-    }
-    return -1;
-}
-
 static int parse_action_name(const char *v) {
     if (!v) return POLICY_ACTION_BYPASS;
     if (strcasecmp(v, "bypass") == 0) return POLICY_ACTION_BYPASS;
@@ -251,9 +229,6 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
     }
     PQclear(res);
 
-    uint8_t wire_id_used[256];
-    memset(wire_id_used, 0, sizeof(wire_id_used));
-    wire_id_used[0] = 1;
     for (int pi = 0; pi < cfg->profile_count; pi++) {
         struct profile_config *p = &cfg->profiles[pi];
         char profile_id_str[32];
@@ -317,13 +292,7 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
                     PQclear(res);
                     return -1;
                 }
-                int wire_id = alloc_wire_policy_id(db_policy_id, wire_id_used);
-                if (wire_id < 0) {
-                    fprintf(stderr, "[DB CRYPTO] no free wire policy id (max 255 policies)\n");
-                    PQclear(res);
-                    return -1;
-                }
-                cp_base.id = wire_id;
+                cp_base.id = db_policy_id;
                 cp_base.db_id = db_policy_id;
                 cp_base.priority = atoi(PQgetvalue(res, r, 1));
                 cp_base.action = parse_action_name(PQgetvalue(res, r, 2));

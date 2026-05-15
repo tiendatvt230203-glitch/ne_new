@@ -25,6 +25,9 @@ fi
 declare -A IDS=()
 for sql_file in "${SQL_FILES[@]}"; do
   base="$(basename "${sql_file}")"
+  if [[ "${base}" == *_peer.sql ]]; then
+    continue
+  fi
   if [[ "${base}" =~ ^([0-9]+)_.*\.sql$ ]]; then
     id="${BASH_REMATCH[1]}"
     id=$((10#${id}))
@@ -46,4 +49,4 @@ for id in "${SORTED_IDS[@]}"; do
   bash "${LOAD_ONE}" "${id}"
 done
 
-echo "OK ids: ${SORTED_IDS[*]}"
+echo "OK ids: ${SORTED_IDS[*]}  (skipped *_peer.sql — load peer with: xdp_load_option.sh <id> <NN>_..._peer.sql)"

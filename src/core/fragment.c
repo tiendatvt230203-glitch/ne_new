@@ -74,7 +74,7 @@ int frag_is_fragment(const uint8_t *pkt_data, uint32_t pkt_len,
     if (pkt_len < (uint32_t)(tunnel_off + tunnel_hdr_size + FRAG_HDR_SIZE))
         return 0;
 
-    uint8_t orig_proto_byte = pkt_data[tunnel_off + nonce_size];
+    uint8_t orig_proto_byte = pkt_data[tunnel_off + nonce_size + NE_WIRE_POLICY_U32];
 
     if (!(orig_proto_byte & FRAG_FLAG_BIT))
         return 0;
@@ -142,7 +142,7 @@ static int build_and_encrypt_fragment(struct packet_crypto_ctx *ctx,
 
     uint8_t flagged_proto = orig_proto | FRAG_FLAG_BIT;
     crypto_write_l3_tunnel_header(out_buf + tunnel_off, nonce, nonce_size,
-                                  0, flagged_proto);
+                                  packet_crypto_get_policy_wire_u32(), flagged_proto);
 
     frag_write_hdr(out_buf + tunnel_off + tunnel_hdr_size, pkt_id, frag_index);
 
@@ -893,7 +893,7 @@ int frag_is_fragment_l4(const uint8_t *pkt_data, uint32_t pkt_len,
     if (pkt_len < (uint32_t)(tunnel_off + tunnel_hdr_size + FRAG_L4_HDR_SIZE))
         return 0;
 
-    if (pkt_data[tunnel_off + nonce_size + 1] != L4_FRAG_MAGIC)
+    if (pkt_data[tunnel_off + nonce_size + NE_WIRE_POLICY_U32] != L4_FRAG_MAGIC)
         return 0;
 
     frag_read_hdr_l4(pkt_data + tunnel_off + tunnel_hdr_size, pkt_id, frag_index);

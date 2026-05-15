@@ -3,6 +3,8 @@
 #include <string.h>
 #include <stdio.h>
 
+#define NE_L2_POLICY_EXTRA (NE_WIRE_POLICY_U32 - 1)
+
 #define MIN_ETH_PKT  (ETH_HEADER_SIZE + 8)
 
 #define likely(x)   __builtin_expect(!!(x), 1)
@@ -25,8 +27,8 @@ int crypto_layer2_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
     if (unlikely(!ctx || !ctx->initialized || !packet || pkt_len < MIN_ETH_PKT)) return -1;
 
     const int nonce_size = packet_crypto_get_nonce_size();
-    const int l2_hdr_extra = nonce_size;
-    const int l2_enc_start = 14 + nonce_size;
+    const int l2_hdr_extra = nonce_size + NE_L2_POLICY_EXTRA;
+    const int l2_enc_start = ETH_HEADER_SIZE + 2 + NE_L2_POLICY_EXTRA + nonce_size;
 
     uint16_t ether_type = ((uint16_t)packet[12] << 8) | packet[13];
     uint8_t proto_flag;
@@ -53,7 +55,7 @@ int crypto_layer2_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
     memmove(packet + l2_enc_start, packet + ETH_HEADER_SIZE, payload_len);
 
     crypto_write_counter(packet, nonce, nonce_size, (uint8_t)(fake_etype >> 8),
-                         packet_crypto_get_policy_id());
+                         packet_crypto_get_policy_wire_u32());
 
     if (likely(is_gcm)) {
         uint8_t tag[AES128_GCM_TAG_SIZE];
@@ -77,7 +79,7 @@ int crypto_layer2_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
     if (unlikely(!ctx || !ctx->initialized || !packet)) return -1;
 
     const int nonce_size = packet_crypto_get_nonce_size();
-    const int l2_enc_start = 14 + nonce_size;
+    const int l2_enc_start = ETH_HEADER_SIZE + 2 + NE_L2_POLICY_EXTRA + nonce_size;
 
     if (unlikely(pkt_len < (size_t)l2_enc_start)) return -1;
 
@@ -87,11 +89,11 @@ int crypto_layer2_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
     if (!(fake_ipv4 && pkt_marker == (uint8_t)(fake_ipv4 >> 8)))
         return (int)pkt_len;
 
-    uint8_t policy_id;
     uint8_t proto_flag;
     uint8_t nonce[16];
-    crypto_read_counter(packet, nonce_size, nonce, &policy_id, &proto_flag);
-    (void)policy_id;
+    uint32_t policy_wire = 0;
+    crypto_read_counter(packet, nonce_size, nonce, &policy_wire, &proto_flag);
+    (void)policy_wire;
     (void)proto_flag;
     const int is_gcm = (packet_crypto_get_mode() == CRYPTO_MODE_GCM);
 

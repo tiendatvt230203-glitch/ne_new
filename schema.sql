@@ -12,7 +12,9 @@ CREATE TABLE IF NOT EXISTS xdp_wan_configs (
     id SERIAL PRIMARY KEY,
     config_id INT NOT NULL REFERENCES xdp_configs(id) ON DELETE CASCADE,
     ifname VARCHAR(32) NOT NULL,
-    dst_ip VARCHAR(32) NOT NULL DEFAULT ''
+    dst_ip VARCHAR(32) NOT NULL DEFAULT '',
+    src_mac VARCHAR(32) NOT NULL DEFAULT '',
+    dst_mac VARCHAR(32) NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS xdp_profiles (
@@ -70,6 +72,13 @@ CREATE TABLE IF NOT EXISTS xdp_profile_crypto_policy_matches (
     dst_port VARCHAR(32) NOT NULL DEFAULT 'ANY'
 );
 
+COMMENT ON TABLE xdp_profile_crypto_policies IS
+    'Crypto rules per profile. Rows with action encrypt_l2 / encrypt_l3 / encrypt_l4 embed policies.id on the wire as 4-byte big-endian cleartext (not inside AES ciphertext) so the receiver selects crypto_key. bypass leaves packets unchanged for crypto.';
+COMMENT ON COLUMN xdp_profile_crypto_policies.id IS
+    'Primary key and on-wire policy id for encrypt_* actions (same value loaded into NE and matched on RX). Use stable ids agreed between peers.';
+COMMENT ON TABLE xdp_profile_crypto_policy_matches IS
+    'Traffic selectors; policy_id references xdp_profile_crypto_policies.id.';
+
 CREATE INDEX IF NOT EXISTS idx_local_config_id ON xdp_local_configs(config_id);
 CREATE INDEX IF NOT EXISTS idx_wan_config_id ON xdp_wan_configs(config_id);
 CREATE INDEX IF NOT EXISTS idx_profiles_config_id ON xdp_profiles(config_id);
@@ -110,6 +119,8 @@ ALTER TABLE xdp_local_configs DROP COLUMN IF EXISTS network;
 ALTER TABLE xdp_local_configs DROP COLUMN IF EXISTS ingress_mbps;
 
 ALTER TABLE xdp_wan_configs ADD COLUMN IF NOT EXISTS dst_ip VARCHAR(32) NOT NULL DEFAULT '';
+ALTER TABLE xdp_wan_configs ADD COLUMN IF NOT EXISTS src_mac VARCHAR(32) NOT NULL DEFAULT '';
+ALTER TABLE xdp_wan_configs ADD COLUMN IF NOT EXISTS dst_mac VARCHAR(32) NOT NULL DEFAULT '';
 ALTER TABLE xdp_wan_configs DROP COLUMN IF EXISTS window_size_kb;
 ALTER TABLE xdp_wan_configs DROP COLUMN IF EXISTS src_ip;
 ALTER TABLE xdp_wan_configs DROP COLUMN IF EXISTS next_hop_ip;

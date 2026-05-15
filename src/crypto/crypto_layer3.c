@@ -70,7 +70,7 @@ int crypto_layer3_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
     }
 
     crypto_write_l3_tunnel_header(packet + tunnel_off, nonce, nonce_size,
-                                  packet_crypto_get_policy_id(), orig_proto);
+                                  packet_crypto_get_policy_wire_u32(), orig_proto);
     uint8_t fake_proto = packet_crypto_get_fake_protocol();
     packet[IPV4_PROTO_OFF] = fake_proto;
 
@@ -108,8 +108,10 @@ int crypto_layer3_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
 
     uint8_t rd_proto_flag, orig_proto;
     uint8_t nonce[16];
+    uint32_t pol_wire = 0;
     crypto_read_l3_tunnel_header(packet + tunnel_off, nonce_size,
-                                  nonce, &rd_proto_flag, NULL, &orig_proto);
+                                  nonce, &rd_proto_flag, &pol_wire, &orig_proto);
+    (void)pol_wire;
 
     packet[IPV4_PROTO_OFF] = orig_proto;
 

@@ -56,12 +56,10 @@ static struct frag_table g_wan_frag_l4;
 
 static struct packet_crypto_ctx g_policy_crypto_ctx[MAX_CRYPTO_POLICIES];
 static int g_policy_crypto_ctx_ready[MAX_CRYPTO_POLICIES];
-static int g_policy_index_by_action_id[POLICY_ACTION_ENCRYPT_L4 + 1][256];
 static struct crypto_policy g_active_policies[MAX_CRYPTO_POLICIES];
 static int g_active_policy_count = 0;
 static struct packet_crypto_ctx g_prev_policy_crypto_ctx[MAX_CRYPTO_POLICIES];
 static int g_prev_policy_crypto_ctx_ready[MAX_CRYPTO_POLICIES];
-static int g_prev_policy_index_by_action_id[POLICY_ACTION_ENCRYPT_L4 + 1][256];
 static struct crypto_policy g_prev_policies[MAX_CRYPTO_POLICIES];
 static int g_prev_policy_count = 0;
 static uint64_t g_prev_policy_grace_until_ms = 0;
@@ -463,6 +461,31 @@ static int prev_policy_grace_active(void) {
     return now <= g_prev_policy_grace_until_ms;
 }
 
+static int fwd_pi_for_action_wire(const struct forwarder *fwd, int action, uint32_t wire_pid) {
+    if (!fwd || !fwd->cfg)
+        return -1;
+    for (int pi = 0; pi < fwd->cfg->policy_count && pi < MAX_CRYPTO_POLICIES; pi++) {
+        if (!g_policy_crypto_ctx_ready[pi])
+            continue;
+        const struct crypto_policy *cp = &fwd->cfg->policies[pi];
+        if (cp->action == action && (uint32_t)cp->id == wire_pid)
+            return pi;
+    }
+    return -1;
+}
+
+static int fwd_prev_pi_for_action_wire(int action, uint32_t wire_pid) {
+    if (!prev_policy_grace_active())
+        return -1;
+    for (int ppi = 0; ppi < g_prev_policy_count && ppi < MAX_CRYPTO_POLICIES; ppi++) {
+        if (!g_prev_policy_crypto_ctx_ready[ppi])
+            continue;
+        if (g_prev_policies[ppi].action == action && (uint32_t)g_prev_policies[ppi].id == wire_pid)
+            return ppi;
+    }
+    return -1;
+}
+
 static int same_topology(const struct app_config *a, const struct app_config *b) {
     if (!a || !b)
         return 0;
@@ -549,10 +572,6 @@ static int rebuild_crypto_runtime(const struct app_config *cfg, int *has_encrypt
     memcpy(old_policies, g_active_policies, sizeof(old_policies));
 
     memset(g_policy_crypto_ctx_ready, 0, sizeof(g_policy_crypto_ctx_ready));
-    for (int a = 0; a <= POLICY_ACTION_ENCRYPT_L4; a++) {
-        for (int id = 0; id < 256; id++)
-            g_policy_index_by_action_id[a][id] = -1;
-    }
 
     for (int pi = 0; pi < cfg->policy_count && pi < MAX_CRYPTO_POLICIES; pi++) {
         const struct crypto_policy *cp = &cfg->policies[pi];
@@ -585,11 +604,6 @@ static int rebuild_crypto_runtime(const struct app_config *cfg, int *has_encrypt
                 continue;
             }
             g_policy_crypto_ctx_ready[pi] = 1;
-        }
-        if (cp->action >= 0 && cp->action <= POLICY_ACTION_ENCRYPT_L4) {
-            uint8_t pid = (uint8_t)cp->id;
-            if (g_policy_index_by_action_id[cp->action][pid] < 0)
-                g_policy_index_by_action_id[cp->action][pid] = pi;
         }
         if (cp->action == POLICY_ACTION_ENCRYPT_L2)
             has_encrypt_l2 = 1;
@@ -994,12 +1008,12 @@ static const struct crypto_policy *select_crypto_policy_for_packet(struct forwar
 
 static int policy_index_from_action_id_current(const struct forwarder *fwd,
                                                int action_layer,
-                                               uint8_t policy_id) {
+                                               uint32_t policy_wire_id) {
     if (!fwd || !fwd->cfg)
         return -1;
     if (action_layer < 0 || action_layer > POLICY_ACTION_ENCRYPT_L4)
         return -1;
-    int pi = g_policy_index_by_action_id[action_layer][policy_id];
+    int pi = fwd_pi_for_action_wire(fwd, action_layer, policy_wire_id);
     if (pi < 0 || pi >= fwd->cfg->policy_count || pi >= MAX_CRYPTO_POLICIES)
         return -1;
     if (!g_policy_crypto_ctx_ready[pi])
@@ -1830,8 +1844,12 @@ static int decrypt_packet_auto_l2(struct forwarder *fwd,
     }
 
 
-    uint8_t policy_id = pkt[13];
-    int pi = g_policy_index_by_action_id[POLICY_ACTION_ENCRYPT_L2][policy_id];
+    uint32_t policy_wire = 0;
+    if (*pkt_len < 17U)
+        return -1;
+    policy_wire = ((uint32_t)pkt[13] << 24) | ((uint32_t)pkt[14] << 16) | ((uint32_t)pkt[15] << 8) |
+                   (uint32_t)pkt[16];
+    int pi = fwd_pi_for_action_wire(fwd, POLICY_ACTION_ENCRYPT_L2, policy_wire);
     if (pi >= 0 && pi < fwd->cfg->policy_count && g_policy_crypto_ctx_ready[pi]) {
         const struct crypto_policy *cp = &fwd->cfg->policies[pi];
         apply_crypto_params_from_policy(cp);
@@ -1843,7 +1861,7 @@ static int decrypt_packet_auto_l2(struct forwarder *fwd,
     }
 
     if (prev_policy_grace_active()) {
-        int ppi = g_prev_policy_index_by_action_id[POLICY_ACTION_ENCRYPT_L2][policy_id];
+        int ppi = fwd_prev_pi_for_action_wire(POLICY_ACTION_ENCRYPT_L2, policy_wire);
         if (ppi >= 0 && ppi < g_prev_policy_count && g_prev_policy_crypto_ctx_ready[ppi]) {
             const struct crypto_policy *cp_prev = &g_prev_policies[ppi];
             apply_crypto_params_from_policy(cp_prev);
@@ -1861,7 +1879,7 @@ static int decrypt_packet_auto_l2(struct forwarder *fwd,
 
 
 static int l3_extract_policy_id(uint8_t *pkt, uint32_t pkt_len,
-                                uint8_t *policy_id_out) {
+                                uint32_t *policy_id_out) {
     if (!pkt || !policy_id_out || pkt_len < 14 + 20)
         return -1;
 
@@ -1882,12 +1900,10 @@ static int decrypt_packet_auto_by_action(struct forwarder *fwd,
         .per_policy_ready = g_policy_crypto_ctx_ready,
         .policies = fwd->cfg ? fwd->cfg->policies : NULL,
         .policy_count = fwd->cfg ? fwd->cfg->policy_count : 0,
-        .policy_index_by_action_id = g_policy_index_by_action_id,
         .prev_per_policy_ctx = g_prev_policy_crypto_ctx,
         .prev_per_policy_ready = g_prev_policy_crypto_ctx_ready,
         .prev_policies = g_prev_policies,
         .prev_policy_count = g_prev_policy_count,
-        .prev_policy_index_by_action_id = g_prev_policy_index_by_action_id,
         .prev_grace_active = prev_policy_grace_active()
     };
     return crypto_decrypt_packet_auto_by_action(crypto_enabled, fwd->cfg, &dctx,
@@ -1906,17 +1922,17 @@ static struct packet_crypto_ctx *forwarder_resolve_l3_decrypt_ctx(struct forward
         return &crypto_ctx;
     }
 
-    uint8_t policy_id = 0;
+    uint32_t policy_id = 0;
     if (crypto_l3_extract_policy_id(pkt, pkt_len, &policy_id) != 0)
         return NULL;
 
-    int pi = g_policy_index_by_action_id[POLICY_ACTION_ENCRYPT_L3][policy_id];
+    int pi = fwd_pi_for_action_wire(fwd, POLICY_ACTION_ENCRYPT_L3, policy_id);
     if (pi >= 0 && pi < fwd->cfg->policy_count && g_policy_crypto_ctx_ready[pi]) {
         apply_crypto_params_from_policy(&fwd->cfg->policies[pi]);
         return &g_policy_crypto_ctx[pi];
     }
     if (prev_policy_grace_active()) {
-        int ppi = g_prev_policy_index_by_action_id[POLICY_ACTION_ENCRYPT_L3][policy_id];
+        int ppi = fwd_prev_pi_for_action_wire(POLICY_ACTION_ENCRYPT_L3, policy_id);
         if (ppi >= 0 && ppi < g_prev_policy_count && g_prev_policy_crypto_ctx_ready[ppi]) {
             apply_crypto_params_from_policy(&g_prev_policies[ppi]);
             return &g_prev_policy_crypto_ctx[ppi];
@@ -1936,12 +1952,12 @@ static struct packet_crypto_ctx *forwarder_resolve_l4_decrypt_ctx(struct forward
         return &crypto_ctx;
     }
 
-    uint8_t policy_id = 0;
+    uint32_t policy_id = 0;
     int nonce_size = 0;
     if (crypto_l4_extract_policy_id_ipv4(pkt, pkt_len, &policy_id, &nonce_size) != 0)
         return NULL;
 
-    int pi = g_policy_index_by_action_id[POLICY_ACTION_ENCRYPT_L4][policy_id];
+    int pi = fwd_pi_for_action_wire(fwd, POLICY_ACTION_ENCRYPT_L4, policy_id);
     if (pi >= 0 && pi < fwd->cfg->policy_count && g_policy_crypto_ctx_ready[pi]) {
         const struct crypto_policy *cp = &fwd->cfg->policies[pi];
         if (cp->nonce_size > 0 && cp->nonce_size == nonce_size) {
@@ -1950,7 +1966,7 @@ static struct packet_crypto_ctx *forwarder_resolve_l4_decrypt_ctx(struct forward
         }
     }
     if (prev_policy_grace_active()) {
-        int ppi = g_prev_policy_index_by_action_id[POLICY_ACTION_ENCRYPT_L4][policy_id];
+        int ppi = fwd_prev_pi_for_action_wire(POLICY_ACTION_ENCRYPT_L4, policy_id);
         if (ppi >= 0 && ppi < g_prev_policy_count && g_prev_policy_crypto_ctx_ready[ppi]) {
             const struct crypto_policy *cp_prev = &g_prev_policies[ppi];
             if (cp_prev->nonce_size > 0 && cp_prev->nonce_size == nonce_size) {
@@ -2666,7 +2682,7 @@ static void *wan_queue_thread_l3l4(void *arg) {
             ne_rx_pkt_recv_log(wan, wan_idx, pkt, wire_len, wire_flow_ok,
                                wire_src_ip, wire_src_port, wire_dst_ip, wire_dst_port, wire_proto);
             if (wire_flow_ok && tcp_diag_want_log(wire_proto, wire_src_port, wire_dst_port)) {
-                uint8_t l3pid = 0, l4pid = 0;
+                uint32_t l3pid = 0, l4pid = 0;
                 int l4nonce = 0;
                 int l3ok = (crypto_l3_extract_policy_id(wire_pkt, wire_len, &l3pid) == 0);
                 int l4ok = (crypto_l4_extract_policy_id_ipv4(wire_pkt, wire_len, &l4pid, &l4nonce) == 0);
@@ -2682,26 +2698,30 @@ static void *wan_queue_thread_l3l4(void *arg) {
 
             if (crypto_enabled && crypto_layer == POLICY_ACTION_ENCRYPT_L3 &&
                 fwd->cfg && fwd->cfg->policy_count > 0) {
-                uint8_t policy_id = 0;
-                int found = 0;
-                if (l3_extract_policy_id(pkt, pkt_len, &policy_id) == 0) {
-                    int pi = g_policy_index_by_action_id[POLICY_ACTION_ENCRYPT_L3][policy_id];
-                    if (pi >= 0 && pi < fwd->cfg->policy_count && g_policy_crypto_ctx_ready[pi]) {
-                        const struct crypto_policy *cp = &fwd->cfg->policies[pi];
-                        apply_crypto_params_from_policy(cp);
-                        found = 1;
-                    }
-                    if (!found && prev_policy_grace_active()) {
-                        int ppi = g_prev_policy_index_by_action_id[POLICY_ACTION_ENCRYPT_L3][policy_id];
-                        if (ppi >= 0 && ppi < g_prev_policy_count && g_prev_policy_crypto_ctx_ready[ppi]) {
-                            const struct crypto_policy *cp_prev = &g_prev_policies[ppi];
-                            apply_crypto_params_from_policy(cp_prev);
+                uint16_t et_prime = ((uint16_t)pkt[12] << 8) | pkt[13];
+                /* L2-on-WAN uses 0x88xx; l3_extract needs IPv4 — skip priming until after L2 strip. */
+                if (et_prime == 0x0800) {
+                    uint32_t policy_id = 0;
+                    int found = 0;
+                    if (l3_extract_policy_id(pkt, pkt_len, &policy_id) == 0) {
+                        int pi = fwd_pi_for_action_wire(fwd, POLICY_ACTION_ENCRYPT_L3, policy_id);
+                        if (pi >= 0 && pi < fwd->cfg->policy_count && g_policy_crypto_ctx_ready[pi]) {
+                            const struct crypto_policy *cp = &fwd->cfg->policies[pi];
+                            apply_crypto_params_from_policy(cp);
                             found = 1;
                         }
+                        if (!found && prev_policy_grace_active()) {
+                            int ppi = fwd_prev_pi_for_action_wire(POLICY_ACTION_ENCRYPT_L3, policy_id);
+                            if (ppi >= 0 && ppi < g_prev_policy_count && g_prev_policy_crypto_ctx_ready[ppi]) {
+                                const struct crypto_policy *cp_prev = &g_prev_policies[ppi];
+                                apply_crypto_params_from_policy(cp_prev);
+                                found = 1;
+                            }
+                        }
                     }
+                    if (!found)
+                        apply_default_crypto_params(fwd);
                 }
-                if (!found)
-                    apply_default_crypto_params(fwd);
             }
 
 
@@ -2728,7 +2748,7 @@ static void *wan_queue_thread_l3l4(void *arg) {
                 uint16_t l3_frag_pid;
                 uint8_t l3_frag_idx;
                 if (frag_is_fragment(pkt, pkt_len, &l3_frag_pid, &l3_frag_idx)) {
-                    uint8_t l3_pid = 0;
+                    uint32_t l3_pid = 0;
                     if (crypto_l3_extract_policy_id(pkt, pkt_len, &l3_pid) == 0) {
                         int pi = policy_index_from_action_id_current(fwd, POLICY_ACTION_ENCRYPT_L3, l3_pid);
                         if (pi >= 0)
@@ -2792,9 +2812,9 @@ static void *wan_queue_thread_l3l4(void *arg) {
                                     "L3_full_decrypt_fail_key_or_corrupt", wire_len, pfl3, ds, dsp, dd, ddp, dproto,
                                     "decrypt_packet_auto_by_action enc_l3");
                     if (pfl3 && tcp_diag_want_log(dproto, dsp, ddp)) {
-                        uint8_t l3pid = 0;
+                        uint32_t l3pid = 0;
                         int l4nonce = 0;
-                        uint8_t l4pid = 0;
+                        uint32_t l4pid = 0;
                         int l3ok = (crypto_l3_extract_policy_id(wire_pkt, wire_len, &l3pid) == 0);
                         int l4ok = (crypto_l4_extract_policy_id_ipv4(wire_pkt, wire_len, &l4pid, &l4nonce) == 0);
                         log_tcp_diag_decrypt("RX-DEC-FAIL",
@@ -2807,7 +2827,7 @@ static void *wan_queue_thread_l3l4(void *arg) {
                     __sync_fetch_and_add(&fwd->total_dropped, 1);
                     continue;
                 } else {
-                    uint8_t l3_pid = 0;
+                    uint32_t l3_pid = 0;
                     if (crypto_l3_extract_policy_id(wire_pkt, wire_len, &l3_pid) == 0) {
                         int pi = policy_index_from_action_id_current(fwd, POLICY_ACTION_ENCRYPT_L3, l3_pid);
                         if (pi >= 0)
@@ -2886,9 +2906,9 @@ static void *wan_queue_thread_l3l4(void *arg) {
                                     "L4_full_decrypt_fail_key_or_corrupt", wire_len, pfl4, ds, dsp, dd, ddp, dproto,
                                     "decrypt_packet_auto_by_action enc_l4");
                     if (pfl4 && tcp_diag_want_log(dproto, dsp, ddp)) {
-                        uint8_t l3pid = 0;
+                        uint32_t l3pid = 0;
                         int l4nonce = 0;
-                        uint8_t l4pid = 0;
+                        uint32_t l4pid = 0;
                         int l3ok = (crypto_l3_extract_policy_id(wire_pkt, wire_len, &l3pid) == 0);
                         int l4ok = (crypto_l4_extract_policy_id_ipv4(wire_pkt, wire_len, &l4pid, &l4nonce) == 0);
                         log_tcp_diag_decrypt("RX-DEC-FAIL",
@@ -2935,7 +2955,7 @@ static void *wan_queue_thread_l3l4(void *arg) {
                                         "totlen/ihl/tcp vs buffer after decrypt");
                     }
                 } else if (inbound_policy_pi < 0) {
-                    uint8_t l4_pid = 0;
+                    uint32_t l4_pid = 0;
                     int l4_nonce = 0;
                     if (crypto_l4_extract_policy_id_ipv4(wire_pkt, wire_len, &l4_pid, &l4_nonce) == 0) {
                         int pi = policy_index_from_action_id_current(fwd, POLICY_ACTION_ENCRYPT_L4, l4_pid);
@@ -3480,7 +3500,6 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg) {
         if (g_active_policy_count > 0) {
             memcpy(g_prev_policy_crypto_ctx, g_policy_crypto_ctx, sizeof(g_prev_policy_crypto_ctx));
             memcpy(g_prev_policy_crypto_ctx_ready, g_policy_crypto_ctx_ready, sizeof(g_prev_policy_crypto_ctx_ready));
-            memcpy(g_prev_policy_index_by_action_id, g_policy_index_by_action_id, sizeof(g_prev_policy_index_by_action_id));
             memcpy(g_prev_policies, g_active_policies, sizeof(g_prev_policies));
             g_prev_policy_count = g_active_policy_count;
             g_prev_policy_grace_until_ms = monotonic_ms() + POLICY_RELOAD_GRACE_MS;
@@ -3488,10 +3507,6 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg) {
                     (unsigned long long)POLICY_RELOAD_GRACE_MS);
         } else {
             memset(g_prev_policy_crypto_ctx_ready, 0, sizeof(g_prev_policy_crypto_ctx_ready));
-            for (int a = 0; a <= POLICY_ACTION_ENCRYPT_L4; a++) {
-                for (int id = 0; id < 256; id++)
-                    g_prev_policy_index_by_action_id[a][id] = -1;
-            }
             g_prev_policy_count = 0;
             g_prev_policy_grace_until_ms = 0;
         }

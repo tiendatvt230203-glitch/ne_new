@@ -150,7 +150,7 @@ static void log_crypto_policies_human(struct app_config *cfg, int config_id) {
             fprintf(stderr,
                     "    crypto_policy sql_id=%d packet_marker=%d priority=%d\n"
                     "      layer/action: %s  |  match: protocol=%s  src_ip=%s  dst_ip=%s  src_port=%s  dst_port=%s\n"
-                    "      crypto: %s-%u  nonce=%d bytes  embed_on_wire=0x%02x (L3/L4 ciphertext marker byte)\n"
+                    "      crypto: %s-%u  nonce=%d bytes  embed_on_wire=0x%08x (L2/L3/L4 cleartext policy id BE)\n"
                     "      key_prefix(hex)=%02x%02x%02x%02x (first 4 bytes)\n",
                     cp->db_id,
                     cp->id,
@@ -164,7 +164,7 @@ static void log_crypto_policies_human(struct app_config *cfg, int config_id) {
                     crypto_mode_str(cp->crypto_mode),
                     (unsigned)cp->aes_bits,
                     cp->nonce_size,
-                    (unsigned)(cp->id & 0xFF),
+                    (unsigned)cp->id,
                     cp->key[0],
                     cp->key[1],
                     cp->key[2],
