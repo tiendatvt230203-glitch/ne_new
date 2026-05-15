@@ -34,7 +34,11 @@ struct {
 #define STAT_NO_SOCK    3
 #define STAT_ARP_PASS   4
 #define STAT_ICMP_PASS  5
+#define STAT_NE_L2      6
 #define IPPROTO_ICMP_VAL 1
+/* L2 wire (crypto_write_counter): byte12=0x88, bytes13-16=policy BE, byte17+=nonce.
+ * tcpdump shows ethertype 0x8800 (byte13 is policy MSB, often 0x00) — NOT 0x88b5 from DB. */
+#define NE_L2_MARKER_BYTE  0x88u
 
 static __always_inline void inc_stat(int idx)
 {
@@ -79,11 +83,16 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
     if (proto == __constant_htons(ETH_P_IPV6))
         return XDP_PASS;
 
+    /* L2 NE ciphertext: same marker as userspace (packet[12]==fake_etype>>8). */
     int key0 = 0;
     __u16 *fake4 = bpf_map_lookup_elem(&wan_config_map, &key0);
-    if (fake4 && *fake4 != 0 &&
-        (proto & __constant_htons(0xFF00)) == (*fake4 & __constant_htons(0xFF00)))
-        goto redirect;
+    if (fake4 && *fake4 != 0) {
+        __u8 *raw = (void *)eth;
+        if ((void *)(raw + 14) <= data_end && raw[12] == NE_L2_MARKER_BYTE) {
+            inc_stat(STAT_NE_L2);
+            goto redirect;
+        }
+    }
 
     inc_stat(STAT_NON_IP);
     return XDP_PASS;
