@@ -1,4 +1,4 @@
--- Config 30 (peer): bonding + WAN weights. Policies 421/422 bypass (id+matches only); crypto_enabled=0.
+-- Config 30 (peer): 421 UDP encrypt_l2, 422 TCP encrypt_l3; reverse CIDR; same keys as 30_wan_matrix.sql.
 
 DELETE FROM xdp_profile_crypto_policies WHERE profile_id IN (SELECT id FROM xdp_profiles WHERE config_id = 30);
 DELETE FROM xdp_profile_locals          WHERE profile_id IN (SELECT id FROM xdp_profiles WHERE config_id = 30);
@@ -20,7 +20,7 @@ INSERT INTO xdp_wan_configs (config_id, ifname) VALUES
 (30, 'enp8s0');
 
 INSERT INTO xdp_profiles (config_id, profile_name, enabled, description) VALUES
-(30, 'wan_enp7s0_enp8s0_70_30', 1, 'Bonding baseline: policy_id 421/422 bypass (id+matches only); crypto_enabled=0.');
+(30, 'wan_enp7s0_enp8s0_70_30', 1, 'Peer: 421 UDP L2 GCM, 422 TCP L3 GCM (keys match matrix).');
 
 INSERT INTO xdp_profile_locals (profile_id, ifname)
 SELECT p.id, 'enp5s0'
@@ -40,12 +40,20 @@ INSERT INTO xdp_profile_wans (profile_id, ifname, bandwidth_weight_percent)
 SELECT p.id, 'enp8s0', 30
 FROM xdp_profiles p WHERE p.config_id = 30 AND p.profile_name = 'wan_enp7s0_enp8s0_70_30';
 
-INSERT INTO xdp_profile_crypto_policies (id, profile_id, priority, action, protocol)
-SELECT 421, p.id, 20, 'bypass', 'udp'
+INSERT INTO xdp_profile_crypto_policies (
+    id, profile_id, priority, action, protocol,
+    crypto_mode, aes_bits, nonce_size, crypto_key
+)
+SELECT 421, p.id, 20, 'encrypt_l2', 'udp', 'gcm', 128, 12,
+       '00112233445566778899aabbccddeeff'
 FROM xdp_profiles p WHERE p.config_id = 30 AND p.profile_name = 'wan_enp7s0_enp8s0_70_30';
 
-INSERT INTO xdp_profile_crypto_policies (id, profile_id, priority, action, protocol)
-SELECT 422, p.id, 20, 'bypass', 'tcp'
+INSERT INTO xdp_profile_crypto_policies (
+    id, profile_id, priority, action, protocol,
+    crypto_mode, aes_bits, nonce_size, crypto_key
+)
+SELECT 422, p.id, 20, 'encrypt_l3', 'tcp', 'gcm', 128, 12,
+       '00112233445566778899aabbccddeeff'
 FROM xdp_profiles p WHERE p.config_id = 30 AND p.profile_name = 'wan_enp7s0_enp8s0_70_30';
 
 INSERT INTO xdp_profile_crypto_policy_matches (policy_id, src_cidr, src_port, dst_cidr, dst_port) VALUES
