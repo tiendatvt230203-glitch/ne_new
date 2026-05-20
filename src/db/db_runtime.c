@@ -1,11 +1,40 @@
 #include "../../inc/db_runtime.h"
 
 #include "../../inc/db_config.h"
+#include "../../inc/db_env.h"
 
 #include <libpq-fe.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+
+int ne_profile_id_exists(int profile_id) {
+    struct ne_postgres_conn pg;
+    if (ne_postgres_conn_fill(&pg) != 0)
+        return -1;
+
+    PGconn *conn = PQconnectdbParams(pg.keywords, pg.values, 0);
+    if (PQstatus(conn) != CONNECTION_OK) {
+        fprintf(stderr, "[DB] connection failed: %s", PQerrorMessage(conn));
+        PQfinish(conn);
+        return -1;
+    }
+
+    char id_str[32];
+    snprintf(id_str, sizeof(id_str), "%d", profile_id);
+    const char *params[1] = { id_str };
+
+    PGresult *res = PQexecParams(conn,
+                                 "SELECT 1 FROM ne_profiles WHERE id = $1",
+                                 1, NULL, params, NULL, NULL, 0);
+    int ok = 0;
+    if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0)
+        ok = 1;
+
+    PQclear(res);
+    PQfinish(conn);
+    return ok ? 0 : -1;
+}
 
 int run_db_check(const char *const *keywords, const char *const *values, int only_id) {
     PGconn *conn = PQconnectdbParams(keywords, values, 0);
@@ -17,23 +46,21 @@ int run_db_check(const char *const *keywords, const char *const *values, int onl
 
     char where_buf[64] = {0};
     if (only_id >= 0)
-        snprintf(where_buf, sizeof(where_buf), "WHERE c.id = %d", only_id);
+        snprintf(where_buf, sizeof(where_buf), "WHERE p.id = %d", only_id);
 
     char sql[4096];
     snprintf(sql, sizeof(sql),
-             "SELECT c.id, "
-             "COUNT(DISTINCT p.id) AS profiles, "
-             "COUNT(DISTINCT l.id) AS locals, "
-             "COUNT(DISTINCT w.id) AS wans, "
-             "COUNT(DISTINCT cp.id) AS policies "
-             "FROM xdp_configs c "
-             "LEFT JOIN xdp_profiles p ON p.config_id = c.id "
-             "LEFT JOIN xdp_local_configs l ON l.config_id = c.id "
-             "LEFT JOIN xdp_wan_configs w ON w.config_id = c.id "
-             "LEFT JOIN xdp_profile_crypto_policies cp ON cp.profile_id = p.id "
+             "SELECT p.id, "
+             "COUNT(DISTINCT pol.id) AS policies, "
+             "COUNT(DISTINCT lan.id) AS lan_rows, "
+             "COUNT(DISTINCT wan.id) AS wan_rows "
+             "FROM ne_profiles p "
+             "LEFT JOIN ne_policies pol ON pol.profile_id = p.id "
+             "LEFT JOIN ne_lan lan ON lan.profile_id = p.id "
+             "LEFT JOIN ne_wan wan ON wan.profile_id = p.id "
              "%s "
-             "GROUP BY c.id "
-             "ORDER BY c.id;",
+             "GROUP BY p.id "
+             "ORDER BY p.id;",
              where_buf);
 
     PGresult *res = PQexec(conn, sql);
@@ -46,71 +73,39 @@ int run_db_check(const char *const *keywords, const char *const *values, int onl
 
     int rows = PQntuples(res);
     if (rows == 0) {
-        fprintf(stderr, "[CHECK] no config found%s\n", (only_id >= 0) ? " for requested id" : "");
+        fprintf(stderr, "[CHECK] no ne_profiles row%s\n", (only_id >= 0) ? " for requested id" : "");
         PQclear(res);
         PQfinish(conn);
         return 1;
     }
 
-    fprintf(stdout, "[CHECK] Config summary:\n");
+    fprintf(stdout, "[CHECK] NE profile summary (ne_profiles / ne_lan / ne_wan / ne_policies):\n");
     for (int i = 0; i < rows; i++) {
         fprintf(stdout,
-                "  id=%s profiles=%s locals=%s wans=%s policies=%s\n",
+                "  profile_id=%s policies=%s lan=%s wan=%s\n",
                 PQgetvalue(res, i, 0), PQgetvalue(res, i, 1), PQgetvalue(res, i, 2),
-                PQgetvalue(res, i, 3), PQgetvalue(res, i, 4));
+                PQgetvalue(res, i, 3));
     }
     PQclear(res);
 
     snprintf(sql, sizeof(sql),
-             "SELECT cp.id, COUNT(*) "
-             "FROM xdp_profile_crypto_policies cp "
-             "JOIN xdp_profiles p ON p.id = cp.profile_id "
-             "JOIN xdp_configs c ON c.id = p.config_id "
-             "%s "
-             "GROUP BY cp.id HAVING COUNT(*) > 1 ORDER BY cp.id;",
-             where_buf);
+             "SELECT id, COUNT(*) AS c FROM ne_policies GROUP BY id HAVING COUNT(*) > 1 ORDER BY id;");
     res = PQexec(conn, sql);
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-        fprintf(stderr, "[CHECK] duplicate policy-id query failed: %s", PQresultErrorMessage(res));
+        fprintf(stderr, "[CHECK] duplicate ne_policies.id query failed: %s", PQresultErrorMessage(res));
         PQclear(res);
         PQfinish(conn);
         return 1;
     }
     if (PQntuples(res) > 0) {
-        fprintf(stdout, "[CHECK][WARN] duplicated policy IDs detected:\n");
+        fprintf(stdout, "[CHECK][WARN] duplicated ne_policies.id:\n");
         for (int i = 0; i < PQntuples(res); i++)
-            fprintf(stdout, "  policy_id=%s count=%s\n", PQgetvalue(res, i, 0), PQgetvalue(res, i, 1));
+            fprintf(stdout, "  id=%s count=%s\n", PQgetvalue(res, i, 0), PQgetvalue(res, i, 1));
     } else {
-        fprintf(stdout, "[CHECK] policy-id uniqueness: OK\n");
+        fprintf(stdout, "[CHECK] ne_policies.id uniqueness: OK\n");
     }
     PQclear(res);
 
-    snprintf(sql, sizeof(sql),
-             "SELECT cp.id, cp.aes_bits, cp.nonce_size "
-             "FROM xdp_profile_crypto_policies cp "
-             "JOIN xdp_profiles p ON p.id = cp.profile_id "
-             "JOIN xdp_configs c ON c.id = p.config_id "
-             "%s%s "
-             "(cp.aes_bits NOT IN (128,256) OR cp.nonce_size < 4 OR cp.nonce_size > 16) "
-             "ORDER BY cp.id;",
-             where_buf,
-             (where_buf[0] == '\0') ? "WHERE " : " AND ");
-    res = PQexec(conn, sql);
-    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-        fprintf(stderr, "[CHECK] policy-params query failed: %s", PQresultErrorMessage(res));
-        PQclear(res);
-        PQfinish(conn);
-        return 1;
-    }
-    if (PQntuples(res) > 0) {
-        fprintf(stdout, "[CHECK][WARN] invalid policy params detected:\n");
-        for (int i = 0; i < PQntuples(res); i++)
-            fprintf(stdout, "  policy_id=%s aes_bits=%s nonce_size=%s\n",
-                    PQgetvalue(res, i, 0), PQgetvalue(res, i, 1), PQgetvalue(res, i, 2));
-    } else {
-        fprintf(stdout, "[CHECK] policy params (aes_bits/nonce_size): OK\n");
-    }
-    PQclear(res);
     PQfinish(conn);
     return 0;
 }
@@ -151,21 +146,40 @@ static int append_wan_unique(struct app_config *dst, const struct wan_config *sr
     return dst->wan_count++;
 }
 
+static void collect_used_wire_ids(const struct app_config *dst, uint8_t used[256]) {
+    memset(used, 0, 256);
+    for (int i = 0; i < dst->policy_count; i++) {
+        int wid = dst->policies[i].id;
+        if (wid >= 1 && wid <= 255)
+            used[(size_t)wid] = 1;
+    }
+}
+
 static int append_policy_unique(struct app_config *dst, const struct crypto_policy *src_cp) {
     if (!dst || !src_cp)
         return -1;
 
-    if (src_cp->db_id != 0) {
-        for (int i = 0; i < dst->policy_count; i++) {
-            if (dst->policies[i].db_id == src_cp->db_id)
-                return i;
-        }
-    }
-
     if (dst->policy_count >= MAX_CRYPTO_POLICIES)
         return -1;
 
-    dst->policies[dst->policy_count] = *src_cp;
+    struct crypto_policy cp = *src_cp;
+    uint8_t used[256];
+    collect_used_wire_ids(dst, used);
+    int wid = cp.id;
+    if (wid < 1 || wid > 255 || used[(size_t)wid]) {
+        int found = -1;
+        for (int j = 1; j <= 255; j++) {
+            if (!used[(size_t)j]) {
+                found = j;
+                break;
+            }
+        }
+        if (found < 0)
+            return -1;
+        cp.id = found;
+    }
+
+    dst->policies[dst->policy_count] = cp;
     return dst->policy_count++;
 }
 
@@ -234,6 +248,7 @@ static int merge_one_config(struct app_config *dst, const struct app_config *src
 }
 
 int build_merged_config(struct app_config *out_cfg, const int *ids, int id_count, const char *db_pass) {
+    (void)db_pass;
     struct app_config merged;
     memset(&merged, 0, sizeof(merged));
     strncpy(merged.bpf_file, "bpf/xdp_redirect.o", sizeof(merged.bpf_file) - 1);
@@ -243,14 +258,22 @@ int build_merged_config(struct app_config *out_cfg, const int *ids, int id_count
 
     for (int i = 0; i < id_count; i++) {
         struct app_config tmp;
-        if (config_load_from_db(&tmp, ids[i], db_pass) != 0)
+        if (config_load_from_db(&tmp, ids[i], NULL) != 0)
             return -1;
         if (merge_one_config(&merged, &tmp) != 0)
             return -1;
     }
 
-    if (app_config_apply_crypto_from_policies(&merged) != 0)
-        return -1;
+    merged.crypto_enabled = (merged.policy_count > 0) ? 1 : 0;
+    if (merged.crypto_enabled) {
+        merged.encrypt_layer = 3;
+        merged.fake_protocol = 99;
+        merged.fake_ethertype_ipv4 = 0x88b5;
+        merged.crypto_mode = merged.policies[0].crypto_mode;
+        merged.aes_bits = merged.policies[0].aes_bits;
+        merged.nonce_size = merged.policies[0].nonce_size;
+        memcpy(merged.crypto_key, merged.policies[0].key, sizeof(merged.crypto_key));
+    }
 
     if (config_validate(&merged) != 0)
         return -1;

@@ -65,8 +65,7 @@ int interface_init_wan(struct xsk_interface *iface,
 int interface_init_wan_rx(struct xsk_interface *iface,
                           const struct wan_config *wan_cfg,
                           const char *bpf_file,
-                          uint16_t fake_ethertype_ipv4,
-                          uint16_t fake_ethertype_ipv6);
+                          uint16_t fake_ethertype_ipv4);
 
 void interface_cleanup(struct xsk_interface *iface);
 

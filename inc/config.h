@@ -4,6 +4,17 @@
 #include <stdint.h>
 #include <net/if.h>
 
+/* Bridge deployment: WAN has no dst_ip; MAC learn + transparent WAN L2. */
+#ifndef NE_BRIDGE_MODE
+#define NE_BRIDGE_MODE 1
+#endif
+
+#if NE_BRIDGE_MODE
+#define NE_USE_ARP_MAC_FORWARD 0
+#else
+#define NE_USE_ARP_MAC_FORWARD 1
+#endif
+
 #define MAX_INTERFACES 16
 #define MAC_LEN 6
 #define AES_KEY_LEN 32
@@ -20,7 +31,6 @@
 #define DEFAULT_RING_SIZE       262144
 #define DEFAULT_RING_SIZE_WAN   32768
 #define WAN_REORDER_WINDOW_KB   10240
-/* NIC RX is forced to one queue (ethtool); that queue is always index 0. AF_XDP/XDP use it only. */
 #define FORWARDER_XSK_QUEUE_ID      0
 #define FORWARDER_XSK_QUEUE_COUNT   1
 #define DEFAULT_QUEUE_COUNT         FORWARDER_XSK_QUEUE_COUNT
@@ -29,25 +39,8 @@
 #define MAX_CRYPTO_POLICIES 128
 #define POLICY_PROTO_ANY 0
 
-/*
- * When 1: crypto policy match and selection use src/dst IP only (CIDR rows in
- * xdp_profile_crypto_policy_matches). Port ranges in the DB are ignored for
- * matching; keep src_port and dst_port as ANY so the schema matches runtime.
- * Layer (bypass / L2 / L3 / L4) and keys come from the winning policy row for
- * that IP pair. A non-ANY protocol column still must match the packet (so
- * separate UDP vs TCP rows for the same IPs work). Set to 0 to restore full
- * port + protocol filtering (including port ranges in match).
- */
 #ifndef CRYPTO_POLICY_MATCH_IP_ONLY
-#define CRYPTO_POLICY_MATCH_IP_ONLY 1
-#endif
-
-/*
- * When 1: flows that match no policy row are still forwarded to WAN (cleartext).
- * When 0: those packets are dropped whenever policy_count > 0 (strict matrix).
- */
-#ifndef CRYPTO_POLICY_PASS_UNMATCHED
-#define CRYPTO_POLICY_PASS_UNMATCHED 1
+#define CRYPTO_POLICY_MATCH_IP_ONLY 0
 #endif
 
 enum policy_action {
@@ -110,7 +103,7 @@ struct local_config {
 
 struct wan_config {
     char ifname[IF_NAMESIZE];
-    uint32_t dst_ip;
+    uint32_t dst_ip;      
     uint8_t src_mac[MAC_LEN];
     uint8_t dst_mac[MAC_LEN];
     uint32_t window_size;
@@ -138,7 +131,6 @@ struct app_config {
     uint8_t crypto_key[AES_KEY_LEN];
     int encrypt_layer;
     uint16_t fake_ethertype_ipv4;
-    uint16_t fake_ethertype_ipv6;
     uint8_t fake_protocol;
     int crypto_mode;
     int nonce_size;
@@ -152,6 +144,7 @@ struct app_config {
 int parse_mac(const char *str, uint8_t *mac);
 int parse_ip_cidr_pub(const char *str, uint32_t *ip, uint32_t *netmask, uint32_t *network);
 int parse_hex_bytes_pub(const char *str, uint8_t *out, int expected_len);
+int config_find_local_for_ip(struct app_config *cfg, uint32_t dest_ip);
 int config_validate(struct app_config *cfg);
 int config_select_profile_for_local(const struct app_config *cfg, int local_idx);
 int config_select_profile_for_wan(const struct app_config *cfg, int wan_idx);

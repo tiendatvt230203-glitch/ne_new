@@ -1,10 +1,12 @@
 #define _POSIX_C_SOURCE 199309L
 #include "../../inc/flow_table.h"
 #include <arpa/inet.h>
-#include <netinet/in.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <stdatomic.h>
+
+static _Atomic uint64_t g_pkt_wrr_seq;
 
 static inline void normalize_flow_5tuple(uint32_t *src_ip, uint32_t *dst_ip,
                                          uint16_t *src_port, uint16_t *dst_port) {
@@ -70,6 +72,7 @@ static uint64_t get_time_sec(void) {
 
 void flow_table_init(struct flow_table *ft, const uint32_t *wan_window_sizes, int wan_count) {
     memset(ft, 0, sizeof(*ft));
+    atomic_store(&g_pkt_wrr_seq, 0);
     ft->wan_count = wan_count;
     for (int i = 0; i < MAX_INTERFACES; i++) {
         if (wan_window_sizes)
@@ -110,10 +113,6 @@ static int get_next_wan(int wan_count) {
     return wan;
 }
 
-static int flow_entry_tcp_stick_one_wan(const struct flow_entry *e) {
-    return e && e->key.protocol == (uint8_t)IPPROTO_TCP;
-}
-
 int flow_table_get_wan(struct flow_table *ft,
                        uint32_t src_ip, uint32_t dst_ip,
                        uint16_t src_port, uint16_t dst_port,
@@ -140,7 +139,7 @@ int flow_table_get_wan(struct flow_table *ft,
                 cur_limit = ft->wan_window_sizes[entry->current_wan];
 
 
-            if (!flow_entry_tcp_stick_one_wan(entry) && cur_limit > 0 && entry->byte_count >= cur_limit) {
+            if (cur_limit > 0 && entry->byte_count >= cur_limit) {
                 entry->byte_count = 0;
                 entry->current_wan = (entry->current_wan + 1) % ft->wan_count;
             }
@@ -212,6 +211,22 @@ static int wrr_slot_to_wan(int slot, const int *allowed_wans, const int *allowed
             return allowed_wans[i];
     }
     return allowed_wans[allowed_count - 1];
+}
+
+int flow_table_pick_wan_per_packet(const int *allowed_wans,
+                                   const int *allowed_weights,
+                                   int allowed_count) {
+    if (!allowed_wans || allowed_count <= 0)
+        return 0;
+    if (allowed_count == 1)
+        return allowed_wans[0];
+
+    int sumw = weights_sum_positive(allowed_weights, allowed_count);
+    uint64_t n = atomic_fetch_add(&g_pkt_wrr_seq, 1);
+    if (sumw > 0 && allowed_weights)
+        return wrr_slot_to_wan((int)(n % (uint64_t)sumw), allowed_wans, allowed_weights,
+                               allowed_count, sumw);
+    return allowed_wans[n % (uint64_t)allowed_count];
 }
 
 int flow_table_get_wan_profile(struct flow_table *ft,

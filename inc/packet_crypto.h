@@ -15,7 +15,6 @@
 #define ETH_HEADER_SIZE       14
 
 #define PROTO_FLAG_IPV4  0
-#define PROTO_FLAG_IPV6  1
 
 #define KEY_SLOT_PREV    0
 #define KEY_SLOT_CURRENT 1
@@ -48,39 +47,26 @@ int packet_decrypt(struct packet_crypto_ctx *ctx,
 
 void packet_crypto_cleanup(struct packet_crypto_ctx *ctx);
 
-void packet_crypto_set_ethertype(uint16_t fake_ipv4, uint16_t fake_ipv6);
+void packet_crypto_set_fake_ethertype(uint16_t fake_ipv4);
 uint16_t packet_crypto_get_fake_ethertype_ipv4(void);
-uint16_t packet_crypto_get_fake_ethertype_ipv6(void);
-
-/* NE L2-on-wire: default fake EtherType when DB/config leaves ipv4 field unset (high byte 0x88). */
-#ifndef NE_DEFAULT_FAKE_ETHERTYPE_IPV4
-#define NE_DEFAULT_FAKE_ETHERTYPE_IPV4 0x88B5u
-#endif
 
 void packet_crypto_set_fake_protocol(uint8_t proto);
 uint8_t packet_crypto_get_fake_protocol(void);
 
 
-void packet_crypto_set_policy_wire_u32(uint32_t policy_id);
-uint32_t packet_crypto_get_policy_wire_u32(void);
-
-/* L3 RX: after policy_id match, if policy row protocol is tcp/udp, use it for IPv4 next-header (not only tunnel byte). */
-void packet_crypto_set_l3_restore_ipproto_from_db(uint8_t proto);
-uint8_t packet_crypto_get_l3_restore_ipproto_from_db(void);
+void packet_crypto_set_policy_id(uint8_t policy_id);
+uint8_t packet_crypto_get_policy_id(void);
 
 #define AES128_GCM_TAG_SIZE  16
-
-/* DB policy id (e.g. 420) on wire as 4-byte big-endian after nonce (L3/L4 tunnel). */
-#define NE_WIRE_POLICY_U32 4
 
 int packet_crypto_get_tunnel_hdr_size(void);
 
 void crypto_write_l3_tunnel_header(uint8_t *buf, const uint8_t *nonce,
-                                    int nonce_size, uint32_t policy_wire_host,
+                                    int nonce_size, uint8_t policy_id,
                                     uint8_t orig_proto);
 void crypto_read_l3_tunnel_header(const uint8_t *buf, int nonce_size,
                                    uint8_t *nonce_out, uint8_t *proto_flag,
-                                   uint32_t *policy_id_out, uint8_t *orig_proto);
+                                   uint8_t *policy_id, uint8_t *orig_proto);
 
 void packet_crypto_set_encrypt_layer(int layer);
 
@@ -114,12 +100,11 @@ int crypto_aes_ctr_with_key(const uint8_t key[AES_MAX_KEY_SIZE],
                             uint8_t *data, int len);
 
 void crypto_write_counter(uint8_t *packet, const uint8_t *nonce,
-                          int nonce_size, uint8_t marker_byte, uint32_t policy_wire_host);
+                          int nonce_size, uint8_t marker_byte, uint8_t policy_id);
 void crypto_read_counter(const uint8_t *packet, int nonce_size,
-                         uint8_t *nonce_out, uint32_t *policy_id_out, uint8_t *proto_flag);
+                         uint8_t *nonce_out, uint8_t *policy_id, uint8_t *proto_flag);
 
 void crypto_restore_ipv4_header(uint8_t *packet, size_t pkt_len);
-void crypto_restore_ipv6_header(uint8_t *packet, size_t pkt_len);
 
 uint16_t crypto_calc_ip_checksum(const uint8_t *ip_hdr, int hdr_len);
 

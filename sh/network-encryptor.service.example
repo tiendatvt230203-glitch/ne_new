@@ -1,0 +1,38 @@
+# Example systemd unit — copy to /etc/systemd/system/network-encryptor.service
+#
+# Behaviour (same as ./bin/network-encryptor):
+#   systemctl restart network-encryptor  -> idle [WAIT], no XDP until -id
+#   /path/to/network-encryptor -id 30    -> load profile (must run as same User=)
+#
+# Do NOT pass -id in ExecStart if you want idle-on-restart.
+
+[Unit]
+Description=Network Encryptor daemon
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sep
+Group=sep
+WorkingDirectory=/home/sep/network-encryptor
+ExecStart=/home/sep/network-encryptor/bin/network-encryptor
+Restart=on-failure
+RestartSec=3
+
+# Same .env path as binary (NE_ENV_FILE in inc/db_env.h)
+EnvironmentFile=-/opt/SEP/be/.env
+
+# XDP/BPF needs these (adjust if your install uses capabilities instead)
+AmbientCapabilities=CAP_NET_ADMIN CAP_BPF CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_BPF CAP_SYS_ADMIN
+
+# IMPORTANT: do not enable PrivateTmp — breaks control socket if client uses host /tmp
+PrivateTmp=no
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=network-encryptor
+
+[Install]
+WantedBy=multi-user.target

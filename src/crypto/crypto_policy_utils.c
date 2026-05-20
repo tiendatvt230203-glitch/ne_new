@@ -12,7 +12,7 @@ void crypto_apply_default_from_cfg(const struct app_config *cfg) {
     packet_crypto_set_nonce_size(cfg->nonce_size);
     if (cfg->encrypt_layer == 3)
         packet_crypto_set_fake_protocol((uint8_t)(cfg->fake_protocol & 0xFF));
-    packet_crypto_set_policy_wire_u32(0);
+    packet_crypto_set_policy_id(0);
 
     packet_crypto_set_encrypt_layer(cfg->encrypt_layer);
 }
@@ -37,7 +37,7 @@ void crypto_apply_from_policy(const struct crypto_policy *cp) {
         uint8_t fp = packet_crypto_get_fake_protocol();
         packet_crypto_set_fake_protocol(fp ? fp : 99);
     }
-    packet_crypto_set_policy_wire_u32((uint32_t)cp->id);
+    packet_crypto_set_policy_id((uint8_t)cp->id);
 }
 
 const struct crypto_policy *crypto_select_policy_for_local(const struct app_config *cfg,
@@ -57,4 +57,3 @@ const struct crypto_policy *crypto_select_policy_for_local(const struct app_conf
     return config_select_crypto_policy(
         (struct app_config *)cfg, pi, src_ip, dst_ip, src_port, dst_port, protocol);
 }
-

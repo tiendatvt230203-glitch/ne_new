@@ -3,14 +3,13 @@
 #include "../../inc/flow_table.h"
 #include "../../inc/config.h"
 #include "../../inc/crypto_layer2.h"
-#include "../../inc/ne_l2_trace.h"
-#include "../../inc/ne_agent_dbg.h"
 #include "../../inc/crypto_layer3.h"
 #include "../../inc/crypto_layer4.h"
+#include "../../inc/wan_arp.h"
+#include "../../inc/bridge_mac.h"
 #include "../../inc/crypto_policy_utils.h"
 #include "../../inc/crypto_dispatch.h"
 #include "../../inc/fragment.h"
-#include <signal.h>
 #include <poll.h>
 #include <pthread.h>
 #include <sched.h>
@@ -24,15 +23,12 @@
 #include <netinet/if_ether.h>
 #include <netpacket/packet.h>
 #include <sys/ioctl.h>
-#include <sys/wait.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <net/if_arp.h>
 #include <netinet/if_ether.h>
 #include <arpa/inet.h>
-#include <errno.h>
 #include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
 #include <stdatomic.h>
 
 void forwarder_pin_cpu(void) {
@@ -55,24 +51,23 @@ static struct flow_table g_flow_table;
 static struct frag_table g_wan_frag_l2;
 static struct frag_table g_wan_frag_l3;
 static struct frag_table g_wan_frag_l4;
-/* enp7/enp8 WAN RX threads share g_wan_frag_l2 — must serialize reasm + gc */
 static pthread_mutex_t g_wan_frag_l2_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_wan_frag_l3_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_wan_frag_l4_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static struct packet_crypto_ctx g_policy_crypto_ctx[MAX_CRYPTO_POLICIES];
 static int g_policy_crypto_ctx_ready[MAX_CRYPTO_POLICIES];
+static int g_policy_index_by_action_id[POLICY_ACTION_ENCRYPT_L4 + 1][256];
 static struct crypto_policy g_active_policies[MAX_CRYPTO_POLICIES];
 static int g_active_policy_count = 0;
 static struct packet_crypto_ctx g_prev_policy_crypto_ctx[MAX_CRYPTO_POLICIES];
 static int g_prev_policy_crypto_ctx_ready[MAX_CRYPTO_POLICIES];
+static int g_prev_policy_index_by_action_id[POLICY_ACTION_ENCRYPT_L4 + 1][256];
 static struct crypto_policy g_prev_policies[MAX_CRYPTO_POLICIES];
 static int g_prev_policy_count = 0;
 static uint64_t g_prev_policy_grace_until_ms = 0;
 #define POLICY_RELOAD_GRACE_MS 60000ULL
-static uint64_t g_profile_hits[MAX_PROFILES];
-static uint64_t g_profile_miss_hits;
-static uint64_t g_profile_log_seq;
 static int g_tcp_diag_enabled = 0;
-static int g_tcp_diag_all_tcp = 0;
 
 
 static struct app_config *g_cfg_ptr = NULL;
@@ -109,95 +104,6 @@ static uint64_t monotonic_ms(void) {
 
 static int is_ssh_flow(uint8_t protocol, uint16_t src_port, uint16_t dst_port) {
     return (protocol == IPPROTO_TCP) && (src_port == 22 || dst_port == 22);
-}
-
-static int tcp_diag_want_log(uint8_t protocol, uint16_t src_port, uint16_t dst_port) {
-    if (!g_tcp_diag_enabled)
-        return 0;
-    if (g_tcp_diag_all_tcp)
-        return (protocol == IPPROTO_TCP);
-    return is_ssh_flow(protocol, src_port, dst_port);
-}
-
-/* Defaults match former NE_TCP_DIAG=1 NE_TCP_DIAG_ALL_TCP=1. Opt-out: NE_TCP_DIAG=0;
- * restrict to SSH-only logs: NE_TCP_DIAG_ALL_TCP=0. */
-static int tcp_diag_env_is_off(const char *v) {
-    return v && v[0] == '0' && v[1] == '\0';
-}
-
-static void forwarder_tcp_diag_print_ssh_hypothesis_banner(void);
-
-static void forwarder_tcp_diag_apply_env(void) {
-    const char *diag = getenv("NE_TCP_DIAG");
-    g_tcp_diag_enabled = tcp_diag_env_is_off(diag) ? 0 : 1;
-
-    const char *all_tcp = getenv("NE_TCP_DIAG_ALL_TCP");
-    if (!g_tcp_diag_enabled)
-        g_tcp_diag_all_tcp = 0;
-    else
-        g_tcp_diag_all_tcp = tcp_diag_env_is_off(all_tcp) ? 0 : 1;
-
-    if (g_tcp_diag_enabled) {
-        fprintf(stderr, "[TCP-DIAG] on (default all TCP; NE_TCP_DIAG=0 off, NE_TCP_DIAG_ALL_TCP=0 SSH-only)\n");
-        fprintf(stderr,
-                "[NE-RX] CLASS=... ; [NE-CHAIN] root=... tren cung dong NE-RX/NE-TX de biet: "
-                "khong_toi_local vs sai_sau_ma_hoa_giai_ma_reasm vs loi_TX\n");
-        fprintf(stderr,
-                "[TCP-DIAG] WAN RX: moi goi nhan tren WAN in [NE-RX][RX_PKT]; decrypt OK/err xem "
-                "[TCP-DIAG] RX-DEC-OK / RX-*FAIL va [NE-RX][CLASS=RX_*]. Im lang != client khong nhan — "
-                "truoc day enc_l3 (fake proto) bi loc khoi log; gio khong loc RX_PKT/CLASS theo tuple wire.\n");
-        forwarder_tcp_diag_print_ssh_hypothesis_banner();
-    }
-}
-
-/* Tat ca gia thuyet SSH/TCP bat tay (trong pham vi NE) — grep [NE-HYP] */
-static void forwarder_tcp_diag_print_ssh_hypothesis_banner(void) {
-    fprintf(stderr,
-            "[NE-HYP] ===== CHECKLIST: SSH khong bat tay — loai tru theo log (tim dung nguyen nhan roi debug) "
-            "=====\n");
-    fprintf(stderr,
-            "[NE-HYP] H01_TX_STRICT_NO_POLICY: log [NE-TX] TX_NO_CRYPTO_POLICY_DROP hoac TX-SELECT cp=NULL + "
-            "policy_count>0 (strict matrix)\n");
-    fprintf(stderr,
-            "[NE-HYP] H02_TX_POLICY_BYPASS_WRONG: TX-SELECT bypass=1 nhung van mong enc — policy sai action\n");
-    fprintf(stderr,
-            "[NE-HYP] H03_TX_ENCRYPT_L2L3L4_FAIL: [NE-TX] TX_L2/L3/L4_ENCRYPT_FAIL hoac TX_*SPLIT_ENCRYPT_FAIL — "
-            "key, IV/nonce, buffer, layer khac RX\n");
-    fprintf(stderr,
-            "[NE-HYP] H04_TX_WAN_QUEUE_REJECT: [NE-TX] TX_WAN_SEND_FAIL / TX_BYPASS_WAN_SEND_FAIL — XSK TX day, "
-            "NIC\n");
-    fprintf(stderr,
-            "[NE-HYP] H05_TX_WORKER_RING_FULL: [NE-TX] TX_WORKER_RING_FULL — vong local->worker day, SYN drop "
-            "truoc ma hoa\n");
-    fprintf(stderr,
-            "[NE-HYP] H06_RX_WAN_DECRYPT_FAIL: [NE-RX] RX_L2_WAN_DECRYPT / RX_L2_MARKER / RX_L3/L4_*DECRYPT* — "
-            "key/policy id khac TX hoac wire khong phai cipher NE\n");
-    fprintf(stderr,
-            "[NE-HYP] H07_RX_REASSEMBLE_FAIL: [NE-RX] RX_*REASSEMBLE_FAIL — mat manh, ID fragment lech hai dau\n");
-    fprintf(stderr,
-            "[NE-HYP] H08_RX_BAD_PLAINTEXT: [NE-RX] POST_DECRYPT_* / TO_LOCAL_IPV4_SHAPE — mo xong nhung IPv4/TCP "
-            "vo ly\n");
-    fprintf(stderr,
-            "[NE-HYP] H09_RX_NO_DELIVERY_LOCAL: [NE-RX] RX_DST_MAC_NO_LOCAL / RX_LOCAL_INJECT — MAC dich, bang "
-            "MAC, AF_XDP toi local\n");
-    fprintf(stderr,
-            "[NE-HYP] H10_MATRIX_PEER_SQL_SAI: matrix vs peer SQL doi nguoc — policy_id/decrypt ctx khac may kia\n");
-    fprintf(stderr,
-            "[NE-HYP] H11_MULTI_WAN_ASYM: TX-SSH-TX-PRE wan# khac duong RX — mat goi hoac sai thu tu (profile/WRR)\n");
-    fprintf(stderr,
-            "[NE-HYP] H12_FRAG_PENDING_OR_MTU: tren wire co fragment nhung khong du manh — MTU/PMTU, timeout "
-            "reasm\n");
-    fprintf(stderr,
-            "[NE-HYP] H13_IP_ONLY_POLICY_PORTS: CRYPTO_POLICY_MATCH_IP_ONLY — port policy khong dung de match\n");
-    fprintf(stderr,
-            "[NE-HYP] H14_TCP_PIN_POLICY: tcp_policy_pin lech policy sau reload — grace / pin vs CIDR\n");
-    fprintf(stderr,
-            "[NE-HYP] H15_KHONG_PHAI_NE: tcpdump end-to-end; neu khong co [NE-TX]/[NE-RX] tuong ung flow thi "
-            "ngoai NE\n");
-    fprintf(stderr,
-            "[NE-HYP] Doc [NE-CHAIN] root= tren dong NE-RX/NE-TX de gom nhanh: NO_DELIVERY vs BAD_PLAINTEXT vs "
-            "RX_DECRYPT vs TX_*\n");
-    fprintf(stderr, "[NE-HYP] ===== het checklist =====\n");
 }
 
 static const char *policy_action_name(int action) {
@@ -281,185 +187,6 @@ static void log_tcp_diag_decrypt_len(const char *tag,
             (unsigned)post_sport, (unsigned)post_dport);
 }
 
-/* Classify WAN→stack failures: wrong decrypt, bad reassembly, or cleartext shape after NE. */
-static int ne_rx_ipv4_frame_plausible(const uint8_t *pkt, uint32_t len) {
-    int l3 = crypto_eth_ipv4_offset(pkt, len);
-    if (l3 < 0 || (uint32_t)(l3 + 20) > len)
-        return 0;
-    const struct iphdr *ip = (const struct iphdr *)(pkt + (unsigned)l3);
-    if (ip->version != 4)
-        return 0;
-    uint32_t tot = (uint32_t)ntohs(ip->tot_len);
-    if (tot < 20u || (uint32_t)l3 + tot > len)
-        return 0;
-    int ihl = (int)ip->ihl * 4;
-    if (ihl < 20 || (uint32_t)l3 + (uint32_t)ihl > len)
-        return 0;
-    if (ip->protocol == IPPROTO_TCP) {
-        if ((uint32_t)l3 + (uint32_t)ihl + 20u > len)
-            return 0;
-    }
-    return 1;
-}
-
-/* Handshake-oriented: map CLASS -> one root cause + what to verify next (VN). */
-static void ne_chain_append_rx(const char *klass) {
-    const char *root = "RX_OTHER";
-    const char *vi = "Xem CLASS trong dong log.";
-    if (!klass)
-        klass = "";
-    if (strncmp(klass, "RX_DST_MAC", 10) == 0 || strncmp(klass, "RX_LOCAL_INJECT", 15) == 0) {
-        root = "NO_DELIVERY_TO_LOCAL_TCP";
-        vi = "Khong day duoc goi vao stack TCP local (MAC dich / bridge / hang doi AF_XDP). "
-             "Day KHONG phai loi ma hoa tren duong WAN den peer.";
-    } else if (strstr(klass, "POST_DECRYPT") != NULL || strstr(klass, "TO_LOCAL_IPV4_SHAPE") != NULL) {
-        root = "BAD_PLAINTEXT_AFTER_DECRYPT";
-        vi = "Giai ma xong nhung IPv4/TCP sai kich thuoc hoac parse fail: doi chieu policy+key+layer "
-             "voi TX va kiem tra reasm.";
-    } else if (strstr(klass, "DECRYPT") != NULL || strstr(klass, "REASSEMBLE") != NULL ||
-               strstr(klass, "_CTX") != NULL) {
-        root = "RX_DECRYPT_REASM_OR_KEY";
-        vi = "Peer co the gui dung nhung NE mo sai hoac rap manh sai: doi chieu TX (layer L2/L3/L4, "
-             "key, policy id) va trace fragment.";
-    }
-    fprintf(stderr, " [NE-CHAIN] root=%s vi=\"%s\"", root, vi);
-}
-
-static void ne_chain_append_tx(const char *klass) {
-    const char *root = "TX_OTHER";
-    const char *vi = "Xem CLASS trong dong log.";
-    if (!klass)
-        klass = "";
-    if (strstr(klass, "WORKER_RING") != NULL) {
-        root = "TX_WORKER_BACKPRESSURE";
-        vi = "Vong local->worker day: SYN co the bi drop truoc ma hoa — tang WORKER_RING_SIZE hoac giam tai.";
-    } else if (strstr(klass, "ENCRYPT") != NULL || strstr(klass, "SPLIT") != NULL) {
-        root = "TX_ENCRYPT_PIPELINE_FAIL";
-        vi = "Ma hoa that bai: peer thuong im hoac RST — debug policy, layer, buffer truoc khi nghi RX.";
-    } else if (strstr(klass, "NO_CRYPTO_POLICY") != NULL) {
-        root = "TX_POLICY_DROP";
-        vi = "Strict mode: khong policy khop — goi khong thanh cipher gui di, peer khong thay ban tin hop le.";
-    } else if (strstr(klass, "WAN_SEND") != NULL || strstr(klass, "BYPASS_WAN") != NULL) {
-        root = "TX_WAN_SEND_OR_QUEUE";
-        vi = "Ma hoa (hoac bypass) xong nhung khong day len WAN: hang doi XSK / NIC.";
-    }
-    fprintf(stderr, " [NE-CHAIN] root=%s vi=\"%s\"", root, vi);
-}
-
-static void ne_rx_class_log(const char *klass,
-                            const char *wan_if,
-                            int wan_idx,
-                            const char *phase,
-                            const char *why,
-                            uint32_t wire_len,
-                            int wire_have_flow,
-                            uint32_t sip,
-                            uint16_t sport,
-                            uint32_t dip,
-                            uint16_t dport,
-                            uint8_t proto,
-                            const char *detail) {
-    if (ne_l2_trace_enabled())
-        return;
-    if (!g_tcp_diag_enabled)
-        return;
-    /* Do not gate on tcp_diag_want_log(wire tuple): enc_l3 wire uses fake IP
-     * proto (e.g. 99), so SSH never "looks like" SSH on wire and errors were
-     * invisible. */
-    fprintf(stderr, "[NE-RX][CLASS=%s][wan=%s#%d][phase=%s] why=%s",
-            klass, wan_if && wan_if[0] ? wan_if : "?", wan_idx,
-            phase && phase[0] ? phase : "-", why && why[0] ? why : "-");
-    if (wire_have_flow) {
-        char a[INET_ADDRSTRLEN], b[INET_ADDRSTRLEN];
-        struct in_addr sa = { .s_addr = sip };
-        struct in_addr da = { .s_addr = dip };
-        if (inet_ntop(AF_INET, &sa, a, sizeof(a)) && inet_ntop(AF_INET, &da, b, sizeof(b)))
-            fprintf(stderr, " %s:%u->%s:%u proto=%u", a, (unsigned)sport, b, (unsigned)dport, (unsigned)proto);
-        else
-            fprintf(stderr, " flow=(ntop_fail)");
-    } else {
-        fprintf(stderr, " flow=(wire_parse_fail)");
-    }
-    fprintf(stderr, " wire_len=%u", (unsigned)wire_len);
-    if (detail && detail[0])
-        fprintf(stderr, " %s", detail);
-    ne_chain_append_rx(klass);
-    fprintf(stderr, "\n");
-}
-
-static void ne_rx_pkt_recv_log(const struct xsk_interface *wan,
-                               int wan_idx,
-                               const uint8_t *pkt,
-                               uint32_t pkt_len,
-                               int wire_have_flow,
-                               uint32_t sip,
-                               uint16_t sport,
-                               uint32_t dip,
-                               uint16_t dport,
-                               uint8_t proto) {
-    if (!g_tcp_diag_enabled)
-        return;
-    /* Log every WAN frame when diag is on; wire tuple is often not TCP/22
-     * under enc_l3 (fake protocol), so SSH-only filtering hid all RX_PKT. */
-    unsigned eth = 0;
-    if (pkt && pkt_len >= 14)
-        eth = ((unsigned)pkt[12] << 8) | pkt[13];
-    fprintf(stderr,
-            "[NE-RX][RX_PKT][wan=%s#%d] len=%u ethertype=0x%04x",
-            wan && wan->ifname[0] ? wan->ifname : "?", wan_idx, (unsigned)pkt_len, eth);
-    if (wire_have_flow) {
-        char a[INET_ADDRSTRLEN], b[INET_ADDRSTRLEN];
-        struct in_addr sa = { .s_addr = sip };
-        struct in_addr da = { .s_addr = dip };
-        if (inet_ntop(AF_INET, &sa, a, sizeof(a)) && inet_ntop(AF_INET, &da, b, sizeof(b)))
-            fprintf(stderr, " %s:%u->%s:%u proto=%u", a, (unsigned)sport, b, (unsigned)dport, (unsigned)proto);
-    } else {
-        fprintf(stderr, " flow=(unparsed_on_wire)");
-    }
-    fprintf(stderr,
-            " | if_peer_silent_suspect_NE_TX | if_peer_replies_gibberish_suspect_NE_RX_decrypt_reasm"
-            " [NE-CHAIN] root=RX_PKT_OBSERVE next=neu_co_NE-RX_CLASS_thi_do_theo_root_cua_CLASS\n");
-}
-
-static void ne_tx_class_log(const char *klass,
-                            const char *path,
-                            const char *why,
-                            int local_idx,
-                            const char *wan_if,
-                            int wan_idx,
-                            int flow_ok,
-                            uint32_t sip,
-                            uint16_t sport,
-                            uint32_t dip,
-                            uint16_t dport,
-                            uint8_t proto,
-                            uint32_t len,
-                            const char *detail) {
-    if (ne_l2_trace_enabled())
-        return;
-    if (!g_tcp_diag_enabled)
-        return;
-    if (flow_ok && !tcp_diag_want_log(proto, sport, dport))
-        return;
-    fprintf(stderr, "[NE-TX][CLASS=%s][path=%s][local=%d][wan=%s#%d] why=%s",
-            klass, path && path[0] ? path : "-", local_idx,
-            wan_if && wan_if[0] ? wan_if : "?", wan_idx,
-            why && why[0] ? why : "-");
-    if (flow_ok) {
-        char a[INET_ADDRSTRLEN], b[INET_ADDRSTRLEN];
-        struct in_addr sa = { .s_addr = sip };
-        struct in_addr da = { .s_addr = dip };
-        if (inet_ntop(AF_INET, &sa, a, sizeof(a)) && inet_ntop(AF_INET, &da, b, sizeof(b)))
-            fprintf(stderr, " %s:%u->%s:%u proto=%u", a, (unsigned)sport, b, (unsigned)dport, (unsigned)proto);
-    } else
-        fprintf(stderr, " flow=(unparsed)");
-    fprintf(stderr, " len=%u", (unsigned)len);
-    if (detail && detail[0])
-        fprintf(stderr, " %s", detail);
-    ne_chain_append_tx(klass);
-    fprintf(stderr, " | TX_path_peer_may_be_silent\n");
-}
-
 static int prev_policy_grace_active(void) {
     if (g_prev_policy_count <= 0)
         return 0;
@@ -467,31 +194,6 @@ static int prev_policy_grace_active(void) {
     if (now == 0 || g_prev_policy_grace_until_ms == 0)
         return 0;
     return now <= g_prev_policy_grace_until_ms;
-}
-
-static int fwd_pi_for_action_wire(const struct forwarder *fwd, int action, uint32_t wire_pid) {
-    if (!fwd || !fwd->cfg)
-        return -1;
-    for (int pi = 0; pi < fwd->cfg->policy_count && pi < MAX_CRYPTO_POLICIES; pi++) {
-        if (!g_policy_crypto_ctx_ready[pi])
-            continue;
-        const struct crypto_policy *cp = &fwd->cfg->policies[pi];
-        if (cp->action == action && (uint32_t)cp->id == wire_pid)
-            return pi;
-    }
-    return -1;
-}
-
-static int fwd_prev_pi_for_action_wire(int action, uint32_t wire_pid) {
-    if (!prev_policy_grace_active())
-        return -1;
-    for (int ppi = 0; ppi < g_prev_policy_count && ppi < MAX_CRYPTO_POLICIES; ppi++) {
-        if (!g_prev_policy_crypto_ctx_ready[ppi])
-            continue;
-        if (g_prev_policies[ppi].action == action && (uint32_t)g_prev_policies[ppi].id == wire_pid)
-            return ppi;
-    }
-    return -1;
 }
 
 static int same_topology(const struct app_config *a, const struct app_config *b) {
@@ -580,6 +282,10 @@ static int rebuild_crypto_runtime(const struct app_config *cfg, int *has_encrypt
     memcpy(old_policies, g_active_policies, sizeof(old_policies));
 
     memset(g_policy_crypto_ctx_ready, 0, sizeof(g_policy_crypto_ctx_ready));
+    for (int a = 0; a <= POLICY_ACTION_ENCRYPT_L4; a++) {
+        for (int id = 0; id < 256; id++)
+            g_policy_index_by_action_id[a][id] = -1;
+    }
 
     for (int pi = 0; pi < cfg->policy_count && pi < MAX_CRYPTO_POLICIES; pi++) {
         const struct crypto_policy *cp = &cfg->policies[pi];
@@ -612,6 +318,11 @@ static int rebuild_crypto_runtime(const struct app_config *cfg, int *has_encrypt
                 continue;
             }
             g_policy_crypto_ctx_ready[pi] = 1;
+        }
+        if (cp->action >= 0 && cp->action <= POLICY_ACTION_ENCRYPT_L4) {
+            uint8_t pid = (uint8_t)cp->id;
+            if (g_policy_index_by_action_id[cp->action][pid] < 0)
+                g_policy_index_by_action_id[cp->action][pid] = pi;
         }
         if (cp->action == POLICY_ACTION_ENCRYPT_L2)
             has_encrypt_l2 = 1;
@@ -909,45 +620,6 @@ static int tcp_ipv4_tcp_flags(void *pkt_data, uint32_t pkt_len, uint8_t *flags_o
     return 0;
 }
 
-static void tcp_diag_flags_fmt(uint8_t f, char *buf, size_t buflen) {
-    size_t n = 0;
-    if (!buf || buflen < 8)
-        return;
-    buf[0] = '\0';
-    if (f & TH_FIN) {
-        int r = snprintf(buf + n, buflen - n, "%sFIN", n ? "," : "");
-        if (r > 0)
-            n += (size_t)r;
-    }
-    if (f & TH_SYN) {
-        int r = snprintf(buf + n, buflen - n, "%sSYN", n ? "," : "");
-        if (r > 0)
-            n += (size_t)r;
-    }
-    if (f & TH_RST) {
-        int r = snprintf(buf + n, buflen - n, "%sRST", n ? "," : "");
-        if (r > 0)
-            n += (size_t)r;
-    }
-    if (f & TH_PUSH) {
-        int r = snprintf(buf + n, buflen - n, "%sPSH", n ? "," : "");
-        if (r > 0)
-            n += (size_t)r;
-    }
-    if (f & TH_ACK) {
-        int r = snprintf(buf + n, buflen - n, "%sACK", n ? "," : "");
-        if (r > 0)
-            n += (size_t)r;
-    }
-    if (f & TH_URG) {
-        int r = snprintf(buf + n, buflen - n, "%sURG", n ? "," : "");
-        if (r > 0)
-            n += (size_t)r;
-    }
-    if (n == 0)
-        snprintf(buf, buflen, "0x%02x", (unsigned)f);
-}
-
 static int select_wan_idx_for_packet(struct forwarder *fwd,
                                      int local_idx,
                                      uint32_t src_ip, uint32_t dst_ip,
@@ -982,11 +654,7 @@ static int select_wan_idx_for_packet(struct forwarder *fwd,
                     return allowed[0];
                 if (n > 1) {
                     const int *wp = any_weight ? weights : NULL;
-                    return flow_table_get_wan_profile(&g_flow_table,
-                                                      src_ip, dst_ip,
-                                                      src_port, dst_port,
-                                                      protocol, pkt_len,
-                                                      allowed, n, wp);
+                    return flow_table_pick_wan_per_packet(allowed, wp, n);
                 }
             } else if (p->wan_count == 1) {
                 int wi = p->wan_indices[0];
@@ -1016,12 +684,12 @@ static const struct crypto_policy *select_crypto_policy_for_packet(struct forwar
 
 static int policy_index_from_action_id_current(const struct forwarder *fwd,
                                                int action_layer,
-                                               uint32_t policy_wire_id) {
+                                               uint8_t policy_id) {
     if (!fwd || !fwd->cfg)
         return -1;
     if (action_layer < 0 || action_layer > POLICY_ACTION_ENCRYPT_L4)
         return -1;
-    int pi = fwd_pi_for_action_wire(fwd, action_layer, policy_wire_id);
+    int pi = g_policy_index_by_action_id[action_layer][policy_id];
     if (pi < 0 || pi >= fwd->cfg->policy_count || pi >= MAX_CRYPTO_POLICIES)
         return -1;
     if (!g_policy_crypto_ctx_ready[pi])
@@ -1051,779 +719,42 @@ static int encrypt_packet_with_ctx(struct packet_crypto_ctx *ctx,
     return 0;
 }
 
+static struct arp_cache g_arp[MAX_INTERFACES];
+static struct arp_cache g_wan_arp[MAX_INTERFACES];
+static int g_arp_inited = 0;
 
-#define LOCAL_MAC_LEARN_MAX 2048
-#define LOCAL_MAC_AGE_MS    300000ULL
-
-struct local_mac_entry {
-    uint8_t mac[MAC_LEN];
-    int local_idx;
-    uint64_t last_seen_ms;
-    uint8_t valid;
-};
-
-static struct local_mac_entry g_local_mac_table[LOCAL_MAC_LEARN_MAX];
-static pthread_mutex_t g_local_mac_lock = PTHREAD_MUTEX_INITIALIZER;
-
-static inline int mac_is_zero(const uint8_t mac[MAC_LEN]) {
-    for (int i = 0; i < MAC_LEN; i++) {
-        if (mac[i] != 0)
-            return 0;
-    }
-    return 1;
-}
-
-static inline int mac_is_broadcast(const uint8_t mac[MAC_LEN]) {
-    for (int i = 0; i < MAC_LEN; i++) {
-        if (mac[i] != 0xFF)
-            return 0;
-    }
-    return 1;
-}
-
-static inline int mac_is_multicast(const uint8_t mac[MAC_LEN]) {
-    return (mac[0] & 0x01) != 0;
-}
-
-static inline uint32_t local_mac_hash(const uint8_t mac[MAC_LEN]) {
-    uint32_t h = 2166136261u;
-    for (int i = 0; i < MAC_LEN; i++) {
-        h ^= mac[i];
-        h *= 16777619u;
-    }
-    return h;
-}
-
-static void local_mac_learn(int local_idx, const uint8_t mac[MAC_LEN]) {
-    if (local_idx < 0 || local_idx >= MAX_INTERFACES || !mac)
-        return;
-    if (mac_is_zero(mac) || mac_is_broadcast(mac) || mac_is_multicast(mac))
-        return;
-
-    uint64_t now = monotonic_ms();
-    uint32_t start = local_mac_hash(mac) % LOCAL_MAC_LEARN_MAX;
-
-    pthread_mutex_lock(&g_local_mac_lock);
-    int free_slot = -1;
-    for (uint32_t step = 0; step < LOCAL_MAC_LEARN_MAX; step++) {
-        uint32_t idx = (start + step) % LOCAL_MAC_LEARN_MAX;
-        struct local_mac_entry *e = &g_local_mac_table[idx];
-        if (!e->valid) {
-            free_slot = (int)idx;
-            break;
-        }
-        if (memcmp(e->mac, mac, MAC_LEN) == 0) {
-            e->local_idx = local_idx;
-            e->last_seen_ms = now;
-            pthread_mutex_unlock(&g_local_mac_lock);
-            return;
-        }
-        if ((now > e->last_seen_ms) && ((now - e->last_seen_ms) > LOCAL_MAC_AGE_MS)) {
-            e->valid = 0;
-            free_slot = (int)idx;
-            break;
-        }
-    }
-    if (free_slot < 0)
-        free_slot = (int)start;
-
-    struct local_mac_entry *dst = &g_local_mac_table[free_slot];
-    memcpy(dst->mac, mac, MAC_LEN);
-    dst->local_idx = local_idx;
-    dst->last_seen_ms = now;
-    dst->valid = 1;
-    pthread_mutex_unlock(&g_local_mac_lock);
-}
-
-static int local_mac_lookup(const uint8_t mac[MAC_LEN]) {
-    if (!mac || mac_is_zero(mac) || mac_is_broadcast(mac) || mac_is_multicast(mac))
+static int set_wan_l2_addrs(struct forwarder *fwd, int wan_idx, uint8_t *pkt) {
+    if (!fwd || wan_idx < 0 || wan_idx >= fwd->wan_count)
         return -1;
-
-    uint64_t now = monotonic_ms();
-    uint32_t start = local_mac_hash(mac) % LOCAL_MAC_LEARN_MAX;
-
-    pthread_mutex_lock(&g_local_mac_lock);
-    for (uint32_t step = 0; step < LOCAL_MAC_LEARN_MAX; step++) {
-        uint32_t idx = (start + step) % LOCAL_MAC_LEARN_MAX;
-        struct local_mac_entry *e = &g_local_mac_table[idx];
-        if (!e->valid)
-            continue;
-        if (memcmp(e->mac, mac, MAC_LEN) == 0) {
-            if ((now > e->last_seen_ms) && ((now - e->last_seen_ms) > LOCAL_MAC_AGE_MS)) {
-                e->valid = 0;
-                break;
-            }
-            int out = e->local_idx;
-            pthread_mutex_unlock(&g_local_mac_lock);
-            return out;
-        }
-    }
-    pthread_mutex_unlock(&g_local_mac_lock);
-    return -1;
-}
-
-static void local_mac_log_iface_and_peer(const char *ifname, const uint8_t peer[MAC_LEN], uint8_t *store_src_mac);
-
-static pthread_mutex_t g_peer_dst_mac_mu = PTHREAD_MUTEX_INITIALIZER;
-
-static void apply_peer_dst_mac(struct forwarder *fwd, int local_idx, const uint8_t mac[MAC_LEN],
-                               const char *reason) {
-    if (!fwd || !fwd->cfg || !mac || local_idx < 0 || local_idx >= fwd->local_count)
-        return;
-    if (mac_is_zero(mac) || mac_is_broadcast(mac) || mac_is_multicast(mac))
-        return;
-
-    pthread_mutex_lock(&g_peer_dst_mac_mu);
-    if (memcmp(fwd->cfg->locals[local_idx].dst_mac, mac, MAC_LEN) == 0) {
-        pthread_mutex_unlock(&g_peer_dst_mac_mu);
-        return;
-    }
-    local_mac_learn(local_idx, mac);
-    memcpy(fwd->cfg->locals[local_idx].dst_mac, mac, MAC_LEN);
-    memcpy(fwd->locals[local_idx].dst_mac, mac, MAC_LEN);
-    pthread_mutex_unlock(&g_peer_dst_mac_mu);
-
-    fprintf(stderr,
-            "[LOCAL-MAC-LEARN][%s] local_if=%s peer=%02x:%02x:%02x:%02x:%02x:%02x\n",
-            reason ? reason : "?",
-            fwd->cfg->locals[local_idx].ifname,
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    local_mac_log_iface_and_peer(fwd->cfg->locals[local_idx].ifname, mac,
-                                 fwd->cfg->locals[local_idx].src_mac);
-}
-
-static void learn_local_src_mac(struct forwarder *fwd, int local_idx, const uint8_t *pkt,
-                                uint32_t pkt_len) {
-    if (!fwd || !pkt || pkt_len < sizeof(struct ether_header))
-        return;
-    const uint8_t *sm = pkt + 6;
-    if (mac_is_zero(sm) || mac_is_broadcast(sm) || mac_is_multicast(sm))
-        return;
-    apply_peer_dst_mac(fwd, local_idx, sm, "rx_eth_src");
-}
-
-static int local_idx_from_dst_mac(struct forwarder *fwd, const uint8_t *pkt, uint32_t pkt_len) {
-    if (!fwd || !pkt || pkt_len < sizeof(struct ether_header))
-        return -1;
-    /* Match inner ether_dhost to peer MAC seeded at startup (or learned from local RX src). */
-    int local_idx = local_mac_lookup(pkt);
-    if (local_idx < 0 || local_idx >= fwd->local_count)
-        return -1;
-    return local_idx;
-}
-
-static void local_mac_table_clear(void) {
-    pthread_mutex_lock(&g_local_mac_lock);
-    for (uint32_t i = 0; i < LOCAL_MAC_LEARN_MAX; i++)
-        g_local_mac_table[i].valid = 0;
-    pthread_mutex_unlock(&g_local_mac_lock);
-}
-
-static int local_idx_by_ifname_cfg(struct app_config *cfg, const char *name) {
-    if (!cfg || !name || !name[0])
-        return -1;
-    for (int i = 0; i < cfg->local_count; i++) {
-        if (strcmp(cfg->locals[i].ifname, name) == 0)
-            return i;
-    }
-    return -1;
-}
-
-static int read_local_iface_hwaddr(const char *ifname, uint8_t mac[MAC_LEN], int *ioctl_errno_out) {
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) {
-        if (ioctl_errno_out)
-            *ioctl_errno_out = errno;
-        return -1;
-    }
-    struct ifreq ifr;
-    memset(&ifr, 0, sizeof(ifr));
-    snprintf(ifr.ifr_name, IFNAMSIZ, "%s", ifname);
-    if (ioctl(fd, SIOCGIFHWADDR, &ifr) < 0) {
-        if (ioctl_errno_out)
-            *ioctl_errno_out = errno;
-        close(fd);
-        return -1;
-    }
-    close(fd);
-    if ((unsigned int)ifr.ifr_hwaddr.sa_family != ARPHRD_ETHER)
-        return -2;
-    memcpy(mac, ifr.ifr_hwaddr.sa_data, MAC_LEN);
-    return 0;
-}
-
-static void local_mac_log_iface_and_peer(const char *ifname, const uint8_t peer[MAC_LEN],
-                                         uint8_t *store_src_mac) {
-    uint8_t loc[MAC_LEN];
-    int ioctl_err = 0;
-    int rr = read_local_iface_hwaddr(ifname, loc, &ioctl_err);
-
-    if (rr == 0) {
-        if (store_src_mac)
-            memcpy(store_src_mac, loc, MAC_LEN);
-        fprintf(stderr,
-                "[LOCAL-MAC] %s local %02x:%02x:%02x:%02x:%02x:%02x peer %02x:%02x:%02x:%02x:%02x:%02x\n",
-                ifname,
-                loc[0], loc[1], loc[2], loc[3], loc[4], loc[5],
-                peer[0], peer[1], peer[2], peer[3], peer[4], peer[5]);
-    } else if (rr == -2) {
-        fprintf(stderr,
-                "[LOCAL-MAC] %s local not_ether peer %02x:%02x:%02x:%02x:%02x:%02x\n",
-                ifname,
-                peer[0], peer[1], peer[2], peer[3], peer[4], peer[5]);
-    } else {
-        fprintf(stderr,
-                "[LOCAL-MAC] %s local ioctl_failed err=%d peer %02x:%02x:%02x:%02x:%02x:%02x\n",
-                ifname,
-                ioctl_err,
-                peer[0], peer[1], peer[2], peer[3], peer[4], peer[5]);
-    }
-}
-
-#define NE_LLADDR_MAX 8
-
-static int merge_lladdr(FILE *fp, uint8_t out[MAC_LEN]) {
-    uint8_t uniq[NE_LLADDR_MAX][MAC_LEN];
-    int n = 0;
-    char line[768];
-
-    while (fgets(line, sizeof(line), fp)) {
-        char *p = strstr(line, "lladdr ");
-        if (!p)
-            continue;
-        p += 7;
-        char mstr[32];
-        if (sscanf(p, "%31s", mstr) != 1)
-            continue;
-        uint8_t m[MAC_LEN];
-        if (parse_mac(mstr, m) != 0)
-            continue;
-        if (mac_is_zero(m) || mac_is_broadcast(m) || mac_is_multicast(m))
-            continue;
-        int dup = 0;
-        for (int j = 0; j < n; j++) {
-            if (memcmp(uniq[j], m, MAC_LEN) == 0) {
-                dup = 1;
-                break;
-            }
-        }
-        if (dup)
-            continue;
-        if (n >= NE_LLADDR_MAX)
-            return -2;
-        memcpy(uniq[n++], m, MAC_LEN);
-    }
-    if (n == 1) {
-        memcpy(out, uniq[0], MAC_LEN);
+    /* Bridge WAN: keep original Ethernet headers on inter-SEP links. */
+    if (fwd->cfg->wans[wan_idx].dst_ip == 0)
         return 0;
-    }
-    if (n == 0)
-        return -1;
-    return -2;
+    return wan_rewrite_dest_mac(&g_wan_arp[wan_idx],
+                                 &fwd->cfg->wans[wan_idx],
+                                 &fwd->wans[wan_idx],
+                                 pkt);
 }
 
-static int merge_bridge_fdb(FILE *fp, uint8_t out[MAC_LEN], const uint8_t *skip_mac) {
-    uint8_t uniq[NE_LLADDR_MAX][MAC_LEN];
-    int n = 0;
-    char line[768];
-
-    while (fgets(line, sizeof(line), fp)) {
-        if (strstr(line, "self permanent"))
-            continue;
-        char macstr[32];
-        if (sscanf(line, "%31s", macstr) != 1)
-            continue;
-        if (!strchr(macstr, ':'))
-            continue;
-        uint8_t m[MAC_LEN];
-        if (parse_mac(macstr, m) != 0)
-            continue;
-        if (mac_is_zero(m) || mac_is_broadcast(m) || mac_is_multicast(m))
-            continue;
-        if (skip_mac && memcmp(m, skip_mac, MAC_LEN) == 0)
-            continue;
-        int dup = 0;
-        for (int j = 0; j < n; j++) {
-            if (memcmp(uniq[j], m, MAC_LEN) == 0) {
-                dup = 1;
-                break;
-            }
-        }
-        if (dup)
-            continue;
-        if (n >= NE_LLADDR_MAX)
-            return -2;
-        memcpy(uniq[n++], m, MAC_LEN);
-    }
-    if (n == 1) {
-        memcpy(out, uniq[0], MAC_LEN);
+static int set_local_l2_addrs(struct forwarder *fwd, int local_idx, uint32_t dest_ip,
+                              uint8_t *pkt) {
+    if (!fwd || local_idx < 0 || local_idx >= fwd->local_count || !pkt)
+        return -1;
+    if (config_wan_bridge_mode(fwd->cfg))
         return 0;
-    }
-    if (n == 0)
-        return -1;
-    return -2;
+    return local_rewrite_dest_mac(&g_arp[local_idx], dest_ip, pkt);
 }
 
-static int net_sysfs_bridge_master(const char *slave, char master[IFNAMSIZ]) {
-    char path[256];
-    char buf[512];
-    ssize_t len;
-
-    snprintf(path, sizeof(path), "/sys/class/net/%s/brport/bridge", slave);
-    len = readlink(path, buf, sizeof(buf) - 1);
-    if (len < 0)
-        return -1;
-    buf[len] = '\0';
-    const char *base = strrchr(buf, '/');
-    if (!base || !base[1])
-        return -1;
-    snprintf(master, IFNAMSIZ, "%s", base + 1);
-    return 0;
-}
-
-static int merge_arp_device(const char *dev, uint8_t out[MAC_LEN], const uint8_t *skip_mac) {
-    FILE *fp = fopen("/proc/net/arp", "r");
-    if (!fp)
-        return -1;
-    char line[512];
-    uint8_t uniq[NE_LLADDR_MAX][MAC_LEN];
-    int n = 0;
-
-    if (!fgets(line, sizeof(line), fp)) {
-        fclose(fp);
-        return -1;
-    }
-    while (fgets(line, sizeof(line), fp)) {
-        char ip[64], htype[32], flags[32], macstr[32], mask[32], dname[IFNAMSIZ];
-        if (sscanf(line, "%63s %31s %31s %31s %31s %31s", ip, htype, flags, macstr, mask, dname) != 6)
-            continue;
-        if (strcmp(dname, dev) != 0)
-            continue;
-        if (strcmp(macstr, "00:00:00:00:00:00") == 0)
-            continue;
-        uint8_t m[MAC_LEN];
-        if (parse_mac(macstr, m) != 0)
-            continue;
-        if (mac_is_zero(m) || mac_is_broadcast(m) || mac_is_multicast(m))
-            continue;
-        if (skip_mac && memcmp(m, skip_mac, MAC_LEN) == 0)
-            continue;
-        int dup = 0;
-        for (int j = 0; j < n; j++) {
-            if (memcmp(uniq[j], m, MAC_LEN) == 0) {
-                dup = 1;
-                break;
-            }
-        }
-        if (dup)
-            continue;
-        if (n >= NE_LLADDR_MAX)
-            return -2;
-        memcpy(uniq[n++], m, MAC_LEN);
-    }
-    fclose(fp);
-    if (n == 1) {
-        memcpy(out, uniq[0], MAC_LEN);
-        return 0;
-    }
-    if (n == 0)
-        return -1;
-    return -2;
-}
-
-static int peer_mac_from_full_bridge_fdb(const char *ifname, const char *brm,
-                                           const uint8_t *skip_mac, uint8_t out[MAC_LEN]) {
-    char devm[IFNAMSIZ + 16];
-    snprintf(devm, sizeof(devm), " dev %s ", ifname);
-
-    FILE *fp = popen("bridge fdb show 2>/dev/null", "r");
-    if (!fp)
-        return -1;
-
-    uint8_t dyn[NE_LLADDR_MAX][MAC_LEN];
-    int n_dyn = 0;
-    uint8_t oth[NE_LLADDR_MAX][MAC_LEN];
-    int n_oth = 0;
-    char line[768];
-
-    while (fgets(line, sizeof(line), fp)) {
-        if (strstr(line, "self permanent"))
-            continue;
-        if (!strstr(line, devm))
-            continue;
-        char *mp = strstr(line, "master ");
-        if (!mp)
-            continue;
-        char brtok[IFNAMSIZ];
-        if (sscanf(mp, "master %31s", brtok) != 1 || strcmp(brtok, brm) != 0)
-            continue;
-        char macstr[32];
-        if (sscanf(line, "%31s", macstr) != 1)
-            continue;
-        if (!strchr(macstr, ':'))
-            continue;
-        uint8_t m[MAC_LEN];
-        if (parse_mac(macstr, m) != 0)
-            continue;
-        if (mac_is_zero(m) || mac_is_broadcast(m) || mac_is_multicast(m))
-            continue;
-        if (skip_mac && memcmp(m, skip_mac, MAC_LEN) == 0)
-            continue;
-        int is_perm = (strstr(line, "permanent") != NULL);
-        uint8_t(*arr)[MAC_LEN];
-        int *np;
-        if (is_perm) {
-            arr = oth;
-            np = &n_oth;
-        } else {
-            arr = dyn;
-            np = &n_dyn;
-        }
-        int dup = 0;
-        for (int j = 0; j < *np; j++) {
-            if (memcmp(arr[j], m, MAC_LEN) == 0) {
-                dup = 1;
-                break;
-            }
-        }
-        if (dup)
-            continue;
-        if (*np >= NE_LLADDR_MAX) {
-            pclose(fp);
-            return -2;
-        }
-        memcpy(arr[(*np)++], m, MAC_LEN);
-    }
-    pclose(fp);
-
-    if (n_dyn == 1) {
-        memcpy(out, dyn[0], MAC_LEN);
-        return 0;
-    }
-    if (n_dyn > 1)
-        return -2;
-    if (n_oth == 1) {
-        memcpy(out, oth[0], MAC_LEN);
-        return 0;
-    }
-    if (n_oth > 1)
-        return -2;
-    return -1;
-}
-
-static int peer_mac_from_kernel(const char *ifname, uint8_t mac_out[MAC_LEN], int quiet) {
-    char cmd[384];
-    FILE *fp;
-    uint8_t local_hw[MAC_LEN];
-    int have_local = (read_local_iface_hwaddr(ifname, local_hw, NULL) == 0);
-    char brm[IFNAMSIZ];
-    int have_br = (net_sysfs_bridge_master(ifname, brm) == 0);
-
-    if (have_br) {
-        int bf = peer_mac_from_full_bridge_fdb(ifname, brm, have_local ? local_hw : NULL, mac_out);
-        if (bf == 0) {
-            if (!quiet) {
-                fprintf(stderr,
-                        "[LOCAL-MAC] %s peer from bridge fdb (dev %s master %s, learned or single candidate)\n",
-                        ifname, ifname, brm);
-            }
-            return 0;
-        }
-        if (bf == -2) {
-            if (!quiet) {
-                fprintf(stderr,
-                        "[LOCAL-MAC][WARN] %s: multiple MAC in `bridge fdb show` for dev %s master %s; "
-                        "try NE_LOCAL_MAC_PRELOAD or reduce hosts on segment\n",
-                        ifname, ifname, brm);
-            }
-        }
-    }
-
-    snprintf(cmd, sizeof(cmd), "ip neigh show dev %s 2>/dev/null", ifname);
-    fp = popen(cmd, "r");
-    if (fp) {
-        int r = merge_lladdr(fp, mac_out);
-        pclose(fp);
-        if (r == 0)
-            return 0;
-        if (r == -2) {
-            if (!quiet) {
-                fprintf(stderr,
-                        "[LOCAL-MAC][WARN] %s: ip neigh has multiple lladdr; trying bridge master / fdb\n",
-                        ifname);
-            }
-        }
-    }
-
-    if (have_br) {
-        snprintf(cmd, sizeof(cmd), "ip neigh show dev %s 2>/dev/null", brm);
-        fp = popen(cmd, "r");
-        if (fp) {
-            int r = merge_lladdr(fp, mac_out);
-            pclose(fp);
-            if (r == 0)
-                return 0;
-            if (r == -2) {
-                if (!quiet) {
-                    fprintf(stderr,
-                            "[LOCAL-MAC][WARN] %s: bridge %s neigh has multiple lladdr; trying bridge fdb\n",
-                            ifname, brm);
-                }
-            }
-        }
-    }
-
-    snprintf(cmd, sizeof(cmd), "bridge fdb show dev %s 2>/dev/null", ifname);
-    fp = popen(cmd, "r");
-    if (!fp)
-        return -1;
-    int r = merge_bridge_fdb(fp, mac_out, have_local ? local_hw : NULL);
-    pclose(fp);
-    if (r == 0)
-        return 0;
-    if (r == -2 && !quiet)
-        fprintf(stderr, "[FATAL][LOCAL-MAC] %s bridge fdb multiple MAC\n", ifname);
-
-    if (have_br) {
-        int ar = merge_arp_device(brm, mac_out, have_local ? local_hw : NULL);
-        if (ar == 0)
-            return 0;
-        if (ar == -2) {
-            if (!quiet) {
-                fprintf(stderr,
-                        "[LOCAL-MAC][WARN] %s: /proc/net/arp on %s has multiple MAC; try NE_LOCAL_MAC_PRELOAD\n",
-                        ifname, brm);
-            }
-        }
-    }
-    if (merge_arp_device(ifname, mac_out, have_local ? local_hw : NULL) == 0)
-        return 0;
-
-    return -1;
-}
-
-static void local_ms_sleep(unsigned ms) {
-    struct timespec ts;
-    ts.tv_sec = (time_t)(ms / 1000u);
-    ts.tv_nsec = (long)(ms % 1000u) * 1000000L;
-    while (nanosleep(&ts, &ts) < 0 && errno == EINTR) {
-    }
-}
-
-static void *local_peer_mac_poll_thread(void *arg) {
-    struct forwarder *fwd = (struct forwarder *)arg;
-    if (!fwd || !fwd->cfg || fwd->local_count <= 0)
-        return NULL;
-
-    unsigned fast_ms = 500;
-    const char *ef = getenv("NE_LOCAL_MAC_POLL_MS");
-    if (ef && ef[0]) {
-        unsigned v = (unsigned)strtoul(ef, NULL, 10);
-        if (v >= 50u && v <= 60000u)
-            fast_ms = v;
-    }
-    unsigned slow_ms = 5000;
-    const char *es = getenv("NE_LOCAL_MAC_POLL_SLOW_MS");
-    if (es && es[0]) {
-        unsigned v = (unsigned)strtoul(es, NULL, 10);
-        if (v >= 200u && v <= 300000u)
-            slow_ms = v;
-    }
-
-    fprintf(stderr,
-            "[LOCAL-MAC-POLL] kernel resync active (NE_LOCAL_MAC_POLL_MS=%u NE_LOCAL_MAC_POLL_SLOW_MS=%u)\n",
-            fast_ms, slow_ms);
-
-    while (running) {
-        int all_known = 1;
-        for (int li = 0; li < fwd->local_count; li++) {
-            if (mac_is_zero(fwd->cfg->locals[li].dst_mac))
-                all_known = 0;
-
-            uint8_t mac[MAC_LEN];
-            if (peer_mac_from_kernel(fwd->cfg->locals[li].ifname, mac, 1) != 0)
-                continue;
-            apply_peer_dst_mac(fwd, li, mac, "kernel_sync");
-        }
-        local_ms_sleep(all_known ? slow_ms : fast_ms);
-    }
-    return NULL;
-}
-
-static int mac_load_from_kernel(struct app_config *cfg, uint64_t *out_n) {
-    uint8_t macs[MAX_INTERFACES][MAC_LEN];
-
-    fprintf(stderr, "[LOCAL-MAC] hardware MAC of local interfaces (ioctl):\n");
-    for (int li = 0; li < cfg->local_count; li++) {
-        uint8_t hw[MAC_LEN];
-        if (read_local_iface_hwaddr(cfg->locals[li].ifname, hw, NULL) == 0) {
-            fprintf(stderr,
-                    "  %s %02x:%02x:%02x:%02x:%02x:%02x\n",
-                    cfg->locals[li].ifname,
-                    hw[0], hw[1], hw[2], hw[3], hw[4], hw[5]);
-        } else {
-            fprintf(stderr, "  %s (SIOCGIFHWADDR failed)\n", cfg->locals[li].ifname);
-        }
-    }
-
-    int n_ok = 0;
-    for (int i = 0; i < cfg->local_count; i++) {
-        memset(macs[i], 0, MAC_LEN);
-        if (peer_mac_from_kernel(cfg->locals[i].ifname, macs[i], 0) != 0) {
-            fprintf(stderr,
-                    "[LOCAL-MAC] %s peer not resolved yet (will learn from RX when link has traffic)\n",
-                    cfg->locals[i].ifname);
-            continue;
-        }
-        n_ok++;
-    }
-
-    for (int i = 0; i < cfg->local_count; i++) {
-        memset(cfg->locals[i].dst_mac, 0, MAC_LEN);
-        if (!mac_is_zero(macs[i])) {
-            local_mac_learn(i, macs[i]);
-            memcpy(cfg->locals[i].dst_mac, macs[i], MAC_LEN);
-        }
-        local_mac_log_iface_and_peer(cfg->locals[i].ifname, macs[i], cfg->locals[i].src_mac);
-    }
-
-    *out_n = (uint64_t)n_ok;
-    return 0;
-}
-
-static int mac_load_from_preload_script(struct app_config *cfg, uint64_t *out_n) {
-    const char *cmd = getenv("NE_LOCAL_MAC_PRELOAD");
-    if (!cmd || !cmd[0])
-        return -1;
-
-    FILE *fp = popen(cmd, "r");
-    if (!fp) {
-        fprintf(stderr, "[FATAL][LOCAL-MAC] NE_LOCAL_MAC_PRELOAD: popen failed (%s)\n", cmd);
-        return -1;
-    }
-
-    uint8_t covered[MAX_INTERFACES];
-    memset(covered, 0, sizeof(covered));
-    uint64_t nlines = 0;
-
-    char line[512];
-    while (fgets(line, sizeof(line), fp)) {
-        char *p = line;
-        while (*p == ' ' || *p == '\t')
-            p++;
-        if (*p == '\0' || *p == '\n' || *p == '#' || *p == '\r')
-            continue;
-
-        char mac_tok[48];
-        char if_tok[64];
-        if (sscanf(p, "%47s %63s", mac_tok, if_tok) != 2) {
-            fprintf(stderr,
-                    "[FATAL][LOCAL-MAC] NE_LOCAL_MAC_PRELOAD: bad line (need \"MAC ifname|index\"): %s\n",
-                    line);
-            pclose(fp);
-            return -1;
-        }
-
-        uint8_t macb[MAC_LEN];
-        if (parse_mac(mac_tok, macb) != 0) {
-            fprintf(stderr, "[FATAL][LOCAL-MAC] NE_LOCAL_MAC_PRELOAD: invalid MAC \"%s\"\n", mac_tok);
-            pclose(fp);
-            return -1;
-        }
-        if (mac_is_zero(macb) || mac_is_broadcast(macb) || mac_is_multicast(macb)) {
-            fprintf(stderr, "[FATAL][LOCAL-MAC] NE_LOCAL_MAC_PRELOAD: MAC must be unicast \"%s\"\n", mac_tok);
-            pclose(fp);
-            return -1;
-        }
-
-        int li = local_idx_by_ifname_cfg(cfg, if_tok);
-        if (li < 0) {
-            char *endp = NULL;
-            long idx = strtol(if_tok, &endp, 10);
-            if (!endp || *endp != '\0' || idx < 0 || idx >= cfg->local_count) {
-                fprintf(stderr,
-                        "[FATAL][LOCAL-MAC] NE_LOCAL_MAC_PRELOAD: unknown local \"%s\" (use ifname or 0..n-1)\n",
-                        if_tok);
-                pclose(fp);
-                return -1;
-            }
-            li = (int)idx;
-        }
-
-        local_mac_learn(li, macb);
-        memcpy(cfg->locals[li].dst_mac, macb, MAC_LEN);
-        local_mac_log_iface_and_peer(cfg->locals[li].ifname, macb, cfg->locals[li].src_mac);
-        covered[li] = 1;
-        nlines++;
-    }
-
-    int st = pclose(fp);
-    if (st == -1 || !WIFEXITED(st) || WEXITSTATUS(st) != 0) {
-        fprintf(stderr,
-                "[FATAL][LOCAL-MAC] NE_LOCAL_MAC_PRELOAD command failed (status=%d).\n",
-                st);
-        return -1;
-    }
-
-    *out_n = nlines;
-    return 0;
-}
-
-static int g_local_peer_macs_ready;
-static uint64_t g_peer_mac_seed_count;
-
-int forwarder_prepare_local_peer_macs(struct app_config *cfg) {
-    if (!cfg || cfg->local_count <= 0)
-        return 0;
-    if (g_local_peer_macs_ready)
-        return 0;
-
-    local_mac_table_clear();
-    uint64_t cnt = 0;
-
-    unsigned wait_sec = 0;
-    const char *wenv = getenv("NE_PEER_MAC_WAIT_SEC");
-    if (wenv && wenv[0])
-        wait_sec = (unsigned)strtoul(wenv, NULL, 10);
-    time_t deadline = time(NULL) + (time_t)wait_sec;
-
-    for (;;) {
-        mac_load_from_kernel(cfg, &cnt);
-        if (cnt >= (uint64_t)cfg->local_count)
-            goto done;
-        if (wait_sec == 0 || time(NULL) >= deadline)
-            break;
-        fprintf(stderr,
-                "[LOCAL-MAC] partial peer MAC; sleep 1s (NE_PEER_MAC_WAIT_SEC=%u)\n",
-                wait_sec);
-        sleep(1);
-    }
-
-    if (getenv("NE_LOCAL_MAC_PRELOAD") && getenv("NE_LOCAL_MAC_PRELOAD")[0]) {
-        if (mac_load_from_preload_script(cfg, &cnt) != 0)
-            return -1;
-    }
-
-done:
-    {
-    uint64_t nz = 0;
-    for (int i = 0; i < cfg->local_count; i++) {
-        if (!mac_is_zero(cfg->locals[i].dst_mac))
-            nz++;
-    }
-    g_peer_mac_seed_count = nz;
-    g_local_peer_macs_ready = 1;
-    return 0;
-    }
-}
-
-static int install_local_mac_table(struct forwarder *fwd) {
+static int forwarder_rx_pick_local(struct forwarder *fwd, uint8_t *pkt, uint32_t pkt_len,
+                                  uint32_t dest_ip) {
     if (!fwd || !fwd->cfg)
         return -1;
-    if (forwarder_prepare_local_peer_macs(fwd->cfg) != 0)
+    if (config_wan_bridge_mode(fwd->cfg)) {
+        bridge_wan_rx_normalize_eth_ipv4(pkt, pkt_len);
+        return bridge_mac_local_for_dmac(fwd, pkt, pkt_len);
+    }
+    if (dest_ip == 0)
         return -1;
-    fwd->local_mac_preload_loaded = g_peer_mac_seed_count;
-    return 0;
+    return config_find_local_for_ip(fwd->cfg, dest_ip);
 }
 
 struct packet_job {
@@ -1853,65 +784,6 @@ struct queue_thread_args {
     int wan_worker_index;
 };
 
-/*
- * Inbound WAN decrypt: pick AES ctx from policy id bytes inside the ciphertext
- * (see decrypt_packet_auto_l2 / crypto_l3_extract_policy_id / crypto_l4_*), not
- * from cleartext IP direction. Return-path IP swap does not change that id.
- * Outbound encrypt policy match already tries both tuple orders in config_select_crypto_policy().
- *
- * WAN L2 ciphertext must use crypto_layer2_decrypt(), not packet_decrypt(): the latter
- * follows g_encrypt_layer (often 3 from DB) and crypto_layer3_decrypt no-ops on non-0x0800
- * frames, leaving 0x88xx on wire and then injecting garbage toward LAN/firewall.
- */
-static int ne_rx_ipv4_header_csum_ok(const uint8_t *ip, int ihl) {
-    uint32_t sum = 0;
-    for (int i = 0; i < ihl; i += 2) {
-        uint16_t w = ((uint16_t)ip[i] << 8);
-        if (i + 1 < ihl)
-            w |= ip[i + 1];
-        sum += w;
-    }
-    while (sum >> 16)
-        sum = (sum & 0xffff) + (sum >> 16);
-    return ((uint16_t)sum) == 0xffff;
-}
-
-/* After WAN decrypt, ensure Ethernet II IPv4 (0x0800) before AF_XDP inject to LAN
- * so bridges/firewalls see standard frames. Belt-and-suspenders if L2 decrypt ran
- * but ethertype was left non-0800. */
-static void ne_wan_rx_normalize_eth_ipv4_before_local_inject(uint8_t *pkt, uint32_t pkt_len) {
-    if (!pkt || pkt_len < 14 + 20)
-        return;
-    uint16_t et = ((uint16_t)pkt[12] << 8) | pkt[13];
-    if (et == 0x0800)
-        return;
-    if (et == 0x8100)
-        return;
-
-    const uint8_t *iph = pkt + 14;
-    if ((iph[0] >> 4) != 4)
-        return;
-    int ihl = (iph[0] & 0x0F) * 4;
-    if (ihl < 20 || ihl > 60 || pkt_len < 14 + (uint32_t)ihl)
-        return;
-    uint16_t tot = ((uint16_t)iph[2] << 8) | iph[3];
-    if (tot < (uint16_t)ihl || pkt_len < 14 + (uint32_t)tot)
-        return;
-    if (!ne_rx_ipv4_header_csum_ok(iph, ihl))
-        return;
-
-    uint16_t fake4 = packet_crypto_get_fake_ethertype_ipv4();
-    if (fake4 == 0)
-        fake4 = NE_DEFAULT_FAKE_ETHERTYPE_IPV4;
-    int ne_wireish = (pkt[12] == (uint8_t)(fake4 >> 8)) ? 1 : 0;
-
-    if (!ne_wireish)
-        return;
-
-    pkt[12] = 0x08;
-    pkt[13] = 0x00;
-}
-
 static int decrypt_packet_auto_l2(struct forwarder *fwd,
                                   uint8_t *pkt, uint32_t *pkt_len,
                                   uint8_t *scratch, size_t scratch_sz) {
@@ -1921,81 +793,54 @@ static int decrypt_packet_auto_l2(struct forwarder *fwd,
 
     uint8_t pkt_marker = pkt[12];
     uint16_t fake_ipv4 = packet_crypto_get_fake_ethertype_ipv4();
-    if (fake_ipv4 == 0)
-        fake_ipv4 = NE_DEFAULT_FAKE_ETHERTYPE_IPV4;
-    if (pkt_marker != (uint8_t)(fake_ipv4 >> 8)) {
-        /* 0x88xx = NE L2-on-wire; never forward undecrypted (L3 thread no-op was leaking ciphertext). */
-        if (pkt_marker == 0x88U) {
-            char d[64];
-            snprintf(d, sizeof(d), "marker_88 fake=0x%04x", (unsigned)fake_ipv4);
-            ne_l2_trace_event("S6-DEC-FAIL", NULL, pkt, *pkt_len, d);
-            return -1;
-        }
+    if (!fake_ipv4 || pkt_marker != (uint8_t)(fake_ipv4 >> 8))
         return 0;
-    }
 
     if (fwd->cfg->policy_count <= 0) {
         apply_default_crypto_params(fwd);
-        int new_len = crypto_layer2_decrypt(&crypto_ctx, pkt, *pkt_len);
-        if (new_len < 0) {
-            ne_l2_trace_plain("S6-DEC-FAIL", NULL, "default_ctx gcm");
-            return -1;
-        }
+        int new_len = packet_decrypt(&crypto_ctx, pkt, *pkt_len);
+        if (new_len < 0) return -1;
         *pkt_len = (uint32_t)new_len;
         return 0;
     }
 
-    uint32_t policy_wire = 0;
-    if (*pkt_len < 17U)
-        return -1;
-    policy_wire = ((uint32_t)pkt[13] << 24) | ((uint32_t)pkt[14] << 16) | ((uint32_t)pkt[15] << 8) |
-                   (uint32_t)pkt[16];
-    int pi = fwd_pi_for_action_wire(fwd, POLICY_ACTION_ENCRYPT_L2, policy_wire);
+
+    uint8_t policy_id = pkt[13];
+    int pi = g_policy_index_by_action_id[POLICY_ACTION_ENCRYPT_L2][policy_id];
     if (pi >= 0 && pi < fwd->cfg->policy_count && g_policy_crypto_ctx_ready[pi]) {
         const struct crypto_policy *cp = &fwd->cfg->policies[pi];
         apply_crypto_params_from_policy(cp);
-        int new_len = crypto_layer2_decrypt(&g_policy_crypto_ctx[pi], pkt, *pkt_len);
-        if (new_len < 0) {
-            char d[48];
-            snprintf(d, sizeof(d), "gcm policy=%u pi=%d", (unsigned)policy_wire, pi);
-            ne_l2_trace_event("S6-DEC-FAIL", NULL, pkt, *pkt_len, d);
+        int new_len = packet_decrypt(&g_policy_crypto_ctx[pi], pkt, *pkt_len);
+        if (new_len < 0)
             return -1;
-        }
         *pkt_len = (uint32_t)new_len;
         return 0;
     }
 
     if (prev_policy_grace_active()) {
-        int ppi = fwd_prev_pi_for_action_wire(POLICY_ACTION_ENCRYPT_L2, policy_wire);
+        int ppi = g_prev_policy_index_by_action_id[POLICY_ACTION_ENCRYPT_L2][policy_id];
         if (ppi >= 0 && ppi < g_prev_policy_count && g_prev_policy_crypto_ctx_ready[ppi]) {
             const struct crypto_policy *cp_prev = &g_prev_policies[ppi];
             apply_crypto_params_from_policy(cp_prev);
-            int new_len = crypto_layer2_decrypt(&g_prev_policy_crypto_ctx[ppi], pkt, *pkt_len);
-            if (new_len < 0) {
-                ne_l2_trace_plain("S6-DEC-FAIL", NULL, "grace gcm");
+            int new_len = packet_decrypt(&g_prev_policy_crypto_ctx[ppi], pkt, *pkt_len);
+            if (new_len < 0)
                 return -1;
-            }
             *pkt_len = (uint32_t)new_len;
             return 0;
         }
     }
 
-    {
-        char d[56];
-        snprintf(d, sizeof(d), "no_policy_ctx policy=%u pi=%d", (unsigned)policy_wire, pi);
-        ne_l2_trace_event("S6-DEC-FAIL", NULL, pkt, *pkt_len, d);
-    }
+
     return -1;
 }
 
 
-static int l3_extract_policy_id(uint8_t *pkt, uint32_t pkt_len,
-                                uint32_t *policy_id_out) {
-    if (!pkt || !policy_id_out || pkt_len < 14 + 20)
+static int l3_extract_policy_id(const struct app_config *cfg,
+                                uint8_t *pkt, uint32_t pkt_len,
+                                uint8_t *policy_id_out) {
+    if (!cfg || !pkt || !policy_id_out || pkt_len < 14 + 20)
         return -1;
-
-
-    return crypto_l3_extract_policy_id(pkt, pkt_len, policy_id_out);
+    return crypto_l3_extract_policy_id(cfg, pkt, pkt_len, policy_id_out);
 }
 
 static int decrypt_packet_auto_by_action(struct forwarder *fwd,
@@ -2011,10 +856,12 @@ static int decrypt_packet_auto_by_action(struct forwarder *fwd,
         .per_policy_ready = g_policy_crypto_ctx_ready,
         .policies = fwd->cfg ? fwd->cfg->policies : NULL,
         .policy_count = fwd->cfg ? fwd->cfg->policy_count : 0,
+        .policy_index_by_action_id = g_policy_index_by_action_id,
         .prev_per_policy_ctx = g_prev_policy_crypto_ctx,
         .prev_per_policy_ready = g_prev_policy_crypto_ctx_ready,
         .prev_policies = g_prev_policies,
         .prev_policy_count = g_prev_policy_count,
+        .prev_policy_index_by_action_id = g_prev_policy_index_by_action_id,
         .prev_grace_active = prev_policy_grace_active()
     };
     return crypto_decrypt_packet_auto_by_action(crypto_enabled, fwd->cfg, &dctx,
@@ -2022,39 +869,9 @@ static int decrypt_packet_auto_by_action(struct forwarder *fwd,
                                                 scratch, scratch_sz);
 }
 
-/*
- * wan_queue_thread_l2 only strips outer L2 NE + L2 reasm. Any inner NE L3/L4 must still
- * go through crypto_decrypt_packet_auto_by_action: that path reads on-wire policy_id from
- * the L3/L4 tunnel header, maps it to the DB policy row, then apply_crypto_params_from_policy
- * (mode, nonce size, AES bits) before crypto_layer3_decrypt / crypto_layer4_decrypt — same
- * as wan_queue_thread_l3l4, not ad-hoc key guessing.
- *
- * For cleartext TCP/UDP after L2, those calls no-op (success, unchanged packet).
- */
-static int wan_rx_inner_ne_after_outer_l2(struct forwarder *fwd,
-                                          uint8_t *pkt, uint32_t *pkt_len,
-                                          uint8_t *scratch, size_t scratch_sz) {
-    if (!crypto_enabled || !fwd || !fwd->cfg || !pkt || !pkt_len)
-        return 0;
-    if (*pkt_len < (uint32_t)(ETH_HEADER_SIZE + 20))
-        return 0;
-    uint16_t et = ((uint16_t)pkt[12] << 8) | pkt[13];
-    if (et != 0x0800)
-        return 0;
-
-    if (decrypt_packet_auto_by_action(fwd, pkt, pkt_len, POLICY_ACTION_ENCRYPT_L3,
-                                      scratch, scratch_sz) != 0)
-        return -1;
-    if (decrypt_packet_auto_by_action(fwd, pkt, pkt_len, POLICY_ACTION_ENCRYPT_L4,
-                                      scratch, scratch_sz) != 0)
-        return -1;
-    return 0;
-}
-
 static struct packet_crypto_ctx *forwarder_resolve_l3_decrypt_ctx(struct forwarder *fwd,
                                                                    uint8_t *pkt,
                                                                    uint32_t pkt_len) {
-    packet_crypto_set_l3_restore_ipproto_from_db(0);
     if (!fwd || !fwd->cfg)
         return NULL;
 
@@ -2063,25 +880,45 @@ static struct packet_crypto_ctx *forwarder_resolve_l3_decrypt_ctx(struct forward
         return &crypto_ctx;
     }
 
-    uint32_t policy_id = 0;
-    if (crypto_l3_extract_policy_id(pkt, pkt_len, &policy_id) != 0)
+    uint8_t policy_id = 0;
+    if (crypto_l3_extract_policy_id(fwd->cfg, pkt, pkt_len, &policy_id) != 0)
         return NULL;
 
-    int pi = fwd_pi_for_action_wire(fwd, POLICY_ACTION_ENCRYPT_L3, policy_id);
+    int pi = g_policy_index_by_action_id[POLICY_ACTION_ENCRYPT_L3][policy_id];
     if (pi >= 0 && pi < fwd->cfg->policy_count && g_policy_crypto_ctx_ready[pi]) {
-        const struct crypto_policy *cp = &fwd->cfg->policies[pi];
-        apply_crypto_params_from_policy(cp);
-        if (cp->protocol == 6 || cp->protocol == 17)
-            packet_crypto_set_l3_restore_ipproto_from_db((uint8_t)cp->protocol);
+        apply_crypto_params_from_policy(&fwd->cfg->policies[pi]);
         return &g_policy_crypto_ctx[pi];
     }
     if (prev_policy_grace_active()) {
-        int ppi = fwd_prev_pi_for_action_wire(POLICY_ACTION_ENCRYPT_L3, policy_id);
+        int ppi = g_prev_policy_index_by_action_id[POLICY_ACTION_ENCRYPT_L3][policy_id];
         if (ppi >= 0 && ppi < g_prev_policy_count && g_prev_policy_crypto_ctx_ready[ppi]) {
-            const struct crypto_policy *cp_prev = &g_prev_policies[ppi];
-            apply_crypto_params_from_policy(cp_prev);
-            if (cp_prev->protocol == 6 || cp_prev->protocol == 17)
-                packet_crypto_set_l3_restore_ipproto_from_db((uint8_t)cp_prev->protocol);
+            apply_crypto_params_from_policy(&g_prev_policies[ppi]);
+            return &g_prev_policy_crypto_ctx[ppi];
+        }
+    }
+    return NULL;
+}
+
+static struct packet_crypto_ctx *forwarder_resolve_l2_decrypt_ctx(struct forwarder *fwd,
+                                                                  uint8_t *pkt) {
+    if (!fwd || !fwd->cfg)
+        return NULL;
+
+    if (fwd->cfg->policy_count <= 0) {
+        apply_default_crypto_params(fwd);
+        return &crypto_ctx;
+    }
+
+    uint8_t policy_id = pkt[13];
+    int pi = g_policy_index_by_action_id[POLICY_ACTION_ENCRYPT_L2][policy_id];
+    if (pi >= 0 && pi < fwd->cfg->policy_count && g_policy_crypto_ctx_ready[pi]) {
+        apply_crypto_params_from_policy(&fwd->cfg->policies[pi]);
+        return &g_policy_crypto_ctx[pi];
+    }
+    if (prev_policy_grace_active()) {
+        int ppi = g_prev_policy_index_by_action_id[POLICY_ACTION_ENCRYPT_L2][policy_id];
+        if (ppi >= 0 && ppi < g_prev_policy_count && g_prev_policy_crypto_ctx_ready[ppi]) {
+            apply_crypto_params_from_policy(&g_prev_policies[ppi]);
             return &g_prev_policy_crypto_ctx[ppi];
         }
     }
@@ -2099,12 +936,12 @@ static struct packet_crypto_ctx *forwarder_resolve_l4_decrypt_ctx(struct forward
         return &crypto_ctx;
     }
 
-    uint32_t policy_id = 0;
+    uint8_t policy_id = 0;
     int nonce_size = 0;
-    if (crypto_l4_extract_policy_id_ipv4(pkt, pkt_len, &policy_id, &nonce_size) != 0)
+    if (crypto_l4_extract_policy_id_ipv4(fwd->cfg, pkt, pkt_len, &policy_id, &nonce_size) != 0)
         return NULL;
 
-    int pi = fwd_pi_for_action_wire(fwd, POLICY_ACTION_ENCRYPT_L4, policy_id);
+    int pi = g_policy_index_by_action_id[POLICY_ACTION_ENCRYPT_L4][policy_id];
     if (pi >= 0 && pi < fwd->cfg->policy_count && g_policy_crypto_ctx_ready[pi]) {
         const struct crypto_policy *cp = &fwd->cfg->policies[pi];
         if (cp->nonce_size > 0 && cp->nonce_size == nonce_size) {
@@ -2113,7 +950,7 @@ static struct packet_crypto_ctx *forwarder_resolve_l4_decrypt_ctx(struct forward
         }
     }
     if (prev_policy_grace_active()) {
-        int ppi = fwd_prev_pi_for_action_wire(POLICY_ACTION_ENCRYPT_L4, policy_id);
+        int ppi = g_prev_policy_index_by_action_id[POLICY_ACTION_ENCRYPT_L4][policy_id];
         if (ppi >= 0 && ppi < g_prev_policy_count && g_prev_policy_crypto_ctx_ready[ppi]) {
             const struct crypto_policy *cp_prev = &g_prev_policies[ppi];
             if (cp_prev->nonce_size > 0 && cp_prev->nonce_size == nonce_size) {
@@ -2126,9 +963,14 @@ static struct packet_crypto_ctx *forwarder_resolve_l4_decrypt_ctx(struct forward
 }
 
 
-static void sigint_handler(int sig) {
-    (void)sig;
-    running = 0;
+static uint32_t get_dest_ip(void *pkt_data, uint32_t pkt_len) {
+    if (pkt_len < sizeof(struct ether_header) + sizeof(struct iphdr))
+        return 0;
+    struct ether_header *eth = (struct ether_header *)pkt_data;
+    if (ntohs(eth->ether_type) != ETHERTYPE_IP)
+        return 0;
+    struct iphdr *ip = (struct iphdr *)(eth + 1);
+    return ip->daddr;
 }
 
 static int parse_flow(void *pkt_data, uint32_t pkt_len,
@@ -2150,14 +992,6 @@ static int parse_flow(void *pkt_data, uint32_t pkt_len,
     int ip_hdr_len = ip->ihl * 4;
     if (ip_hdr_len < 20)
         return -1;
-
-    uint16_t frag_word = ntohs(ip->frag_off);
-    if (frag_word & (uint16_t)(IP_MF | IP_OFFMASK)) {
-        *src_port = ntohs(ip->id);
-        *dst_port = 0;
-        return 0;
-    }
-
     uint8_t *transport = pkt + l3_off + ip_hdr_len;
 
     if (ip->protocol == IPPROTO_TCP) {
@@ -2190,13 +1024,13 @@ static uint32_t pkt_l2_sig(const uint8_t *p, uint32_t len) {
     return h;
 }
 
-static int select_wan_idx_nonip_flow(struct forwarder *fwd, int local_idx, const void *pkt,
-                                     uint32_t pkt_len) {
+static int select_wan_idx_nonip_flow(struct forwarder *fwd, int local_idx,
+                                     const void *pkt, uint32_t pkt_len) {
     uint32_t h = pkt ? pkt_l2_sig((const uint8_t *)pkt, pkt_len) : 0;
     uint16_t sp = (uint16_t)h;
     uint16_t dp = (uint16_t)(h >> 16);
-    return select_wan_idx_for_packet(fwd, local_idx, htonl(0xc0000201u), htonl(0xc0000202u), sp, dp,
-                                       NE_WAN_NONIP_DIST_PROTO, pkt_len);
+    return select_wan_idx_for_packet(fwd, local_idx, htonl(0xc0000201u), htonl(0xc0000202u),
+                                     sp, dp, NE_WAN_NONIP_DIST_PROTO, pkt_len);
 }
 
 static inline uint32_t flow_hash_local_tq(uint32_t src_ip, uint32_t dst_ip,
@@ -2217,7 +1051,10 @@ static void *gc_thread(void *arg) {
     (void)arg;
     forwarder_pin_cpu();
     while (running) {
-        sleep(60); 
+        for (int i = 0; i < 600 && running; i++)
+            usleep(100000);
+        if (!running)
+            break;
         flow_table_gc(&g_flow_table);
         tcp_policy_pin_gc();
         frag_table_gc(&g_wan_frag_l2);
@@ -2258,7 +1095,9 @@ static void *local_queue_thread_no_crypto(void *arg) {
             wan_tx_q[w] = tx_base % fwd->wans[w].queue_count;
 
         for (int i = 0; i < rcvd; i++) {
-            learn_local_src_mac(fwd, local_idx, (const uint8_t *)pkt_ptrs[i], pkt_lens[i]);
+            if (config_wan_bridge_mode(fwd->cfg))
+                bridge_mac_learn_rx(fwd, local_idx, (const uint8_t *)pkt_ptrs[i], pkt_lens[i]);
+
             uint32_t src_ip = 0, dst_ip = 0;
             uint16_t src_port = 0, dst_port = 0;
             uint8_t protocol = 0;
@@ -2279,6 +1118,11 @@ static void *local_queue_thread_no_crypto(void *arg) {
             struct xsk_interface *wan = &fwd->wans[wan_idx];
             int tq = wan_tx_q[wan_idx];
             uint8_t *pkt = (uint8_t *)pkt_ptrs[i];
+
+            if (set_wan_l2_addrs(fwd, wan_idx, pkt) != 0) {
+                __sync_fetch_and_add(&fwd->total_dropped, 1);
+                continue;
+            }
 
             if (interface_send_batch_queue(wan, tq, pkt, pkt_lens[i]) == 0) {
                 __sync_fetch_and_add(&fwd->local_to_wan, 1);
@@ -2328,10 +1172,14 @@ static void *wan_queue_thread_no_crypto(void *arg) {
             uint8_t *pkt = (uint8_t *)pkt_ptrs[i];
             uint32_t pkt_len = pkt_lens[i];
 
-            int local_idx = local_idx_from_dst_mac(fwd, pkt, pkt_len);
+            uint32_t dest_ip = get_dest_ip(pkt, pkt_len);
+            int local_idx = forwarder_rx_pick_local(fwd, pkt, pkt_len, dest_ip);
             if (local_idx < 0) {
                 __sync_fetch_and_add(&fwd->total_dropped, 1);
-                __sync_fetch_and_add(&fwd->dropped_no_local_match, 1);
+                if (dest_ip == 0 && !config_wan_bridge_mode(fwd->cfg))
+                    __sync_fetch_and_add(&fwd->dropped_bad_ip, 1);
+                else
+                    __sync_fetch_and_add(&fwd->dropped_no_local_match, 1);
                 continue;
             }
 
@@ -2351,7 +1199,13 @@ static void *wan_queue_thread_no_crypto(void *arg) {
                     tq = args->wan_worker_index >= 0 ? (args->wan_worker_index % nq) : (tx_base % nq);
             }
 
-            ne_wan_rx_normalize_eth_ipv4_before_local_inject(pkt, pkt_len);
+            
+            if (set_local_l2_addrs(fwd, local_idx, dest_ip, pkt) != 0) {
+                __sync_fetch_and_add(&fwd->total_dropped, 1);
+                interface_recv_release_single_queue(wan, queue_idx, &addrs[i], 1);
+                continue;
+            }
+
             if (interface_send_to_local_batch_queue(local_iface, tq, local_cfg, pkt, pkt_len) == 0) {
                 __sync_fetch_and_add(&fwd->wan_to_local, 1);
                 local_used_queues[local_idx] |= (1u << tq);
@@ -2406,7 +1260,9 @@ static void *local_queue_thread_l2(void *arg) {
             wan_tx_q[w] = tx_base % fwd->wans[w].queue_count;
 
         for (int i = 0; i < rcvd; i++) {
-            learn_local_src_mac(fwd, local_idx, (const uint8_t *)pkt_ptrs[i], pkt_lens[i]);
+            if (config_wan_bridge_mode(fwd->cfg))
+                bridge_mac_learn_rx(fwd, local_idx, (const uint8_t *)pkt_ptrs[i], pkt_lens[i]);
+
             uint32_t src_ip = 0, dst_ip = 0;
             uint16_t src_port = 0, dst_port = 0;
             uint8_t protocol = 0;
@@ -2431,6 +1287,11 @@ static void *local_queue_thread_l2(void *arg) {
 
             uint32_t pkt_len = pkt_lens[i];
             uint8_t *pkt = (uint8_t *)pkt_ptrs[i];
+
+            if (set_wan_l2_addrs(fwd, wan_idx, pkt) != 0) {
+                __sync_fetch_and_add(&fwd->total_dropped, 1);
+                continue;
+            }
 
             const struct crypto_policy *cp = NULL;
             if (flow_ok) {
@@ -2460,12 +1321,8 @@ static void *local_queue_thread_l2(void *arg) {
                         apply_crypto_params_from_policy(cp);
                 }
             } else {
-#if CRYPTO_POLICY_PASS_UNMATCHED
-                drop_unmatched = 0;
-#else
                 drop_unmatched = (flow_ok && fwd->cfg && fwd->cfg->policy_count > 0) ? 1 : 0;
-#endif
-                bypass_crypto = !drop_unmatched;
+                bypass_crypto = 0;
             }
 
             if (drop_unmatched) {
@@ -2478,9 +1335,6 @@ static void *local_queue_thread_l2(void *arg) {
                     __sync_fetch_and_add(&fwd->local_to_wan, 1);
                     wan_used[wan_idx] = 1;
                 } else {
-                    ne_tx_class_log("TX_BYPASS_WAN_SEND_FAIL", "LOCAL_L2_THREAD", "bypass_wan_send_reject",
-                                    local_idx, wan->ifname, wan_idx, flow_ok, src_ip, src_port, dst_ip, dst_port,
-                                    protocol, pkt_len, "interface_send_batch_queue bypass");
                     __sync_fetch_and_add(&fwd->total_dropped, 1);
                 }
                 continue;
@@ -2488,58 +1342,43 @@ static void *local_queue_thread_l2(void *arg) {
 
             int split_done = 0;
             if (cp && cp->action == POLICY_ACTION_ENCRYPT_L2 && frag_need_split_l2(pkt_len)) {
-                char fd[32];
-                snprintf(fd, sizeof(fd), "policy=%u", (unsigned)cp->id);
-                ne_l2_trace_event("S1-LOCAL-IN", local->ifname, pkt, pkt_len, fd);
                 uint8_t f1[4096], f2[4096];
                 uint32_t l1, l2;
                 if (frag_split_and_encrypt_l2(use_ctx, pkt, pkt_len, f1, &l1, f2, &l2) == 0) {
                     split_done = 1;
-                    ne_l2_trace_event("S4-TX-WAN", wan->ifname, f1, l1, "part=0");
+                    if (set_wan_l2_addrs(fwd, wan_idx, f1) != 0 ||
+                        set_wan_l2_addrs(fwd, wan_idx, f2) != 0) {
+                        __sync_fetch_and_add(&fwd->total_dropped, 1);
+                        continue;
+                    }
                     if (interface_send_batch_queue(wan, tq, f1, l1) == 0) {
                         __sync_fetch_and_add(&fwd->local_to_wan, 1);
                         wan_used[wan_idx] = 1;
                     } else {
-                        ne_l2_trace_plain("S4-TX-WAN", wan->ifname, "FAIL send part=0");
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                     }
-                    ne_l2_trace_event("S4-TX-WAN", wan->ifname, f2, l2, "part=1");
                     if (interface_send_batch_queue(wan, tq, f2, l2) == 0) {
                         __sync_fetch_and_add(&fwd->local_to_wan, 1);
                         wan_used[wan_idx] = 1;
                     } else {
-                        ne_l2_trace_plain("S4-TX-WAN", wan->ifname, "FAIL send part=1");
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                     }
                 } else {
-                    ne_l2_trace_plain("S2-FRAG-SPLIT", local->ifname, "FAIL split+encrypt");
                     __sync_fetch_and_add(&fwd->total_dropped, 1);
                     continue;
                 }
             }
 
             if (!split_done) {
-                {
-                    char fd[32];
-                    if (cp)
-                        snprintf(fd, sizeof(fd), "policy=%u", (unsigned)cp->id);
-                    else
-                        fd[0] = '\0';
-                    ne_l2_trace_event("S1-LOCAL-IN", local->ifname, pkt, pkt_lens[i],
-                                      cp ? fd : NULL);
-                }
                 if (encrypt_packet_with_ctx(use_ctx, pkt_ptrs[i], &pkt_len) != 0) {
-                    ne_l2_trace_plain("S3-FRAG-ENC", local->ifname, "FAIL encrypt_packet_with_ctx");
                     __sync_fetch_and_add(&fwd->total_dropped, 1);
                     continue;
                 }
 
-                ne_l2_trace_event("S4-TX-WAN", wan->ifname, pkt_ptrs[i], pkt_len, "single");
                 if (interface_send_batch_queue(wan, tq, pkt_ptrs[i], pkt_len) == 0) {
                     __sync_fetch_and_add(&fwd->local_to_wan, 1);
                     wan_used[wan_idx] = 1;
                 } else {
-                    ne_l2_trace_plain("S4-TX-WAN", wan->ifname, "FAIL send single");
                     __sync_fetch_and_add(&fwd->total_dropped, 1);
                 }
             }
@@ -2582,7 +1421,9 @@ static void *local_queue_thread_l3l4(void *arg) {
 
 
         for (int i = 0; i < rcvd; i++) {
-            learn_local_src_mac(fwd, local_idx, (const uint8_t *)pkt_ptrs[i], pkt_lens[i]);
+            if (config_wan_bridge_mode(fwd->cfg))
+                bridge_mac_learn_rx(fwd, local_idx, (const uint8_t *)pkt_ptrs[i], pkt_lens[i]);
+
             struct packet_job job;
             job.fwd = fwd;
             job.local_idx = local_idx;
@@ -2605,16 +1446,6 @@ static void *local_queue_thread_l3l4(void *arg) {
             pthread_mutex_unlock(&ring->lock);
 
             if (!enqueued) {
-                uint32_t sip = 0, dip = 0;
-                uint16_t sp = 0, dp = 0;
-                uint8_t pr = 0;
-                int pfo = (parse_flow(pkt_ptrs[i], pkt_lens[i], &sip, &dip, &sp, &dp, &pr) == 0);
-                const char *lif = (local_idx >= 0 && local_idx < fwd->local_count)
-                                      ? fwd->locals[local_idx].ifname
-                                      : "?";
-                ne_tx_class_log("TX_WORKER_RING_FULL", "LOCAL_L3L4_THREAD", "g_worker_ring_saturated", local_idx,
-                                lif, -1, pfo, sip, sp, dip, dp, pr, pkt_lens[i],
-                                "WORKER_RING_SIZE see NE-HYP H05");
                 __sync_fetch_and_add(&fwd->total_dropped, 1);
                 interface_recv_release_single_queue(local, queue_idx, &addrs[i], 1);
             }
@@ -2648,6 +1479,7 @@ static void *wan_queue_thread_l2(void *arg) {
                                                 pkt_ptrs, pkt_lens, addrs, batch_size);
         if (rcvd <= 0)
             continue;
+
         packet_critical_enter();
 
         uint32_t local_used_queues[MAX_INTERFACES] = {0};
@@ -2662,94 +1494,73 @@ static void *wan_queue_thread_l2(void *arg) {
             uint8_t *final_pkt = pkt;
             uint32_t final_len = pkt_len;
 
-            const int ne_l2_wire = ne_l2_pkt_is_wire_enc(pkt, pkt_len);
-
-            if (ne_l2_wire)
-                ne_l2_trace_event("S5-RX-WAN", wan->ifname, pkt, pkt_len, NULL);
-
-            if (decrypt_packet_auto_l2(fwd, pkt, &pkt_len,
-                                        decrypt_scratch, sizeof(decrypt_scratch)) != 0) {
-                __sync_fetch_and_add(&fwd->total_dropped, 1);
-                continue;
-            }
-
-            if (ne_l2_wire)
-                ne_l2_trace_event("S6-RX-DEC", wan->ifname, pkt, pkt_len, NULL);
 
             {
                 uint16_t fpid;
                 uint8_t fidx;
-                if (frag_is_fragment_l2(pkt, pkt_len, &fpid, &fidx)) {
-                    if (ne_l2_wire)
-                        ne_l2_trace_frag("S7-FRAG-RX", wan->ifname, fpid, fidx, 1, pkt, pkt_len,
-                                         "after L2 decrypt");
+                if (frag_is_fragment_l2(fwd->cfg, pkt, pkt_len, &fpid, &fidx)) {
+                    struct packet_crypto_ctx *l2ctx = forwarder_resolve_l2_decrypt_ctx(fwd, pkt);
+                    if (!l2ctx) {
+                        __sync_fetch_and_add(&fwd->total_dropped, 1);
+                        continue;
+                    }
+                    uint16_t opid;
+                    uint8_t ofidx;
+                    int nd = crypto_layer2_decrypt_fragment(l2ctx, pkt, pkt_len, &opid, &ofidx);
+                    if (nd < 0) {
+                        __sync_fetch_and_add(&fwd->total_dropped, 1);
+                        continue;
+                    }
+                    pkt_len = (uint32_t)nd;
                     uint8_t reass_buf[4096];
                     uint32_t reass_len = 0;
                     int rr;
                     pthread_mutex_lock(&g_wan_frag_l2_mu);
-                    rr = frag_try_reassemble_l2(&g_wan_frag_l2, pkt, pkt_len, fpid, fidx,
+                    rr = frag_try_reassemble_l2(&g_wan_frag_l2, pkt, pkt_len, opid, ofidx,
                                                 reass_buf, &reass_len);
                     pthread_mutex_unlock(&g_wan_frag_l2_mu);
-                    if (rr == 0)
+                    if (rr == 0) {
                         continue;
+                    }
                     if (rr != 1) {
-                        if (ne_l2_wire) {
-                            char detail[80];
-                            snprintf(detail, sizeof(detail), "reasm_fail rr=%d", rr);
-                            ne_l2_trace_frag("S8-FRAG-REASM", wan->ifname, fpid, fidx, 1, pkt,
-                                             pkt_len, detail);
-                        }
-                        // #region agent log
-                        if (rr < 0 && fidx == 1) {
-                            char kv[80];
-                            snprintf(kv, sizeof(kv), "\"pkt_id\":%u,\"wan\":\"%s\"",
-                                     (unsigned)fpid, wan->ifname);
-                            ne_agent_dbg("H3", "forwarder.c:wan_l2", "frag1_reasm_fail", "pre-fix",
-                                         kv);
-                        }
-                        // #endregion
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                         continue;
                     }
                     memcpy(pkt, reass_buf, reass_len);
                     pkt_len = reass_len;
+                } else if (decrypt_packet_auto_l2(fwd, pkt, &pkt_len,
+                                                  decrypt_scratch,
+                                                  sizeof(decrypt_scratch)) != 0) {
+                    __sync_fetch_and_add(&fwd->total_dropped, 1);
+                    continue;
                 }
-            }
-
-            if (wan_rx_inner_ne_after_outer_l2(fwd, pkt, &pkt_len, decrypt_scratch,
-                                               sizeof(decrypt_scratch)) != 0) {
-                uint32_t sip = 0, dip = 0;
-                uint16_t sp = 0, dp = 0;
-                uint8_t pr = 0;
-                int wf = (parse_flow(pkt, pkt_len, &sip, &dip, &sp, &dp, &pr) == 0);
-                ne_rx_class_log("RX_L2_WAN_INNER_NE_FAIL", wan->ifname, wan_idx, "RX_L2_WAN",
-                                "inner_L3_or_L4_decrypt_fail_after_L2", pkt_len, wf, sip, sp, dip, dp, pr,
-                                "wan_rx_inner_ne_after_outer_l2");
-                __sync_fetch_and_add(&fwd->total_dropped, 1);
-                continue;
             }
 
             final_pkt = pkt;
             final_len = pkt_len;
 
 
-            int local_idx = local_idx_from_dst_mac(fwd, final_pkt, final_len);
+            uint32_t dest_ip = get_dest_ip(final_pkt, final_len);
+            int local_idx = forwarder_rx_pick_local(fwd, final_pkt, final_len, dest_ip);
             if (local_idx < 0) {
                 uint32_t fs = 0, fd = 0;
                 uint16_t fsp = 0, fdp = 0;
                 uint8_t fp = 0;
-                int pf = (parse_flow(final_pkt, final_len, &fs, &fd, &fsp, &fdp, &fp) == 0);
-                if (pf && tcp_diag_want_log(fp, fsp, fdp)) {
-                    fprintf(stderr, "[TCP-DIAG][DROP-NO-LOCAL] dst_mac=%02x:%02x:%02x:%02x:%02x:%02x flow=%u:%u -> %u:%u len=%u\n",
-                            final_pkt[0], final_pkt[1], final_pkt[2],
-                            final_pkt[3], final_pkt[4], final_pkt[5],
-                            ntohl(fs), (unsigned)fsp, ntohl(fd), (unsigned)fdp, (unsigned)final_len);
+                if (g_tcp_diag_enabled &&
+                    parse_flow(final_pkt, final_len, &fs, &fd, &fsp, &fdp, &fp) == 0 &&
+                    is_ssh_flow(fp, fsp, fdp)) {
+                    if (dest_ip == 0 && !config_wan_bridge_mode(fwd->cfg))
+                        fprintf(stderr, "[TCP-DIAG][DROP-BAD-IP] flow=%u:%u -> %u:%u len=%u\n",
+                                ntohl(fs), (unsigned)fsp, ntohl(fd), (unsigned)fdp, (unsigned)final_len);
+                    else
+                        fprintf(stderr, "[TCP-DIAG][DROP-NO-LOCAL] dst_ip=%u flow=%u:%u -> %u:%u len=%u\n",
+                                ntohl(dest_ip), ntohl(fs), (unsigned)fsp, ntohl(fd), (unsigned)fdp, (unsigned)final_len);
                 }
-                ne_rx_class_log("RX_DST_MAC_NO_LOCAL", wan->ifname, wan_idx, "TO_LOCAL",
-                                "dst_mac_unknown_bridge", final_len, pf, fs, fsp, fd, fdp, fp,
-                                "L2_only_WAN_RX_path");
                 __sync_fetch_and_add(&fwd->total_dropped, 1);
-                __sync_fetch_and_add(&fwd->dropped_no_local_match, 1);
+                if (dest_ip == 0 && !config_wan_bridge_mode(fwd->cfg))
+                    __sync_fetch_and_add(&fwd->dropped_bad_ip, 1);
+                else
+                    __sync_fetch_and_add(&fwd->dropped_no_local_match, 1);
                 continue;
             }
 
@@ -2769,23 +1580,36 @@ static void *wan_queue_thread_l2(void *arg) {
                     tq = args->wan_worker_index >= 0 ? (args->wan_worker_index % nq) : (tx_base % nq);
             }
 
-            ne_wan_rx_normalize_eth_ipv4_before_local_inject(final_pkt, final_len);
-            if (ne_l2_wire) {
-                if (final_len >= 14U && final_pkt[12] == 0x88U)
-                    ne_l2_trace_event("S9-TX-PFSENSE", local_iface->ifname, final_pkt, final_len,
-                                      "LEAK still_encrypted");
-                else
-                    ne_l2_trace_event("S9-TX-PFSENSE", local_iface->ifname, final_pkt, final_len, NULL);
+            if (set_local_l2_addrs(fwd, local_idx, dest_ip, final_pkt) != 0) {
+                uint32_t fs = 0, fd = 0;
+                uint16_t fsp = 0, fdp = 0;
+                uint8_t fp = 0;
+                if (g_tcp_diag_enabled &&
+                    parse_flow(final_pkt, final_len, &fs, &fd, &fsp, &fdp, &fp) == 0 &&
+                    is_ssh_flow(fp, fsp, fdp)) {
+                    fprintf(stderr, "[TCP-DIAG][DROP-ARP-MISS] local=%s dst_ip=%u flow=%u:%u -> %u:%u len=%u\n",
+                            fwd->cfg->locals[local_idx].ifname, ntohl(dest_ip),
+                            ntohl(fs), (unsigned)fsp, ntohl(fd), (unsigned)fdp, (unsigned)final_len);
+                }
+                __sync_fetch_and_add(&fwd->total_dropped, 1);
+                continue;
             }
+
             if (interface_send_to_local_batch_queue(local_iface, tq, local_cfg, final_pkt, final_len) == 0) {
                 __sync_fetch_and_add(&fwd->wan_to_local, 1);
                 if (tq < 32)
                     local_used_queues[local_idx] |= (1u << tq);
-            } else if (ne_l2_wire) {
-                ne_l2_trace_plain("S9-TX-PFSENSE", local_iface->ifname, "FAIL inject local");
-                __sync_fetch_and_add(&fwd->total_dropped, 1);
-                __sync_fetch_and_add(&fwd->dropped_local_tx_fail, 1);
             } else {
+                uint32_t fs = 0, fd = 0;
+                uint16_t fsp = 0, fdp = 0;
+                uint8_t fp = 0;
+                if (g_tcp_diag_enabled &&
+                    parse_flow(final_pkt, final_len, &fs, &fd, &fsp, &fdp, &fp) == 0 &&
+                    is_ssh_flow(fp, fsp, fdp)) {
+                    fprintf(stderr, "[TCP-DIAG][DROP-LOCAL-TX] local=%s q=%d flow=%u:%u -> %u:%u len=%u\n",
+                            local_iface->ifname, tq,
+                            ntohl(fs), (unsigned)fsp, ntohl(fd), (unsigned)fdp, (unsigned)final_len);
+                }
                 __sync_fetch_and_add(&fwd->total_dropped, 1);
                 __sync_fetch_and_add(&fwd->dropped_local_tx_fail, 1);
             }
@@ -2831,8 +1655,12 @@ static void *wan_queue_thread_l3l4(void *arg) {
 
         uint32_t local_used_queues[MAX_INTERFACES] = {0};
 
+        pthread_mutex_lock(&g_wan_frag_l3_mu);
         frag_table_gc(&g_wan_frag_l3);
+        pthread_mutex_unlock(&g_wan_frag_l3_mu);
+        pthread_mutex_lock(&g_wan_frag_l4_mu);
         frag_table_gc(&g_wan_frag_l4);
+        pthread_mutex_unlock(&g_wan_frag_l4_mu);
 
         for (int i = 0; i < rcvd; i++) {
             uint8_t *pkt = (uint8_t *)pkt_ptrs[i];
@@ -2849,13 +1677,11 @@ static void *wan_queue_thread_l3l4(void *arg) {
                                            &wire_src_ip, &wire_dst_ip,
                                            &wire_src_port, &wire_dst_port,
                                            &wire_proto) == 0);
-            ne_rx_pkt_recv_log(wan, wan_idx, pkt, wire_len, wire_flow_ok,
-                               wire_src_ip, wire_src_port, wire_dst_ip, wire_dst_port, wire_proto);
-            if (wire_flow_ok && tcp_diag_want_log(wire_proto, wire_src_port, wire_dst_port)) {
-                uint32_t l3pid = 0, l4pid = 0;
+            if (wire_flow_ok && is_ssh_flow(wire_proto, wire_src_port, wire_dst_port)) {
+                uint8_t l3pid = 0, l4pid = 0;
                 int l4nonce = 0;
-                int l3ok = (crypto_l3_extract_policy_id(wire_pkt, wire_len, &l3pid) == 0);
-                int l4ok = (crypto_l4_extract_policy_id_ipv4(wire_pkt, wire_len, &l4pid, &l4nonce) == 0);
+                int l3ok = (crypto_l3_extract_policy_id(fwd->cfg, wire_pkt, wire_len, &l3pid) == 0);
+                int l4ok = (crypto_l4_extract_policy_id_ipv4(fwd->cfg, wire_pkt, wire_len, &l4pid, &l4nonce) == 0);
                 log_tcp_diag_decrypt("RX-WIRE",
                                      wire_src_ip, wire_src_port, wire_dst_ip, wire_dst_port,
                                      POLICY_ACTION_ENCRYPT_L4,
@@ -2868,117 +1694,110 @@ static void *wan_queue_thread_l3l4(void *arg) {
 
             if (crypto_enabled && crypto_layer == POLICY_ACTION_ENCRYPT_L3 &&
                 fwd->cfg && fwd->cfg->policy_count > 0) {
-                uint16_t et_prime = ((uint16_t)pkt[12] << 8) | pkt[13];
-                /* L2-on-WAN uses 0x88xx; l3_extract needs IPv4 — skip priming until after L2 strip. */
-                if (et_prime == 0x0800) {
-                    uint32_t policy_id = 0;
-                    int found = 0;
-                    if (l3_extract_policy_id(pkt, pkt_len, &policy_id) == 0) {
-                        int pi = fwd_pi_for_action_wire(fwd, POLICY_ACTION_ENCRYPT_L3, policy_id);
-                        if (pi >= 0 && pi < fwd->cfg->policy_count && g_policy_crypto_ctx_ready[pi]) {
-                            const struct crypto_policy *cp = &fwd->cfg->policies[pi];
-                            apply_crypto_params_from_policy(cp);
+                uint8_t policy_id = 0;
+                int found = 0;
+                if (l3_extract_policy_id(fwd->cfg, pkt, pkt_len, &policy_id) == 0) {
+                    int pi = g_policy_index_by_action_id[POLICY_ACTION_ENCRYPT_L3][policy_id];
+                    if (pi >= 0 && pi < fwd->cfg->policy_count && g_policy_crypto_ctx_ready[pi]) {
+                        const struct crypto_policy *cp = &fwd->cfg->policies[pi];
+                        apply_crypto_params_from_policy(cp);
+                        found = 1;
+                    }
+                    if (!found && prev_policy_grace_active()) {
+                        int ppi = g_prev_policy_index_by_action_id[POLICY_ACTION_ENCRYPT_L3][policy_id];
+                        if (ppi >= 0 && ppi < g_prev_policy_count && g_prev_policy_crypto_ctx_ready[ppi]) {
+                            const struct crypto_policy *cp_prev = &g_prev_policies[ppi];
+                            apply_crypto_params_from_policy(cp_prev);
                             found = 1;
                         }
-                        if (!found && prev_policy_grace_active()) {
-                            int ppi = fwd_prev_pi_for_action_wire(POLICY_ACTION_ENCRYPT_L3, policy_id);
-                            if (ppi >= 0 && ppi < g_prev_policy_count && g_prev_policy_crypto_ctx_ready[ppi]) {
-                                const struct crypto_policy *cp_prev = &g_prev_policies[ppi];
-                                apply_crypto_params_from_policy(cp_prev);
-                                found = 1;
-                            }
-                        }
                     }
-                    if (!found)
-                        apply_default_crypto_params(fwd);
                 }
+                if (!found)
+                    apply_default_crypto_params(fwd);
             }
 
 
             {
                 uint8_t pkt_marker = pkt[12];
-                uint16_t f4 = packet_crypto_get_fake_ethertype_ipv4();
-                if (f4 == 0)
-                    f4 = NE_DEFAULT_FAKE_ETHERTYPE_IPV4;
-                int has_l2_marker = (pkt_marker == (uint8_t)(f4 >> 8));
+                uint16_t fake_ipv4 = packet_crypto_get_fake_ethertype_ipv4();
+                int has_l2_marker = fake_ipv4 && pkt_marker == (uint8_t)(fake_ipv4 >> 8);
                 if (has_l2_marker) {
-                    if (decrypt_packet_auto_l2(fwd, pkt, &pkt_len,
-                                               decrypt_scratch,
-                                               sizeof(decrypt_scratch)) != 0) {
-                        ne_rx_class_log("RX_L2_MARKER_DECRYPT_FAIL", wan->ifname, wan_idx, "RX_L2_MARKER",
-                                        "L2_decrypt_fail_on_L3L4_thread", wire_len, wire_flow_ok,
-                                        wire_src_ip, wire_src_port, wire_dst_ip, wire_dst_port, wire_proto,
-                                        "decrypt_packet_auto_l2");
+                    uint16_t l2fpid;
+                    uint8_t l2fidx;
+                    if (frag_is_fragment_l2(fwd->cfg, pkt, pkt_len, &l2fpid, &l2fidx)) {
+                        struct packet_crypto_ctx *l2ctx =
+                            forwarder_resolve_l2_decrypt_ctx(fwd, pkt);
+                        if (!l2ctx) {
+                            __sync_fetch_and_add(&fwd->total_dropped, 1);
+                            continue;
+                        }
+                        uint16_t opid;
+                        uint8_t ofidx;
+                        int nd = crypto_layer2_decrypt_fragment(l2ctx, pkt, pkt_len, &opid, &ofidx);
+                        if (nd < 0) {
+                            __sync_fetch_and_add(&fwd->total_dropped, 1);
+                            continue;
+                        }
+                        pkt_len = (uint32_t)nd;
+                        uint8_t reass_l2[4096];
+                        uint32_t reass_l2_len = 0;
+                        int rr;
+                        pthread_mutex_lock(&g_wan_frag_l2_mu);
+                        rr = frag_try_reassemble_l2(&g_wan_frag_l2, pkt, pkt_len, opid, ofidx,
+                                                    reass_l2, &reass_l2_len);
+                        pthread_mutex_unlock(&g_wan_frag_l2_mu);
+                        if (rr == 0) {
+                            continue;
+                        }
+                        if (rr != 1) {
+                            __sync_fetch_and_add(&fwd->total_dropped, 1);
+                            continue;
+                        }
+                        memcpy(pkt, reass_l2, reass_l2_len);
+                        pkt_len = reass_l2_len;
+                    } else if (decrypt_packet_auto_l2(fwd, pkt, &pkt_len,
+                                                      decrypt_scratch,
+                                                      sizeof(decrypt_scratch)) != 0) {
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                         continue;
                     }
-                }
-            }
-
-            {
-                uint16_t et = ((uint16_t)pkt[12] << 8) | pkt[13];
-                if (et != 0x0800 && pkt_len >= 14U && pkt[12] == 0x88U) {
-                    ne_rx_class_log("RX_WAN_NE_ETH_NOT_IPV4", wan->ifname, wan_idx, "RX_WAN_GIBBERISH",
-                                    "eth_88xx_not_decrypted_to_0800", wire_len, wire_flow_ok,
-                                    wire_src_ip, wire_src_port, wire_dst_ip, wire_dst_port, wire_proto,
-                                    "block_forward_ciphertext");
-                    __sync_fetch_and_add(&fwd->total_dropped, 1);
-                    continue;
                 }
             }
 
             if (crypto_enabled) {
                 uint16_t l3_frag_pid;
                 uint8_t l3_frag_idx;
-                if (frag_is_fragment(pkt, pkt_len, &l3_frag_pid, &l3_frag_idx)) {
-                    uint32_t l3_pid = 0;
-                    if (crypto_l3_extract_policy_id(pkt, pkt_len, &l3_pid) == 0) {
+                if (frag_is_fragment(fwd->cfg, pkt, pkt_len, &l3_frag_pid, &l3_frag_idx)) {
+                    uint8_t l3_pid = 0;
+                    if (crypto_l3_extract_policy_id(fwd->cfg, pkt, pkt_len, &l3_pid) == 0) {
                         int pi = policy_index_from_action_id_current(fwd, POLICY_ACTION_ENCRYPT_L3, l3_pid);
                         if (pi >= 0)
                             inbound_policy_pi = pi;
                     }
                     struct packet_crypto_ctx *l3ctx = forwarder_resolve_l3_decrypt_ctx(fwd, pkt, pkt_len);
                     if (!l3ctx) {
-                        char detail[96];
-                        snprintf(detail, sizeof(detail), "L3_frag opid=%u idx=%u no_decrypt_ctx", l3_frag_pid,
-                                 l3_frag_idx);
-                        ne_rx_class_log("RX_L3_FRAG_NO_DECRYPT_CTX", wan->ifname, wan_idx, "RX_L3_FRAG",
-                                        "L3_frag_no_crypto_ctx_or_policy", wire_len, wire_flow_ok,
-                                        wire_src_ip, wire_src_port, wire_dst_ip, wire_dst_port, wire_proto,
-                                        detail);
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                         continue;
                     }
                     uint16_t opid;
                     uint8_t ofidx;
-                    int nd = frag_decrypt_fragment(l3ctx, pkt, pkt_len, &opid, &ofidx);
-                    packet_crypto_set_l3_restore_ipproto_from_db(0);
+                    int nd = crypto_layer3_decrypt_fragment(l3ctx, pkt, pkt_len, &opid, &ofidx);
                     if (nd < 0) {
-                        char detail[96];
-                        snprintf(detail, sizeof(detail), "L3_frag opid=%u idx=%u frag_decrypt rc=%d", opid, ofidx,
-                                 nd);
-                        ne_rx_class_log("RX_L3_FRAG_DECRYPT_FAIL", wan->ifname, wan_idx, "RX_L3_FRAG",
-                                        "L3_frag_decrypt_fail_key_or_corrupt", wire_len, wire_flow_ok,
-                                        wire_src_ip, wire_src_port, wire_dst_ip, wire_dst_port, wire_proto,
-                                        detail);
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                         continue;
                     }
                     pkt_len = (uint32_t)nd;
                     uint8_t reass_buf[4096];
                     uint32_t reass_len = 0;
-                    int rr = frag_try_reassemble(&g_wan_frag_l3, pkt, pkt_len, opid, ofidx,
-                                                 reass_buf, &reass_len);
+                    int rr;
+                    pthread_mutex_lock(&g_wan_frag_l3_mu);
+                    rr = frag_try_reassemble(&g_wan_frag_l3, pkt, pkt_len, opid, ofidx,
+                                             reass_buf, &reass_len);
+                    pthread_mutex_unlock(&g_wan_frag_l3_mu);
                     if (rr == 0) {
                         continue;
                     }
                     if (rr != 1) {
-                        char detail[96];
-                        snprintf(detail, sizeof(detail), "L3_frag opid=%u idx=%u rr=%d", opid, ofidx, rr);
-                        ne_rx_class_log("RX_L3_REASSEMBLE_FAIL", wan->ifname, wan_idx, "RX_L3_FRAG",
-                                        "L3_reassemble_fail_fragment_state", wire_len, wire_flow_ok,
-                                        wire_src_ip, wire_src_port, wire_dst_ip, wire_dst_port, wire_proto,
-                                        detail);
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                         continue;
                     }
@@ -2991,16 +1810,13 @@ static void *wan_queue_thread_l3l4(void *arg) {
                     uint32_t ds = 0, dd = 0;
                     uint16_t dsp = 0, ddp = 0;
                     uint8_t dproto = 0;
-                    int pfl3 = (parse_flow(wire_pkt, wire_len, &ds, &dd, &dsp, &ddp, &dproto) == 0);
-                    ne_rx_class_log("RX_L3_FULL_DECRYPT_FAIL", wan->ifname, wan_idx, "RX_L3_FULL",
-                                    "L3_full_decrypt_fail_key_or_corrupt", wire_len, pfl3, ds, dsp, dd, ddp, dproto,
-                                    "decrypt_packet_auto_by_action enc_l3");
-                    if (pfl3 && tcp_diag_want_log(dproto, dsp, ddp)) {
-                        uint32_t l3pid = 0;
+                    if (parse_flow(wire_pkt, wire_len, &ds, &dd, &dsp, &ddp, &dproto) == 0 &&
+                        is_ssh_flow(dproto, dsp, ddp)) {
+                        uint8_t l3pid = 0;
                         int l4nonce = 0;
-                        uint32_t l4pid = 0;
-                        int l3ok = (crypto_l3_extract_policy_id(wire_pkt, wire_len, &l3pid) == 0);
-                        int l4ok = (crypto_l4_extract_policy_id_ipv4(wire_pkt, wire_len, &l4pid, &l4nonce) == 0);
+                        uint8_t l4pid = 0;
+                        int l3ok = (crypto_l3_extract_policy_id(fwd->cfg, wire_pkt, wire_len, &l3pid) == 0);
+                        int l4ok = (crypto_l4_extract_policy_id_ipv4(fwd->cfg, wire_pkt, wire_len, &l4pid, &l4nonce) == 0);
                         log_tcp_diag_decrypt("RX-DEC-FAIL",
                                              ds, dsp, dd, ddp,
                                              POLICY_ACTION_ENCRYPT_L3,
@@ -3011,68 +1827,41 @@ static void *wan_queue_thread_l3l4(void *arg) {
                     __sync_fetch_and_add(&fwd->total_dropped, 1);
                     continue;
                 } else {
-                    uint32_t l3_pid = 0;
-                    if (crypto_l3_extract_policy_id(wire_pkt, wire_len, &l3_pid) == 0) {
+                    uint8_t l3_pid = 0;
+                    if (crypto_l3_extract_policy_id(fwd->cfg, wire_pkt, wire_len, &l3_pid) == 0) {
                         int pi = policy_index_from_action_id_current(fwd, POLICY_ACTION_ENCRYPT_L3, l3_pid);
                         if (pi >= 0)
                             inbound_policy_pi = pi;
                     }
                 }
 
-                int wan_rx_cleartext_ssh = 0;
-                {
-                    uint32_t cx_sip, cx_dip;
-                    uint16_t cx_sport, cx_dport;
-                    uint8_t cx_proto;
-                    if (parse_flow(pkt, pkt_len, &cx_sip, &cx_dip, &cx_sport, &cx_dport, &cx_proto) == 0 &&
-                        tcp_diag_want_log(cx_proto, cx_sport, cx_dport))
-                        wan_rx_cleartext_ssh = 1;
-                }
-
                 uint16_t l4_frag_pid;
                 uint8_t l4_frag_idx;
-                if (frag_is_fragment_l4(pkt, pkt_len, &l4_frag_pid, &l4_frag_idx)) {
+                if (frag_is_fragment_l4(fwd->cfg, pkt, pkt_len, &l4_frag_pid, &l4_frag_idx)) {
                     struct packet_crypto_ctx *l4ctx = forwarder_resolve_l4_decrypt_ctx(fwd, pkt, pkt_len);
                     if (!l4ctx) {
-                        char detail[96];
-                        snprintf(detail, sizeof(detail), "L4_frag opid=%u idx=%u no_decrypt_ctx", l4_frag_pid,
-                                 l4_frag_idx);
-                        ne_rx_class_log("RX_L4_FRAG_NO_DECRYPT_CTX", wan->ifname, wan_idx, "RX_L4_FRAG",
-                                        "L4_frag_no_crypto_ctx_or_policy", wire_len, wire_flow_ok,
-                                        wire_src_ip, wire_src_port, wire_dst_ip, wire_dst_port, wire_proto,
-                                        detail);
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                         continue;
                     }
                     uint16_t opid2;
                     uint8_t ofidx2;
-                    int nd4 = frag_decrypt_fragment_l4(l4ctx, pkt, pkt_len, &opid2, &ofidx2);
+                    int nd4 = crypto_layer4_decrypt_fragment(l4ctx, pkt, pkt_len, &opid2, &ofidx2);
                     if (nd4 < 0) {
-                        char detail[96];
-                        snprintf(detail, sizeof(detail), "L4_frag opid=%u idx=%u frag_decrypt rc=%d", opid2,
-                                 ofidx2, nd4);
-                        ne_rx_class_log("RX_L4_FRAG_DECRYPT_FAIL", wan->ifname, wan_idx, "RX_L4_FRAG",
-                                        "L4_frag_decrypt_fail_key_or_corrupt", wire_len, wire_flow_ok,
-                                        wire_src_ip, wire_src_port, wire_dst_ip, wire_dst_port, wire_proto,
-                                        detail);
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                         continue;
                     }
                     pkt_len = (uint32_t)nd4;
                     uint8_t reass4[4096];
                     uint32_t reass4_len = 0;
-                    int rr4 = frag_try_reassemble_l4(&g_wan_frag_l4, pkt, pkt_len, opid2, ofidx2,
-                                                     reass4, &reass4_len);
+                    int rr4;
+                    pthread_mutex_lock(&g_wan_frag_l4_mu);
+                    rr4 = frag_try_reassemble_l4(&g_wan_frag_l4, pkt, pkt_len, opid2, ofidx2,
+                                                 reass4, &reass4_len);
+                    pthread_mutex_unlock(&g_wan_frag_l4_mu);
                     if (rr4 == 0) {
                         continue;
                     }
                     if (rr4 != 1) {
-                        char detail[96];
-                        snprintf(detail, sizeof(detail), "L4_frag opid=%u idx=%u rr=%d", opid2, ofidx2, rr4);
-                        ne_rx_class_log("RX_L4_REASSEMBLE_FAIL", wan->ifname, wan_idx, "RX_L4_FRAG",
-                                        "L4_reassemble_fail_fragment_state", wire_len, wire_flow_ok,
-                                        wire_src_ip, wire_src_port, wire_dst_ip, wire_dst_port, wire_proto,
-                                        detail);
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                         continue;
                     }
@@ -3085,16 +1874,13 @@ static void *wan_queue_thread_l3l4(void *arg) {
                     uint32_t ds = 0, dd = 0;
                     uint16_t dsp = 0, ddp = 0;
                     uint8_t dproto = 0;
-                    int pfl4 = (parse_flow(wire_pkt, wire_len, &ds, &dd, &dsp, &ddp, &dproto) == 0);
-                    ne_rx_class_log("RX_L4_FULL_DECRYPT_FAIL", wan->ifname, wan_idx, "RX_L4_FULL",
-                                    "L4_full_decrypt_fail_key_or_corrupt", wire_len, pfl4, ds, dsp, dd, ddp, dproto,
-                                    "decrypt_packet_auto_by_action enc_l4");
-                    if (pfl4 && tcp_diag_want_log(dproto, dsp, ddp)) {
-                        uint32_t l3pid = 0;
+                    if (parse_flow(wire_pkt, wire_len, &ds, &dd, &dsp, &ddp, &dproto) == 0 &&
+                        is_ssh_flow(dproto, dsp, ddp)) {
+                        uint8_t l3pid = 0;
                         int l4nonce = 0;
-                        uint32_t l4pid = 0;
-                        int l3ok = (crypto_l3_extract_policy_id(wire_pkt, wire_len, &l3pid) == 0);
-                        int l4ok = (crypto_l4_extract_policy_id_ipv4(wire_pkt, wire_len, &l4pid, &l4nonce) == 0);
+                        uint8_t l4pid = 0;
+                        int l3ok = (crypto_l3_extract_policy_id(fwd->cfg, wire_pkt, wire_len, &l3pid) == 0);
+                        int l4ok = (crypto_l4_extract_policy_id_ipv4(fwd->cfg, wire_pkt, wire_len, &l4pid, &l4nonce) == 0);
                         log_tcp_diag_decrypt("RX-DEC-FAIL",
                                              ds, dsp, dd, ddp,
                                              POLICY_ACTION_ENCRYPT_L4,
@@ -3104,8 +1890,7 @@ static void *wan_queue_thread_l3l4(void *arg) {
                     }
                     __sync_fetch_and_add(&fwd->total_dropped, 1);
                     continue;
-                } else if ((wire_flow_ok && tcp_diag_want_log(wire_proto, wire_src_port, wire_dst_port)) ||
-                           wan_rx_cleartext_ssh) {
+                } else if (wire_flow_ok && is_ssh_flow(wire_proto, wire_src_port, wire_dst_port)) {
                     uint32_t ps = 0, pd = 0;
                     uint16_t psp = 0, pdp = 0;
                     uint8_t pp = 0;
@@ -3115,33 +1900,10 @@ static void *wan_queue_thread_l3l4(void *arg) {
                                              wire_len, pkt_len,
                                              post_ok, post_ok ? pp : 0,
                                              post_ok ? psp : 0, post_ok ? pdp : 0);
-                    if (g_tcp_diag_enabled &&
-                        is_ssh_flow(wire_proto, wire_src_port, wire_dst_port)) {
-                        uint8_t tf = 0;
-                        char fg[64];
-                        if (tcp_ipv4_tcp_flags(pkt, pkt_len, &tf) == 0)
-                            tcp_diag_flags_fmt(tf, fg, sizeof(fg));
-                        else
-                            snprintf(fg, sizeof(fg), "unk");
-                        fprintf(stderr,
-                                "[TCP-DIAG][SSH-RX-DEC] post_dec tcp=[%s] cleartext_len=%u\n",
-                                fg, (unsigned)pkt_len);
-                    }
-                    if (!post_ok) {
-                        ne_rx_class_log("RX_POST_DECRYPT_PARSE_FAIL", wan->ifname, wan_idx, "POST_DECRYPT",
-                                        "cleartext_parse_fail_NE_output_corrupt", wire_len, wire_flow_ok,
-                                        wire_src_ip, wire_src_port, wire_dst_ip, wire_dst_port, wire_proto,
-                                        "parse_flow failed after decrypt");
-                    } else if (!ne_rx_ipv4_frame_plausible(pkt, pkt_len)) {
-                        ne_rx_class_log("RX_POST_DECRYPT_IPV4_SHAPE_BAD", wan->ifname, wan_idx, "POST_DECRYPT",
-                                        "cleartext_IPv4_length_inconsistent", wire_len, 1,
-                                        ps, psp, pd, pdp, pp,
-                                        "totlen/ihl/tcp vs buffer after decrypt");
-                    }
                 } else if (inbound_policy_pi < 0) {
-                    uint32_t l4_pid = 0;
+                    uint8_t l4_pid = 0;
                     int l4_nonce = 0;
-                    if (crypto_l4_extract_policy_id_ipv4(wire_pkt, wire_len, &l4_pid, &l4_nonce) == 0) {
+                    if (crypto_l4_extract_policy_id_ipv4(fwd->cfg, wire_pkt, wire_len, &l4_pid, &l4_nonce) == 0) {
                         int pi = policy_index_from_action_id_current(fwd, POLICY_ACTION_ENCRYPT_L4, l4_pid);
                         if (pi >= 0)
                             inbound_policy_pi = pi;
@@ -3156,28 +1918,11 @@ static void *wan_queue_thread_l3l4(void *arg) {
                 uint16_t fsp = 0, fdp = 0;
                 uint8_t fp = 0;
                 if (parse_flow(final_pkt, final_len, &fs, &fd, &fsp, &fdp, &fp) == 0 &&
-                    tcp_diag_want_log(fp, fsp, fdp)) {
+                    is_ssh_flow(fp, fsp, fdp)) {
                     log_tcp_diag_decrypt("RX-TO-LOCAL",
                                          fs, fsp, fd, fdp,
                                          POLICY_ACTION_ENCRYPT_L4,
                                          0, -1, 0, -1, 0, 0);
-                    if (!ne_rx_ipv4_frame_plausible((const uint8_t *)final_pkt, final_len)) {
-                        ne_rx_class_log("RX_TO_LOCAL_IPV4_SHAPE_BAD", wan->ifname, wan_idx, "TO_LOCAL",
-                                        "cleartext_IPv4_bad_before_inject", final_len, 1, fs, fsp, fd, fdp, fp,
-                                        "frame not plausible before AF_XDP to local");
-                    }
-                    if (g_tcp_diag_enabled && fp == IPPROTO_TCP &&
-                        is_ssh_flow(fp, fsp, fdp)) {
-                        uint8_t tf = 0;
-                        char fg[64];
-                        if (tcp_ipv4_tcp_flags(final_pkt, final_len, &tf) == 0)
-                            tcp_diag_flags_fmt(tf, fg, sizeof(fg));
-                        else
-                            snprintf(fg, sizeof(fg), "unk");
-                        fprintf(stderr,
-                                "[TCP-DIAG][SSH-RX-TO-LOCAL] tcp=[%s] len=%u\n",
-                                fg, (unsigned)final_len);
-                    }
                 }
             }
 
@@ -3190,23 +1935,14 @@ static void *wan_queue_thread_l3l4(void *arg) {
             }
 
 
-            int local_idx = local_idx_from_dst_mac(fwd, final_pkt, final_len);
+            uint32_t dest_ip = get_dest_ip(final_pkt, final_len);
+            int local_idx = forwarder_rx_pick_local(fwd, final_pkt, final_len, dest_ip);
             if (local_idx < 0) {
-                uint32_t fs = 0, fd = 0;
-                uint16_t fsp = 0, fdp = 0;
-                uint8_t fp = 0;
-                int pf = (parse_flow(final_pkt, final_len, &fs, &fd, &fsp, &fdp, &fp) == 0);
-                if (pf && tcp_diag_want_log(fp, fsp, fdp)) {
-                    fprintf(stderr, "[TCP-DIAG][DROP-NO-LOCAL] dst_mac=%02x:%02x:%02x:%02x:%02x:%02x flow=%u:%u -> %u:%u len=%u\n",
-                            final_pkt[0], final_pkt[1], final_pkt[2],
-                            final_pkt[3], final_pkt[4], final_pkt[5],
-                            ntohl(fs), (unsigned)fsp, ntohl(fd), (unsigned)fdp, (unsigned)final_len);
-                }
-                ne_rx_class_log("RX_DST_MAC_NO_LOCAL", wan->ifname, wan_idx, "TO_LOCAL",
-                                "dst_mac_unknown_bridge", final_len, pf, fs, fsp, fd, fdp, fp,
-                                "L3L4_WAN_RX_path");
                 __sync_fetch_and_add(&fwd->total_dropped, 1);
-                __sync_fetch_and_add(&fwd->dropped_no_local_match, 1);
+                if (dest_ip == 0 && !config_wan_bridge_mode(fwd->cfg))
+                    __sync_fetch_and_add(&fwd->dropped_bad_ip, 1);
+                else
+                    __sync_fetch_and_add(&fwd->dropped_no_local_match, 1);
                 continue;
             }
 
@@ -3226,27 +1962,16 @@ static void *wan_queue_thread_l3l4(void *arg) {
                     tq = args->wan_worker_index >= 0 ? (args->wan_worker_index % nq) : (tx_base % nq);
             }
 
-            ne_wan_rx_normalize_eth_ipv4_before_local_inject(final_pkt, final_len);
-            if (final_len >= 14U && final_pkt[12] == 0x88U)
-                ne_l2_trace_event("S9-TX-PFSENSE", local_iface->ifname, final_pkt, final_len,
-                                  "LEAK still_encrypted L3path");
+            if (set_local_l2_addrs(fwd, local_idx, dest_ip, final_pkt) != 0) {
+                __sync_fetch_and_add(&fwd->total_dropped, 1);
+                continue;
+            }
+
             if (interface_send_to_local_batch_queue(local_iface, tq, local_cfg, final_pkt, final_len) == 0) {
                 __sync_fetch_and_add(&fwd->wan_to_local, 1);
                 if (tq < 32)
                     local_used_queues[local_idx] |= (1u << tq);
             } else {
-                uint32_t fs = 0, fd = 0;
-                uint16_t fsp = 0, fdp = 0;
-                uint8_t fp = 0;
-                int pf = (parse_flow(final_pkt, final_len, &fs, &fd, &fsp, &fdp, &fp) == 0);
-                if (pf && tcp_diag_want_log(fp, fsp, fdp)) {
-                    fprintf(stderr, "[TCP-DIAG][DROP-LOCAL-TX] local=%s q=%d flow=%u:%u -> %u:%u len=%u\n",
-                            local_iface->ifname, tq,
-                            ntohl(fs), (unsigned)fsp, ntohl(fd), (unsigned)fdp, (unsigned)final_len);
-                }
-                ne_rx_class_log("RX_LOCAL_INJECT_BATCH_FAIL", wan->ifname, wan_idx, "TO_LOCAL",
-                                "af_xdp_local_queue_reject", final_len, pf, fs, fsp, fd, fdp, fp,
-                                "interface_send_to_local_batch_queue rejected");
                 __sync_fetch_and_add(&fwd->total_dropped, 1);
                 __sync_fetch_and_add(&fwd->dropped_local_tx_fail, 1);
             }
@@ -3291,7 +2016,6 @@ static void *worker_thread(void *arg) {
 
         struct forwarder *fwd = job.fwd;
         if (!fwd) {
-            packet_critical_leave();
             continue;
         }
 
@@ -3310,15 +2034,6 @@ static void *worker_thread(void *arg) {
         int tcp_flags_ok = 0;
         if (flow_ok && protocol == IPPROTO_TCP)
             tcp_flags_ok = (tcp_ipv4_tcp_flags(job.pkt_ptr, job.pkt_len, &tcp_flags) == 0);
-        int profile_idx = -1;
-        if (fwd->cfg && job.local_idx >= 0 && job.local_idx < fwd->cfg->local_count) {
-            profile_idx = config_select_profile_for_local(fwd->cfg, job.local_idx);
-            if (profile_idx >= 0 && profile_idx < MAX_PROFILES)
-                __sync_fetch_and_add(&g_profile_hits[profile_idx], 1);
-            else
-                __sync_fetch_and_add(&g_profile_miss_hits, 1);
-        }
-
         int wan_idx;
         if (flow_ok) {
             wan_idx = select_wan_idx_for_packet(fwd, job.local_idx,
@@ -3332,42 +2047,11 @@ static void *worker_thread(void *arg) {
             wan_idx = 0;
         }
 
-        uint64_t seq = __sync_add_and_fetch(&g_profile_log_seq, 1);
-        if ((seq % 20000ULL) == 0 && fwd->cfg) {
-            fprintf(stderr, "[PROFILE HIT] total=%llu miss=%llu",
-                    (unsigned long long)seq,
-                    (unsigned long long)g_profile_miss_hits);
-            for (int pi = 0; pi < fwd->cfg->profile_count; pi++) {
-                fprintf(stderr, " p%d(%s)=%llu",
-                        pi, fwd->cfg->profiles[pi].name,
-                        (unsigned long long)g_profile_hits[pi]);
-            }
-            fprintf(stderr, " last_sel=%d last_wan=%d\n", profile_idx, wan_idx);
-        }
-
         struct xsk_interface *wan = &fwd->wans[wan_idx];
         int tq = wan_tx_q[wan_idx];
 
         uint32_t pkt_len = job.pkt_len;
-        const uint32_t cleartext_len = job.pkt_len;
 
-        if (g_tcp_diag_enabled && flow_ok && is_ssh_flow(protocol, src_port, dst_port)) {
-            char fg[64];
-            char sip[INET_ADDRSTRLEN], dip[INET_ADDRSTRLEN];
-            struct in_addr sa = { .s_addr = src_ip };
-            struct in_addr da = { .s_addr = dst_ip };
-            if (tcp_flags_ok)
-                tcp_diag_flags_fmt(tcp_flags, fg, sizeof(fg));
-            else
-                snprintf(fg, sizeof(fg), "unk");
-            inet_ntop(AF_INET, &sa, sip, sizeof(sip));
-            inet_ntop(AF_INET, &da, dip, sizeof(dip));
-            fprintf(stderr,
-                    "[TCP-DIAG][SSH-TX-PRE] %s:%u -> %s:%u local_idx=%d wan=%d(%s) wan_q=%u len=%u tcp=[%s]\n",
-                    sip, (unsigned)src_port, dip, (unsigned)dst_port,
-                    job.local_idx, wan_idx, wan->ifname, (unsigned)tq,
-                    (unsigned)cleartext_len, fg);
-        }
 
         const struct crypto_policy *cp = NULL;
         struct packet_crypto_ctx *use_ctx = &crypto_ctx;
@@ -3397,32 +2081,15 @@ static void *worker_thread(void *arg) {
                             apply_crypto_params_from_policy(cp);
                     }
                 } else {
-#if !CRYPTO_POLICY_PASS_UNMATCHED
                     if (fwd->cfg && fwd->cfg->policy_count > 0) {
-                        if (g_tcp_diag_enabled && flow_ok &&
-                            is_ssh_flow(protocol, src_port, dst_port)) {
-                            char sip[INET_ADDRSTRLEN], dip[INET_ADDRSTRLEN];
-                            struct in_addr sa = { .s_addr = src_ip };
-                            struct in_addr da = { .s_addr = dst_ip };
-                            inet_ntop(AF_INET, &sa, sip, sizeof(sip));
-                            inet_ntop(AF_INET, &da, dip, sizeof(dip));
-                            fprintf(stderr,
-                                    "[TCP-DIAG][SSH-TX-DROP-NO-POLICY] %s:%u -> %s:%u len=%u (no cp, policy_count=%d)\n",
-                                    sip, (unsigned)src_port, dip, (unsigned)dst_port,
-                                    (unsigned)job.pkt_len, fwd->cfg->policy_count);
-                        }
-                        ne_tx_class_log("TX_NO_CRYPTO_POLICY_DROP", "WORKER_L3L4", "strict_mode_no_matching_policy",
-                                        job.local_idx, wan->ifname, wan_idx, flow_ok, src_ip, src_port, dst_ip, dst_port,
-                                        protocol, job.pkt_len, "CRYPTO_POLICY_PASS_UNMATCHED=0");
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                         goto release_local;
                     }
-#endif
                     bypass_crypto = 1;
                 }
             }
 
-            if (flow_ok && tcp_diag_want_log(protocol, src_port, dst_port)) {
+            if (flow_ok && is_ssh_flow(protocol, src_port, dst_port)) {
                 log_tcp_diag_policy_select("TX-SELECT",
                                            src_ip, src_port, dst_ip, dst_port,
                                            cp, bypass_crypto);
@@ -3442,24 +2109,16 @@ static void *worker_thread(void *arg) {
             }
 
             if (bypass_crypto) {
-                int send_rc = interface_send_batch_queue(wan, tq, job.pkt_ptr, pkt_len);
-                if (send_rc == 0) {
+                uint8_t *pkt = (uint8_t *)job.pkt_ptr;
+                if (set_wan_l2_addrs(fwd, wan_idx, pkt) != 0) {
+                    __sync_fetch_and_add(&fwd->total_dropped, 1);
+                    goto release_local;
+                }
+
+                if (interface_send_batch_queue(wan, tq, job.pkt_ptr, pkt_len) == 0) {
                     __sync_fetch_and_add(&fwd->local_to_wan, 1);
                     wan_used[wan_idx] = 1;
-                    if (g_tcp_diag_enabled && flow_ok && is_ssh_flow(protocol, src_port, dst_port)) {
-                        fprintf(stderr,
-                                "[TCP-DIAG][SSH-TX-BYPASS-SENT] wan=%d(%s) len=%u\n",
-                                wan_idx, wan->ifname, (unsigned)pkt_len);
-                    }
                 } else {
-                    if (g_tcp_diag_enabled && flow_ok && is_ssh_flow(protocol, src_port, dst_port)) {
-                        fprintf(stderr,
-                                "[TCP-DIAG][SSH-TX-BYPASS-SEND-FAIL] wan=%d(%s) len=%u rc=%d\n",
-                                wan_idx, wan->ifname, (unsigned)pkt_len, send_rc);
-                    }
-                    ne_tx_class_log("TX_BYPASS_WAN_SEND_FAIL", "WORKER_L3L4", "bypass_wan_batch_reject",
-                                    job.local_idx, wan->ifname, wan_idx, flow_ok, src_ip, src_port, dst_ip, dst_port,
-                                    protocol, pkt_len, "interface_send_batch_queue");
                     __sync_fetch_and_add(&fwd->total_dropped, 1);
                 }
                 goto skip_encrypt_flush;
@@ -3468,6 +2127,11 @@ static void *worker_thread(void *arg) {
 
         if (!crypto_enabled) {
             uint8_t *pkt = (uint8_t *)job.pkt_ptr;
+            if (set_wan_l2_addrs(fwd, wan_idx, pkt) != 0) {
+                __sync_fetch_and_add(&fwd->total_dropped, 1);
+                goto release_local;
+            }
+
             if (interface_send_batch_queue(wan, tq, pkt, pkt_len) == 0) {
                 __sync_fetch_and_add(&fwd->local_to_wan, 1);
                 wan_used[wan_idx] = 1;
@@ -3476,15 +2140,22 @@ static void *worker_thread(void *arg) {
             }
         } else {
             uint8_t *pkt = (uint8_t *)job.pkt_ptr;
+            if (set_wan_l2_addrs(fwd, wan_idx, pkt) != 0) {
+                __sync_fetch_and_add(&fwd->total_dropped, 1);
+                goto release_local;
+            }
+
             int sent_split = 0;
             if (cp) {
                 if (cp->action == POLICY_ACTION_ENCRYPT_L2 && frag_need_split_l2(pkt_len)) {
                     uint8_t f1[4096], f2[4096];
                     uint32_t l1, l2;
                     if (frag_split_and_encrypt_l2(use_ctx, pkt, pkt_len, f1, &l1, f2, &l2) != 0) {
-                        ne_tx_class_log("TX_L2_SPLIT_ENCRYPT_FAIL", "WORKER_L3L4", "frag_split_encrypt_l2_failed",
-                                        job.local_idx, wan->ifname, wan_idx, flow_ok, src_ip, src_port, dst_ip,
-                                        dst_port, protocol, cleartext_len, "frag_split_and_encrypt_l2");
+                        __sync_fetch_and_add(&fwd->total_dropped, 1);
+                        goto release_local;
+                    }
+                    if (set_wan_l2_addrs(fwd, wan_idx, f1) != 0 ||
+                        set_wan_l2_addrs(fwd, wan_idx, f2) != 0) {
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                         goto release_local;
                     }
@@ -3493,27 +2164,23 @@ static void *worker_thread(void *arg) {
                         __sync_fetch_and_add(&fwd->local_to_wan, 1);
                         wan_used[wan_idx] = 1;
                     } else {
-                        ne_tx_class_log("TX_WAN_SEND_FAIL", "WORKER_L3L4", "wan_queue_reject_cipher_part1",
-                                        job.local_idx, wan->ifname, wan_idx, flow_ok, src_ip, src_port, dst_ip,
-                                        dst_port, protocol, l1, "L2_split frag1");
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                     }
                     if (interface_send_batch_queue(wan, tq, f2, l2) == 0) {
                         __sync_fetch_and_add(&fwd->local_to_wan, 1);
                         wan_used[wan_idx] = 1;
                     } else {
-                        ne_tx_class_log("TX_WAN_SEND_FAIL", "WORKER_L3L4", "wan_queue_reject_cipher_part2",
-                                        job.local_idx, wan->ifname, wan_idx, flow_ok, src_ip, src_port, dst_ip,
-                                        dst_port, protocol, l2, "L2_split frag2");
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                     }
                 } else if (cp->action == POLICY_ACTION_ENCRYPT_L3 && frag_need_split(pkt_len)) {
                     uint8_t f1[4096], f2[4096];
                     uint32_t l1, l2;
                     if (frag_split_and_encrypt(use_ctx, pkt, pkt_len, f1, &l1, f2, &l2) != 0) {
-                        ne_tx_class_log("TX_L3_SPLIT_ENCRYPT_FAIL", "WORKER_L3L4", "frag_split_encrypt_l3_failed",
-                                        job.local_idx, wan->ifname, wan_idx, flow_ok, src_ip, src_port, dst_ip,
-                                        dst_port, protocol, cleartext_len, "frag_split_and_encrypt");
+                        __sync_fetch_and_add(&fwd->total_dropped, 1);
+                        goto release_local;
+                    }
+                    if (set_wan_l2_addrs(fwd, wan_idx, f1) != 0 ||
+                        set_wan_l2_addrs(fwd, wan_idx, f2) != 0) {
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                         goto release_local;
                     }
@@ -3522,27 +2189,23 @@ static void *worker_thread(void *arg) {
                         __sync_fetch_and_add(&fwd->local_to_wan, 1);
                         wan_used[wan_idx] = 1;
                     } else {
-                        ne_tx_class_log("TX_WAN_SEND_FAIL", "WORKER_L3L4", "wan_queue_reject_cipher_part1",
-                                        job.local_idx, wan->ifname, wan_idx, flow_ok, src_ip, src_port, dst_ip,
-                                        dst_port, protocol, l1, "L3_split frag1");
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                     }
                     if (interface_send_batch_queue(wan, tq, f2, l2) == 0) {
                         __sync_fetch_and_add(&fwd->local_to_wan, 1);
                         wan_used[wan_idx] = 1;
                     } else {
-                        ne_tx_class_log("TX_WAN_SEND_FAIL", "WORKER_L3L4", "wan_queue_reject_cipher_part2",
-                                        job.local_idx, wan->ifname, wan_idx, flow_ok, src_ip, src_port, dst_ip,
-                                        dst_port, protocol, l2, "L3_split frag2");
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                     }
                 } else if (cp->action == POLICY_ACTION_ENCRYPT_L4 && frag_need_split_l4(pkt_len)) {
                     uint8_t f1[4096], f2[4096];
                     uint32_t l1, l2;
                     if (frag_split_and_encrypt_l4(use_ctx, pkt, pkt_len, f1, &l1, f2, &l2) != 0) {
-                        ne_tx_class_log("TX_L4_SPLIT_ENCRYPT_FAIL", "WORKER_L3L4", "frag_split_encrypt_l4_failed",
-                                        job.local_idx, wan->ifname, wan_idx, flow_ok, src_ip, src_port, dst_ip,
-                                        dst_port, protocol, cleartext_len, "frag_split_and_encrypt_l4");
+                        __sync_fetch_and_add(&fwd->total_dropped, 1);
+                        goto release_local;
+                    }
+                    if (set_wan_l2_addrs(fwd, wan_idx, f1) != 0 ||
+                        set_wan_l2_addrs(fwd, wan_idx, f2) != 0) {
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                         goto release_local;
                     }
@@ -3551,18 +2214,12 @@ static void *worker_thread(void *arg) {
                         __sync_fetch_and_add(&fwd->local_to_wan, 1);
                         wan_used[wan_idx] = 1;
                     } else {
-                        ne_tx_class_log("TX_WAN_SEND_FAIL", "WORKER_L3L4", "wan_queue_reject_cipher_part1",
-                                        job.local_idx, wan->ifname, wan_idx, flow_ok, src_ip, src_port, dst_ip,
-                                        dst_port, protocol, l1, "L4_split frag1");
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                     }
                     if (interface_send_batch_queue(wan, tq, f2, l2) == 0) {
                         __sync_fetch_and_add(&fwd->local_to_wan, 1);
                         wan_used[wan_idx] = 1;
                     } else {
-                        ne_tx_class_log("TX_WAN_SEND_FAIL", "WORKER_L3L4", "wan_queue_reject_cipher_part2",
-                                        job.local_idx, wan->ifname, wan_idx, flow_ok, src_ip, src_port, dst_ip,
-                                        dst_port, protocol, l2, "L4_split frag2");
                         __sync_fetch_and_add(&fwd->total_dropped, 1);
                     }
                 }
@@ -3581,60 +2238,16 @@ static void *worker_thread(void *arg) {
                 }
 
                 if (new_len < 0) {
-                    const char *txk = "TX_ENCRYPT_FAIL";
-                    if (cp) {
-                        if (cp->action == POLICY_ACTION_ENCRYPT_L2)
-                            txk = "TX_L2_ENCRYPT_FAIL";
-                        else if (cp->action == POLICY_ACTION_ENCRYPT_L3)
-                            txk = "TX_L3_ENCRYPT_FAIL";
-                        else if (cp->action == POLICY_ACTION_ENCRYPT_L4)
-                            txk = "TX_L4_ENCRYPT_FAIL";
-                    }
-                    char dbuf[96];
-                    snprintf(dbuf, sizeof(dbuf), "new_len=%d action=%s", new_len,
-                             cp ? policy_action_name(cp->action) : "none");
-                    ne_tx_class_log(txk, "WORKER_L3L4", "crypto_layer_encrypt_returned_neg", job.local_idx,
-                                    wan->ifname, wan_idx, flow_ok, src_ip, src_port, dst_ip, dst_port, protocol,
-                                    cleartext_len, dbuf);
-                    if (g_tcp_diag_enabled && flow_ok && tcp_diag_want_log(protocol, src_port, dst_port)) {
-                        fprintf(stderr,
-                                "[TCP-DIAG][TX-ENC-FAIL] action=%s cleartext_len=%u new_len=%d\n",
-                                cp ? policy_action_name(cp->action) : "none",
-                                (unsigned)cleartext_len, new_len);
-                    }
                     __sync_fetch_and_add(&fwd->total_dropped, 1);
                     goto release_local;
                 }
                 pkt_len = (uint32_t)new_len;
 
-                if (g_tcp_diag_enabled && flow_ok && is_ssh_flow(protocol, src_port, dst_port) && cp) {
-                    char fg[64];
-                    if (tcp_flags_ok)
-                        tcp_diag_flags_fmt(tcp_flags, fg, sizeof(fg));
-                    else
-                        snprintf(fg, sizeof(fg), "unk");
-                    fprintf(stderr,
-                            "[TCP-DIAG][SSH-TX-ENC-OK] action=%s cleartext_len=%u onwire_len=%u wan=%d(%s) tcp=[%s]\n",
-                            policy_action_name(cp->action), (unsigned)cleartext_len, (unsigned)pkt_len,
-                            wan_idx, wan->ifname, fg);
-                }
-
-                {
-                    int send_rc = interface_send_batch_queue(wan, tq, job.pkt_ptr, pkt_len);
-                    if (send_rc == 0) {
-                        __sync_fetch_and_add(&fwd->local_to_wan, 1);
-                        wan_used[wan_idx] = 1;
-                    } else {
-                        if (g_tcp_diag_enabled && flow_ok && tcp_diag_want_log(protocol, src_port, dst_port)) {
-                            fprintf(stderr,
-                                    "[TCP-DIAG][TX-SEND-FAIL] wan=%d(%s) enc_len=%u rc=%d\n",
-                                    wan_idx, wan->ifname, (unsigned)pkt_len, send_rc);
-                        }
-                        ne_tx_class_log("TX_WAN_SEND_FAIL", "WORKER_L3L4", "wan_batch_queue_reject_full_packet",
-                                        job.local_idx, wan->ifname, wan_idx, flow_ok, src_ip, src_port, dst_ip,
-                                        dst_port, protocol, pkt_len, "interface_send_batch_queue");
-                        __sync_fetch_and_add(&fwd->total_dropped, 1);
-                    }
+                if (interface_send_batch_queue(wan, tq, job.pkt_ptr, pkt_len) == 0) {
+                    __sync_fetch_and_add(&fwd->local_to_wan, 1);
+                    wan_used[wan_idx] = 1;
+                } else {
+                    __sync_fetch_and_add(&fwd->total_dropped, 1);
                 }
             }
         }
@@ -3662,6 +2275,9 @@ release_local:
 }
 
 int forwarder_init(struct forwarder *fwd, struct app_config *cfg) {
+    if (forwarder_should_stop())
+        return -1;
+
     memset(fwd, 0, sizeof(*fwd));
     fwd->cfg = cfg;
     g_cfg_ptr = cfg;
@@ -3669,7 +2285,6 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg) {
     interface_xdp_detach_all_from_config(cfg);
     interface_reset_redirect_maps();
 
-    /* Single-queue per iface: matches single-core scheduling (FORWARDER_CPU_CORE). */
     for (int i = 0; i < cfg->local_count; i++)
         cfg->locals[i].queue_count = FORWARDER_XSK_QUEUE_COUNT;
     for (int i = 0; i < cfg->wan_count; i++)
@@ -3677,23 +2292,27 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg) {
 
     crypto_enabled = cfg->crypto_enabled;
     crypto_layer = cfg->encrypt_layer;
-    forwarder_tcp_diag_apply_env();
-    if (cfg->local_count > 0) {
-        if (install_local_mac_table(fwd) != 0)
-            return -1;
+    {
+        const char *diag = getenv("NE_TCP_DIAG");
+        g_tcp_diag_enabled = (diag && diag[0] == '1') ? 1 : 0;
+        if (g_tcp_diag_enabled)
+            fprintf(stderr, "[TCP-DIAG] enabled (NE_TCP_DIAG=1)\n");
     }
     int has_encrypt_l2 = 0;
     if (crypto_enabled) {
         if (g_active_policy_count > 0) {
             memcpy(g_prev_policy_crypto_ctx, g_policy_crypto_ctx, sizeof(g_prev_policy_crypto_ctx));
             memcpy(g_prev_policy_crypto_ctx_ready, g_policy_crypto_ctx_ready, sizeof(g_prev_policy_crypto_ctx_ready));
+            memcpy(g_prev_policy_index_by_action_id, g_policy_index_by_action_id, sizeof(g_prev_policy_index_by_action_id));
             memcpy(g_prev_policies, g_active_policies, sizeof(g_prev_policies));
             g_prev_policy_count = g_active_policy_count;
             g_prev_policy_grace_until_ms = monotonic_ms() + POLICY_RELOAD_GRACE_MS;
-            fprintf(stderr, "[CRYPTO] policy grace window active for %llu ms\n",
-                    (unsigned long long)POLICY_RELOAD_GRACE_MS);
         } else {
             memset(g_prev_policy_crypto_ctx_ready, 0, sizeof(g_prev_policy_crypto_ctx_ready));
+            for (int a = 0; a <= POLICY_ACTION_ENCRYPT_L4; a++) {
+                for (int id = 0; id < 256; id++)
+                    g_prev_policy_index_by_action_id[a][id] = -1;
+            }
             g_prev_policy_count = 0;
             g_prev_policy_grace_until_ms = 0;
         }
@@ -3712,9 +2331,8 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg) {
         packet_crypto_set_nonce_size(cfg->nonce_size);
         if (has_encrypt_l2) {
             if (cfg->fake_ethertype_ipv4 == 0)
-                cfg->fake_ethertype_ipv4 = NE_DEFAULT_FAKE_ETHERTYPE_IPV4;
-            cfg->fake_ethertype_ipv6 = 0;
-            packet_crypto_set_ethertype(cfg->fake_ethertype_ipv4, 0);
+                cfg->fake_ethertype_ipv4 = 0x88b5;
+            packet_crypto_set_fake_ethertype(cfg->fake_ethertype_ipv4);
         }
         if (crypto_layer == 3) {
             if (cfg->fake_protocol != 0)
@@ -3752,6 +2370,8 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg) {
     total_threads += 1;
 
     for (int i = 0; i < cfg->local_count; i++) {
+        if (forwarder_should_stop())
+            goto err_locals;
         if (interface_init_local(&fwd->locals[i], &cfg->locals[i], cfg->bpf_file) != 0) {
             fprintf(stderr, "Failed to init LOCAL %s\n", cfg->locals[i].ifname);
             interface_cleanup(&fwd->locals[i]);
@@ -3765,15 +2385,81 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg) {
         fprintf(stderr, "[XDP] WARN: encrypt filter maps may be stale\n");
     }
 
+    if (config_wan_bridge_mode(cfg) && cfg->local_count > 0) {
+        if (bridge_mac_install(fwd) != 0) {
+            fprintf(stderr, "[BRIDGE-MAC] install failed\n");
+            goto err_locals;
+        }
+    }
+
+    for (int i = 0; i < fwd->local_count; i++) {
+        if (forwarder_should_stop())
+            goto err_locals;
+        if (config_wan_bridge_mode(cfg))
+            continue;
+        if (arp_init_for_local(&g_arp[i], &fwd->locals[i], &running) == 0) {
+            pthread_t tid;
+            pthread_create(&tid, NULL, arp_listener_thread, &g_arp[i]);
+            pthread_detach(tid);
+            g_arp_inited = 1;
+            local_log_arp_ready(&g_arp[i]);
+            (void)local_config_fill_ipv4_from_iface(&cfg->locals[i]);
+            lan_arp_resolve_policy_hosts(&g_arp[i], cfg, i);
+            local_sync_primary_peer_mac(&g_arp[i], cfg, i);
+            memcpy(fwd->locals[i].src_mac, g_arp[i].if_mac, MAC_LEN);
+            memcpy(cfg->locals[i].src_mac, g_arp[i].if_mac, MAC_LEN);
+            memcpy(fwd->locals[i].dst_mac, cfg->locals[i].dst_mac, MAC_LEN);
+        } else {
+            fprintf(stderr, "[LAN ARP] WARN: cannot init on %s\n",
+                    fwd->locals[i].ifname);
+        }
+    }
+
     for (int i = 0; i < cfg->wan_count; i++) {
+        if (forwarder_should_stop())
+            goto err_wans;
         uint16_t wan_fake4 = (crypto_enabled && has_encrypt_l2) ? cfg->fake_ethertype_ipv4 : 0;
         const char *wan_bpf = (cfg->bpf_wan_file[0]) ? cfg->bpf_wan_file : "bpf/xdp_wan_redirect.o";
-        if (interface_init_wan_rx(&fwd->wans[i], &cfg->wans[i], wan_bpf, wan_fake4, 0) != 0) {
+        if (interface_init_wan_rx(&fwd->wans[i], &cfg->wans[i], wan_bpf, wan_fake4) != 0) {
             fprintf(stderr, "Failed to init WAN %s\n", cfg->wans[i].ifname);
             goto err_wans;
         }
         fwd->wan_count++;
+        if (cfg->wans[i].dst_ip != 0) {
+
+            memset(fwd->wans[i].dst_mac, 0, MAC_LEN);
+            memset(fwd->wans[i].src_mac, 0, MAC_LEN);
+        }
     }
+
+
+    for (int i = 0; i < fwd->wan_count; i++) {
+        if (forwarder_should_stop())
+            goto err_wans;
+        if (cfg->wans[i].dst_ip == 0)
+            continue;
+        if (arp_init_for_local(&g_wan_arp[i], &fwd->wans[i], &running) == 0) {
+            pthread_t tid;
+            pthread_create(&tid, NULL, arp_listener_thread, &g_wan_arp[i]);
+            pthread_detach(tid);
+            g_arp_inited = 1;
+            wan_log_peer_mac(&g_wan_arp[i], fwd->wans[i].ifname, &cfg->wans[i]);
+            memcpy(fwd->wans[i].src_mac, g_wan_arp[i].if_mac, MAC_LEN);
+            memcpy(cfg->wans[i].src_mac, g_wan_arp[i].if_mac, MAC_LEN);
+            if (cfg->wans[i].dst_ip != 0) {
+                uint8_t peer_mac[MAC_LEN];
+                if (arp_cache_lookup(&g_wan_arp[i], cfg->wans[i].dst_ip, peer_mac)) {
+                    memcpy(fwd->wans[i].dst_mac, peer_mac, MAC_LEN);
+                    memcpy(cfg->wans[i].dst_mac, peer_mac, MAC_LEN);
+                }
+            }
+        } else {
+            fprintf(stderr, "[ARP] WARN: cannot init WAN ARP on %s\n", cfg->wans[i].ifname);
+        }
+    }
+
+    if (forwarder_should_stop())
+        goto err_wans;
 
     return 0;
 
@@ -3800,7 +2486,6 @@ int forwarder_reload_config(struct forwarder *fwd, struct app_config *cfg) {
     if (!need_crypto_reload && !need_forwarding_reload) {
         fwd->cfg = cfg;
         g_cfg_ptr = cfg;
-        fprintf(stderr, "[RELOAD] skipped: config is unchanged\n");
         return 0;
     }
 
@@ -3811,7 +2496,6 @@ int forwarder_reload_config(struct forwarder *fwd, struct app_config *cfg) {
     fwd->cfg = cfg;
     g_cfg_ptr = cfg;
 
-    /* Keep one AF_XDP queue per iface (single-core mode). */
     for (int i = 0; i < cfg->local_count; i++)
         cfg->locals[i].queue_count = FORWARDER_XSK_QUEUE_COUNT;
     for (int i = 0; i < cfg->wan_count; i++)
@@ -3825,12 +2509,8 @@ int forwarder_reload_config(struct forwarder *fwd, struct app_config *cfg) {
         packet_crypto_set_encrypt_layer(cfg->encrypt_layer);
         packet_crypto_set_mode(cfg->crypto_mode);
         packet_crypto_set_nonce_size(cfg->nonce_size);
-        if (has_encrypt_l2) {
-            if (cfg->fake_ethertype_ipv4 == 0)
-                cfg->fake_ethertype_ipv4 = NE_DEFAULT_FAKE_ETHERTYPE_IPV4;
-            cfg->fake_ethertype_ipv6 = 0;
-            packet_crypto_set_ethertype(cfg->fake_ethertype_ipv4, 0);
-        }
+        if (has_encrypt_l2)
+            packet_crypto_set_fake_ethertype(cfg->fake_ethertype_ipv4);
         if (cfg->encrypt_layer == 3)
             packet_crypto_set_fake_protocol(cfg->fake_protocol ? cfg->fake_protocol : 99);
         tcp_policy_pin_clear_all();
@@ -3839,9 +2519,6 @@ int forwarder_reload_config(struct forwarder *fwd, struct app_config *cfg) {
     atomic_store_explicit(&g_reload_pause, 0, memory_order_release);
     if (interface_push_encrypt_filters(cfg) != 0)
         fprintf(stderr, "[RELOAD][WARN] interface_push_encrypt_filters failed\n");
-    fprintf(stderr, "[RELOAD] hot reload applied in-place (crypto=%s, forwarding=%s)\n",
-            need_crypto_reload ? "yes" : "no",
-            need_forwarding_reload ? "yes" : "no");
     return 0;
 }
 
@@ -3850,12 +2527,9 @@ void forwarder_cleanup(struct forwarder *fwd) {
         packet_crypto_cleanup(&crypto_ctx);
     }
 
+    bridge_mac_shutdown();
     flow_table_cleanup(&g_flow_table);
     tcp_policy_pin_cleanup();
-
-    local_mac_table_clear();
-    g_local_peer_macs_ready = 0;
-    g_peer_mac_seed_count = 0;
 
     for (int i = 0; i < fwd->local_count; i++)
         interface_cleanup(&fwd->locals[i]);
@@ -3921,7 +2595,7 @@ static void forwarder_run_no_crypto(struct forwarder *fwd) {
     }
 
     while (running)
-        sleep(1);
+        usleep(200000);
 
     for (int i = 0; i < total_threads; i++)
         pthread_join(threads[i], NULL);
@@ -3940,18 +2614,6 @@ static void forwarder_run_l2(struct forwarder *fwd) {
     int total_wan_queues = 0;
     for (int i = 0; i < fwd->wan_count; i++)
         total_wan_queues += fwd->wans[i].queue_count;
-
-
-    fprintf(stderr, "[L2 DEBUG] total_local_queues=%d, total_wan_queues=%d\n",
-            total_local_queues, total_wan_queues);
-    for (int i = 0; i < fwd->local_count; i++) {
-        fprintf(stderr, "[L2 DEBUG] local[%d] ifname=%s queue_count=%d\n",
-                i, fwd->locals[i].ifname, fwd->locals[i].queue_count);
-    }
-    for (int i = 0; i < fwd->wan_count; i++) {
-        fprintf(stderr, "[L2 DEBUG] wan[%d] ifname=%s queue_count=%d\n",
-                i, fwd->wans[i].ifname, fwd->wans[i].queue_count);
-    }
 
 
     int total_threads = total_local_queues + total_wan_queues;
@@ -4002,7 +2664,7 @@ static void forwarder_run_l2(struct forwarder *fwd) {
     }
 
     while (running)
-        sleep(1);
+        usleep(200000);
 
     for (int i = 0; i < total_threads; i++)
         pthread_join(threads[i], NULL);
@@ -4078,7 +2740,7 @@ static void forwarder_run_l3(struct forwarder *fwd) {
     thread_idx++;
 
     while (running)
-        sleep(1);
+        usleep(200000);
 
     for (int i = 0; i < total_threads; i++)
         pthread_join(threads[i], NULL);
@@ -4154,7 +2816,7 @@ static void forwarder_run_l4(struct forwarder *fwd) {
     thread_idx++;
 
     while (running)
-        sleep(1);
+        usleep(200000);
 
     for (int i = 0; i < total_threads; i++)
         pthread_join(threads[i], NULL);
@@ -4167,23 +2829,10 @@ static void forwarder_run_l4(struct forwarder *fwd) {
 
 
 void forwarder_run(struct forwarder *fwd) {
+    if (forwarder_should_stop())
+        return;
     running = 1;
-    signal(SIGINT, sigint_handler);
-    signal(SIGTERM, sigint_handler);
-
-    fprintf(stderr,
-            "[RUNTIME] single_core cpu=%d xsk_queue_id=%d queues_per_iface=%d (all worker threads pin here)\n",
-            FORWARDER_CPU_CORE, FORWARDER_XSK_QUEUE_ID, FORWARDER_XSK_QUEUE_COUNT);
-
-    pthread_t mac_poll_tid;
-    int mac_poll_on = 0;
-    if (fwd && fwd->local_count > 0) {
-        if (pthread_create(&mac_poll_tid, NULL, local_peer_mac_poll_thread, fwd) != 0) {
-            fprintf(stderr, "[LOCAL-MAC-POLL] pthread_create failed (continuing without kernel resync thread)\n");
-        } else {
-            mac_poll_on = 1;
-        }
-    }
+    /* SIGINT/SIGTERM handled only in main.c (on_stop_signal). */
 
     if (!crypto_enabled) {
         forwarder_run_no_crypto(fwd);
@@ -4196,41 +2845,16 @@ void forwarder_run(struct forwarder *fwd) {
     } else {
         forwarder_run_l3(fwd);
     }
-
-    if (mac_poll_on)
-        pthread_join(mac_poll_tid, NULL);
 }
 
 void forwarder_stop(void) {
     running = 0;
 }
 
+int forwarder_should_stop(void) {
+    return !running;
+}
+
 void forwarder_print_stats(struct forwarder *fwd) {
-    if (!fwd) return;
-
-    int nq = (fwd->local_count > 0 && fwd->locals[0].queue_count <= FORWARDER_MAX_LOCAL_QUEUES)
-             ? fwd->locals[0].queue_count : 0;
-    if (nq <= 0) nq = 1;
-
-    uint64_t tx_wait_loops = 0;
-    for (int i = 0; i < fwd->local_count; i++) {
-        for (int q = 0; q < fwd->locals[i].queue_count && q < MAX_QUEUES; q++)
-            tx_wait_loops += fwd->locals[i].queues[q].tx_wait_loops;
-    }
-
-    fprintf(stdout,
-            "[STATS] local_to_wan=%lu wan_to_local=%lu total_dropped=%lu "
-            "dropped_bad_ip=%lu dropped_no_local_match=%lu dropped_local_tx_fail=%lu "
-            "local_mac_preload_loaded=%lu",
-            fwd->local_to_wan,
-            fwd->wan_to_local,
-            fwd->total_dropped,
-            fwd->dropped_bad_ip,
-            fwd->dropped_no_local_match,
-            fwd->dropped_local_tx_fail,
-            (unsigned long)fwd->local_mac_preload_loaded);
-    for (int i = 0; i < nq && i < FORWARDER_MAX_LOCAL_QUEUES; i++)
-        fprintf(stdout, " q%d=%lu", i, (unsigned long)fwd->dropped_local_tx_fail_by_queue[i]);
-    fprintf(stdout, " tx_wait_loops=%lu\n", (unsigned long)tx_wait_loops);
-
+    (void)fwd;
 }

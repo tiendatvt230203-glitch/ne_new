@@ -6,30 +6,35 @@
 
 static const char *policy_action_name(int action) {
     switch (action) {
-    case POLICY_ACTION_BYPASS: return "bypass";
-    case POLICY_ACTION_ENCRYPT_L2: return "encrypt_l2";
-    case POLICY_ACTION_ENCRYPT_L3: return "encrypt_l3";
-    case POLICY_ACTION_ENCRYPT_L4: return "encrypt_l4";
-    default: return "?";
+    case POLICY_ACTION_BYPASS:
+        return "bypass";
+    case POLICY_ACTION_ENCRYPT_L2:
+        return "L2";
+    case POLICY_ACTION_ENCRYPT_L3:
+        return "L3";
+    case POLICY_ACTION_ENCRYPT_L4:
+        return "L4";
+    default:
+        return "?";
     }
 }
 
 static const char *policy_proto_str(uint8_t proto) {
     if (proto == POLICY_PROTO_ANY)
-        return "Any";
+        return "any";
     if (proto == 6)
-        return "TCP";
+        return "tcp";
     if (proto == 17)
-        return "UDP";
+        return "udp";
     if (proto == 1)
-        return "ICMP";
+        return "icmp";
     static char buf[16];
-    snprintf(buf, sizeof(buf), "ip_proto=%u", (unsigned)proto);
+    snprintf(buf, sizeof(buf), "proto%u", (unsigned)proto);
     return buf;
 }
 
 static const char *crypto_mode_str(int mode) {
-    return (mode == CRYPTO_MODE_GCM) ? "AES-GCM" : "AES-CTR";
+    return (mode == CRYPTO_MODE_GCM) ? "gcm" : "ctr";
 }
 
 static int ipv4_netmask_to_prefix(uint32_t mask_be) {
@@ -53,7 +58,7 @@ static void ipv4_format_cidr(char *out, size_t outsz, uint32_t net_be, uint32_t 
 
 static void policy_port_str(char *out, size_t outsz, int from, int to) {
     if (from < 0 || to < 0)
-        snprintf(out, outsz, "Any");
+        snprintf(out, outsz, "any");
     else if (from == to)
         snprintf(out, outsz, "%d", from);
     else
@@ -61,9 +66,9 @@ static void policy_port_str(char *out, size_t outsz, int from, int to) {
 }
 
 static void policy_cidr_field(char *out, size_t outsz, int any, int negate,
-                               uint32_t net_be, uint32_t mask_be) {
+                              uint32_t net_be, uint32_t mask_be) {
     if (any) {
-        snprintf(out, outsz, "Any");
+        snprintf(out, outsz, "any");
         return;
     }
     char cidr[48];
@@ -74,67 +79,49 @@ static void policy_cidr_field(char *out, size_t outsz, int any, int negate,
         snprintf(out, outsz, "%s", cidr);
 }
 
-static void log_crypto_policies_human(struct app_config *cfg, int config_id) {
-    fprintf(stderr,
-            "[CRYPTO POLICIES] config_id=%d — xdp_profile_crypto_policies as loaded (grouped by profile)\n",
-            config_id);
+static void fmt_mac(char *out, size_t outsz, const uint8_t mac[MAC_LEN]) {
+    int zero = !(mac[0] | mac[1] | mac[2] | mac[3] | mac[4] | mac[5]);
+    if (zero)
+        snprintf(out, outsz, "(none)");
+    else
+        snprintf(out, outsz, "%02x:%02x:%02x:%02x:%02x:%02x",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
 
-    if (cfg->profile_count <= 0) {
-        fprintf(stderr,
-                "  (no profiles; policies=%d — check xdp_profiles / DB load)\n",
-                cfg->policy_count);
-        for (int pi = 0; pi < cfg->policy_count && pi < MAX_CRYPTO_POLICIES; pi++) {
-            const struct crypto_policy *cp = &cfg->policies[pi];
-            fprintf(stderr,
-                    "  [orphan POL] wire_id=%d db_id=%d %s %s proto=%s prio=%d\n",
-                    cp->id,
-                    cp->db_id,
-                    policy_action_name(cp->action),
-                    crypto_mode_str(cp->crypto_mode),
-                    policy_proto_str(cp->protocol),
-                    cp->priority);
-        }
-        return;
+static void log_interface_names(const struct app_config *cfg) {
+    fprintf(stderr, "[WAN] ");
+    for (int i = 0; i < cfg->wan_count; i++)
+        fprintf(stderr, "%s%s", i ? ", " : "", cfg->wans[i].ifname);
+    fprintf(stderr, "\n");
+
+    fprintf(stderr, "[LAN] ");
+    for (int i = 0; i < cfg->local_count; i++)
+        fprintf(stderr, "%s%s", i ? ", " : "", cfg->locals[i].ifname);
+    fprintf(stderr, "\n");
+}
+
+static void log_wan_peer_macs(const struct app_config *cfg) {
+    for (int i = 0; i < cfg->wan_count; i++) {
+        const struct wan_config *w = &cfg->wans[i];
+        char peer_mac[32];
+        fmt_mac(peer_mac, sizeof(peer_mac), w->dst_mac);
+        fprintf(stderr, "[WAN] %s peer_mac=%s\n", w->ifname, peer_mac);
     }
+}
 
+static void log_local_peer_macs(const struct app_config *cfg) {
+    for (int i = 0; i < cfg->local_count; i++) {
+        const struct local_config *l = &cfg->locals[i];
+        char peer_mac[32];
+        fmt_mac(peer_mac, sizeof(peer_mac), l->dst_mac);
+        fprintf(stderr, "[LAN] %s peer_mac=%s\n", l->ifname, peer_mac);
+    }
+}
+
+static void log_profile_policies(const struct app_config *cfg) {
     for (int pr = 0; pr < cfg->profile_count; pr++) {
-        struct profile_config *p = &cfg->profiles[pr];
-        fprintf(stderr,
-                "  [profile] id=%d name=\"%s\" enabled=%d locals=%d wans=%d policy_refs=%d\n",
-                p->id,
-                p->name,
-                p->enabled,
-                p->local_count,
-                p->wan_count,
-                p->policy_count);
-
-        if (p->local_count > 0) {
-            fprintf(stderr, "    interfaces local: ");
-            for (int li = 0; li < p->local_count; li++) {
-                int idx = p->local_indices[li];
-                if (idx >= 0 && idx < cfg->local_count) {
-                    const struct local_config *lc = &cfg->locals[idx];
-                    fprintf(stderr, "%s%s", li ? ", " : "", lc->ifname);
-                }
-            }
-            fprintf(stderr, "\n");
-        }
-        if (p->wan_count > 0) {
-            fprintf(stderr, "    interfaces wan:  ");
-            for (int wi = 0; wi < p->wan_count; wi++) {
-                int idx = p->wan_indices[wi];
-                if (idx >= 0 && idx < cfg->wan_count) {
-                    fprintf(stderr, "%s%s", wi ? ", " : "", cfg->wans[idx].ifname);
-                    int bw = p->wan_bandwidth_weight[wi];
-                    if (bw > 0)
-                        fprintf(stderr, " [weight=%d", bw);
-                    else
-                        fprintf(stderr, " [equal-share");
-                    fprintf(stderr, "]");
-                }
-            }
-            fprintf(stderr, "\n");
-        }
+        const struct profile_config *p = &cfg->profiles[pr];
+        fprintf(stderr, "[PROFILE] id=%d name=\"%s\"\n", p->id, p->name);
 
         for (int j = 0; j < p->policy_count; j++) {
             int pix = p->policy_indices[j];
@@ -142,64 +129,56 @@ static void log_crypto_policies_human(struct app_config *cfg, int config_id) {
                 continue;
             const struct crypto_policy *cp = &cfg->policies[pix];
             char src_c[72], dst_c[72], sp[24], dp[24];
-            policy_cidr_field(src_c, sizeof(src_c), cp->src_any, cp->src_negate, cp->src_net, cp->src_mask);
-            policy_cidr_field(dst_c, sizeof(dst_c), cp->dst_any, cp->dst_negate, cp->dst_net, cp->dst_mask);
+            policy_cidr_field(src_c, sizeof(src_c), cp->src_any, cp->src_negate,
+                              cp->src_net, cp->src_mask);
+            policy_cidr_field(dst_c, sizeof(dst_c), cp->dst_any, cp->dst_negate,
+                              cp->dst_net, cp->dst_mask);
             policy_port_str(sp, sizeof(sp), cp->src_port_from, cp->src_port_to);
             policy_port_str(dp, sizeof(dp), cp->dst_port_from, cp->dst_port_to);
 
+            if (cp->action == POLICY_ACTION_BYPASS) {
+                fprintf(stderr,
+                        "  policy db_id=%d prio=%d bypass  %s  src=%s dst=%s  sport=%s dport=%s\n",
+                        cp->db_id,
+                        cp->priority,
+                        policy_proto_str(cp->protocol),
+                        src_c,
+                        dst_c,
+                        sp,
+                        dp);
+                continue;
+            }
+
             fprintf(stderr,
-                    "    crypto_policy sql_id=%d packet_marker=%d priority=%d\n"
-                    "      layer/action: %s  |  match: protocol=%s  src_ip=%s  dst_ip=%s  src_port=%s  dst_port=%s\n"
-                    "      crypto: %s-%u  nonce=%d bytes  embed_on_wire=0x%08x (L2/L3/L4 cleartext policy id BE)\n"
-                    "      key_prefix(hex)=%02x%02x%02x%02x (first 4 bytes)\n",
+                    "  policy db_id=%d wire_id=%d prio=%d %s  %s-%u nonce=%d\n"
+                    "    match: %s  src=%s dst=%s  sport=%s dport=%s\n",
                     cp->db_id,
                     cp->id,
                     cp->priority,
                     policy_action_name(cp->action),
+                    crypto_mode_str(cp->crypto_mode),
+                    (unsigned)cp->aes_bits,
+                    cp->nonce_size,
                     policy_proto_str(cp->protocol),
                     src_c,
                     dst_c,
                     sp,
-                    dp,
-                    crypto_mode_str(cp->crypto_mode),
-                    (unsigned)cp->aes_bits,
-                    cp->nonce_size,
-                    (unsigned)cp->id,
-                    cp->key[0],
-                    cp->key[1],
-                    cp->key[2],
-                    cp->key[3]);
+                    dp);
         }
     }
 }
 
-static void log_local_peer_mac_hint(struct app_config *cfg) {
-    if (!cfg || cfg->local_count <= 0)
+void main_diag_log_loaded_config(struct app_config *cfg, int config_id) {
+    (void)config_id;
+    if (!cfg)
         return;
-    fprintf(stderr,
-            "[LOCAL CFG] locals from DB:");
-    for (int i = 0; i < cfg->local_count; i++)
-        fprintf(stderr, " %s", cfg->locals[i].ifname);
-    fprintf(stderr,
-            " — peer MAC from kernel when present, else learned on RX; optional NE_LOCAL_MAC_PRELOAD.\n");
+    log_interface_names(cfg);
+    log_profile_policies(cfg);
 }
 
-void main_diag_log_loaded_config(struct app_config *cfg, int config_id) {
-    fprintf(stderr,
-            "[DB LOAD] config_id=%d crypto_enabled=%d encrypt_layer=%d "
-            "fake_protocol=%u (derived from crypto policies) "
-            "crypto_mode=%d aes_bits=%d nonce_size=%d locals=%d wans=%d profiles=%d policies=%d\n",
-            config_id,
-            cfg->crypto_enabled,
-            cfg->encrypt_layer,
-            (unsigned)cfg->fake_protocol,
-            cfg->crypto_mode,
-            cfg->aes_bits,
-            cfg->nonce_size,
-            cfg->local_count,
-            cfg->wan_count,
-            cfg->profile_count,
-            cfg->policy_count);
-    log_crypto_policies_human(cfg, config_id);
-    log_local_peer_mac_hint(cfg);
+void main_diag_log_link_macs(struct app_config *cfg) {
+    if (!cfg)
+        return;
+    log_wan_peer_macs(cfg);
+    log_local_peer_macs(cfg);
 }

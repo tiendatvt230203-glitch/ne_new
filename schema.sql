@@ -1,142 +1,99 @@
-CREATE TABLE IF NOT EXISTS xdp_configs (
-    id SERIAL PRIMARY KEY
+DROP TABLE IF EXISTS ne_policies CASCADE;
+DROP TABLE IF EXISTS ne_lan CASCADE;
+DROP TABLE IF EXISTS ne_wan CASCADE;
+DROP TABLE IF EXISTS ne_profiles CASCADE;
+DROP TABLE IF EXISTS pqc CASCADE;
+
+DROP TYPE IF EXISTS encryption_action_enum CASCADE;
+DROP TYPE IF EXISTS encryption_protocol_enum CASCADE;
+DROP TYPE IF EXISTS encryption_method_enum CASCADE;
+
+CREATE TYPE encryption_action_enum AS ENUM ('L2', 'L3', 'L4', 'bypass');
+
+CREATE TYPE encryption_protocol_enum AS ENUM ('tcp', 'udp', 'icmp', 'ospf');
+
+CREATE TYPE encryption_method_enum AS ENUM (
+    'aes-gcm-128',
+    'aes-gcm-256',
+    'aes-ctr-128',
+    'aes-ctr-256'
 );
 
-CREATE TABLE IF NOT EXISTS xdp_local_configs (
-    id SERIAL PRIMARY KEY,
-    config_id INT NOT NULL REFERENCES xdp_configs(id) ON DELETE CASCADE,
-    ifname VARCHAR(32) NOT NULL
+CREATE TABLE pqc (
+    id              SERIAL PRIMARY KEY,
+    encryption_key  TEXT     NULL
 );
 
-CREATE TABLE IF NOT EXISTS xdp_wan_configs (
-    id SERIAL PRIMARY KEY,
-    config_id INT NOT NULL REFERENCES xdp_configs(id) ON DELETE CASCADE,
-    ifname VARCHAR(32) NOT NULL,
-    dst_ip VARCHAR(32) NOT NULL DEFAULT '',
-    src_mac VARCHAR(32) NOT NULL DEFAULT '',
-    dst_mac VARCHAR(32) NOT NULL DEFAULT ''
+CREATE TABLE ne_profiles (
+    id              SERIAL PRIMARY KEY,
+    name            VARCHAR(100)    NOT NULL,
+    description     VARCHAR(80)     NULL,
+    weight_enable   BOOLEAN         NOT NULL DEFAULT FALSE,
+    latency_enable  BOOLEAN         NOT NULL DEFAULT FALSE,
+    loss_enable     BOOLEAN         NOT NULL DEFAULT FALSE,
+    latency_duration INT            NULL CHECK (latency_duration >= 0),
+    loss_duration   INT             NULL CHECK (loss_duration >= 0),
+    created_at      TIMESTAMP       NOT NULL DEFAULT NOW(),
+    created_by      VARCHAR(100)    NULL,
+    updated_at      TIMESTAMP       NULL,
+    updated_by      VARCHAR(100)    NULL,
+
+    CONSTRAINT uq_encryption_profile_name UNIQUE (name)
 );
 
-CREATE TABLE IF NOT EXISTS xdp_profiles (
-    id SERIAL PRIMARY KEY,
-    config_id INT NOT NULL REFERENCES xdp_configs(id) ON DELETE CASCADE,
-    profile_name VARCHAR(64) NOT NULL,
-    enabled INT NOT NULL DEFAULT 1,
-    description TEXT,
-    CONSTRAINT xdp_profiles_enabled_chk CHECK (enabled IN (0, 1)),
-    CONSTRAINT xdp_profiles_config_name_uniq UNIQUE (config_id, profile_name)
+CREATE INDEX idx_encryption_profile_name ON ne_profiles (name);
+
+CREATE TABLE ne_policies (
+    id              INT             PRIMARY KEY,
+    profile_id      INT             NOT NULL REFERENCES ne_profiles(id) ON DELETE CASCADE,
+    priority        INT             NOT NULL,
+    action          encryption_action_enum   NOT NULL,
+    proto           encryption_protocol_enum NULL,
+    src_ip          TEXT[]          NULL,
+    invert_src_ip   BOOLEAN         NOT NULL DEFAULT FALSE,
+    dst_ip          TEXT[]          NULL,
+    invert_dst_ip   BOOLEAN         NOT NULL DEFAULT FALSE,
+    src_port        TEXT[]          NULL,
+    dst_port        TEXT[]          NULL,
+    method          encryption_method_enum   NULL,
+    encryption_key  VARCHAR(512)    NULL,
+    nonce           INT             NULL CHECK (nonce IN (4, 8, 12, 16)),
+    created_at      TIMESTAMP       NOT NULL DEFAULT NOW(),
+    created_by      VARCHAR(100)    NULL,
+    updated_at      TIMESTAMP       NULL,
+    updated_by      VARCHAR(100)    NULL,
+
+    CONSTRAINT uq_encryption_profile_priority UNIQUE (profile_id, priority)
 );
 
-CREATE TABLE IF NOT EXISTS xdp_profile_locals (
-    id SERIAL PRIMARY KEY,
-    profile_id INT NOT NULL REFERENCES xdp_profiles(id) ON DELETE CASCADE,
-    ifname VARCHAR(32) NOT NULL,
-    CONSTRAINT xdp_profile_locals_uniq UNIQUE (profile_id, ifname)
+CREATE INDEX idx_encryption_profile_id  ON ne_policies (profile_id);
+CREATE INDEX idx_encryption_priority    ON ne_policies (priority);
+CREATE INDEX idx_encryption_action      ON ne_policies (action);
+
+CREATE TABLE ne_lan (
+    id          UUID            PRIMARY KEY DEFAULT gen_random_uuid(),
+    interface   VARCHAR(100)    NULL,
+    profile_id  INT             NOT NULL REFERENCES ne_profiles(id) ON DELETE CASCADE,
+    created_at  TIMESTAMP       NOT NULL DEFAULT NOW(),
+    created_by  VARCHAR(100)    NULL,
+    updated_at  TIMESTAMP       NULL,
+    updated_by  VARCHAR(100)    NULL
 );
 
-CREATE TABLE IF NOT EXISTS xdp_profile_wans (
-    id SERIAL PRIMARY KEY,
-    profile_id INT NOT NULL REFERENCES xdp_profiles(id) ON DELETE CASCADE,
-    ifname VARCHAR(32) NOT NULL,
-    bandwidth_weight_percent INTEGER NOT NULL DEFAULT 0,
-    CONSTRAINT xdp_profile_wans_uniq UNIQUE (profile_id, ifname),
-    CONSTRAINT xdp_profile_wans_weight_chk CHECK (bandwidth_weight_percent >= 0 AND bandwidth_weight_percent <= 100)
+CREATE TABLE ne_wan (
+    id              UUID            PRIMARY KEY DEFAULT gen_random_uuid(),
+    interface       VARCHAR(100)    NULL,
+    profile_id      INT             NOT NULL REFERENCES ne_profiles(id) ON DELETE CASCADE,
+    dst_ip          VARCHAR(45)     NULL,
+    weight          INT             NOT NULL DEFAULT 50 CHECK (weight BETWEEN 0 AND 100),
+    latency_ip      VARCHAR(45)     NULL,
+    latency         INT             NULL CHECK (latency >= 0),
+    latency_enable  BOOLEAN         NOT NULL DEFAULT FALSE,
+    loss_ip         VARCHAR(45)     NULL,
+    loss_percentage INT             NOT NULL DEFAULT 0 CHECK (loss_percentage BETWEEN 0 AND 100),
+    loss_enable     BOOLEAN         NOT NULL DEFAULT FALSE,
+    created_at      TIMESTAMP       NOT NULL DEFAULT NOW(),
+    created_by      VARCHAR(100)    NULL,
+    updated_at      TIMESTAMP       NULL,
+    updated_by      VARCHAR(100)    NULL
 );
-
-CREATE TABLE IF NOT EXISTS xdp_profile_crypto_policies (
-    id SERIAL PRIMARY KEY,
-    profile_id INT NOT NULL REFERENCES xdp_profiles(id) ON DELETE CASCADE,
-    priority INT NOT NULL DEFAULT 100,
-    action VARCHAR(32) NOT NULL,
-    protocol VARCHAR(16) NOT NULL DEFAULT 'ANY',
-    crypto_mode VARCHAR(16) NOT NULL DEFAULT 'gcm',
-    aes_bits INT NOT NULL DEFAULT 128,
-    nonce_size INT NOT NULL DEFAULT 12,
-    crypto_key TEXT,
-    CONSTRAINT xdp_profile_crypto_policies_action_chk
-        CHECK (lower(action) IN ('bypass', 'encrypt_l2', 'encrypt l2', 'encrypt_l3', 'encrypt l3', 'encrypt_l4', 'encrypt l4')),
-    CONSTRAINT xdp_profile_crypto_policies_mode_chk
-        CHECK (lower(crypto_mode) IN ('gcm', 'ctr')),
-    CONSTRAINT xdp_profile_crypto_policies_aes_bits_chk
-        CHECK (aes_bits IN (128, 256)),
-    CONSTRAINT xdp_profile_crypto_policies_nonce_chk
-        CHECK (nonce_size >= 4 AND nonce_size <= 16)
-);
-
-CREATE TABLE IF NOT EXISTS xdp_profile_crypto_policy_matches (
-    id SERIAL PRIMARY KEY,
-    policy_id INT NOT NULL REFERENCES xdp_profile_crypto_policies(id) ON DELETE CASCADE,
-    src_cidr TEXT NOT NULL DEFAULT 'ANY',
-    src_port VARCHAR(32) NOT NULL DEFAULT 'ANY',
-    dst_cidr TEXT NOT NULL DEFAULT 'ANY',
-    dst_port VARCHAR(32) NOT NULL DEFAULT 'ANY'
-);
-
-COMMENT ON TABLE xdp_profile_crypto_policies IS
-    'Crypto rules per profile. For encrypt_l2 / encrypt_l3 / encrypt_l4, policy id is on the wire and crypto_mode / aes_bits / nonce_size / crypto_key apply. For action bypass, only id, priority, protocol, and policy matches matter; crypto columns are unused (schema defaults may fill them).';
-COMMENT ON COLUMN xdp_profile_crypto_policies.id IS
-    'Primary key and on-wire policy id for encrypt_* actions (same value loaded into NE and matched on RX). Use stable ids agreed between peers.';
-COMMENT ON TABLE xdp_profile_crypto_policy_matches IS
-    'Traffic selectors; policy_id references xdp_profile_crypto_policies.id.';
-
-CREATE INDEX IF NOT EXISTS idx_local_config_id ON xdp_local_configs(config_id);
-CREATE INDEX IF NOT EXISTS idx_wan_config_id ON xdp_wan_configs(config_id);
-CREATE INDEX IF NOT EXISTS idx_profiles_config_id ON xdp_profiles(config_id);
-CREATE INDEX IF NOT EXISTS idx_profile_locals_profile_id ON xdp_profile_locals(profile_id);
-CREATE INDEX IF NOT EXISTS idx_profile_wans_profile_id ON xdp_profile_wans(profile_id);
-CREATE INDEX IF NOT EXISTS idx_profile_policies_profile_id ON xdp_profile_crypto_policies(profile_id);
-CREATE INDEX IF NOT EXISTS idx_profile_policy_matches_policy_id ON xdp_profile_crypto_policy_matches(policy_id);
-
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint WHERE conname = 'xdp_local_configs_unique_per_config'
-    ) THEN
-        ALTER TABLE xdp_local_configs
-            ADD CONSTRAINT xdp_local_configs_unique_per_config UNIQUE (config_id, ifname);
-    END IF;
-END $$;
-
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint WHERE conname = 'xdp_wan_configs_unique_per_config'
-    ) THEN
-        ALTER TABLE xdp_wan_configs
-            ADD CONSTRAINT xdp_wan_configs_unique_per_config UNIQUE (config_id, ifname);
-    END IF;
-END $$;
-
-ALTER TABLE xdp_configs DROP COLUMN IF EXISTS crypto_enabled;
-ALTER TABLE xdp_configs DROP COLUMN IF EXISTS crypto_key;
-ALTER TABLE xdp_configs DROP COLUMN IF EXISTS encrypt_layer;
-ALTER TABLE xdp_configs DROP COLUMN IF EXISTS fake_protocol;
-ALTER TABLE xdp_configs DROP COLUMN IF EXISTS crypto_mode;
-ALTER TABLE xdp_configs DROP COLUMN IF EXISTS aes_bits;
-ALTER TABLE xdp_configs DROP COLUMN IF EXISTS nonce_size;
-
-ALTER TABLE xdp_local_configs DROP COLUMN IF EXISTS network;
-ALTER TABLE xdp_local_configs DROP COLUMN IF EXISTS ingress_mbps;
-
-ALTER TABLE xdp_wan_configs ADD COLUMN IF NOT EXISTS dst_ip VARCHAR(32) NOT NULL DEFAULT '';
-ALTER TABLE xdp_wan_configs ADD COLUMN IF NOT EXISTS src_mac VARCHAR(32) NOT NULL DEFAULT '';
-ALTER TABLE xdp_wan_configs ADD COLUMN IF NOT EXISTS dst_mac VARCHAR(32) NOT NULL DEFAULT '';
-ALTER TABLE xdp_wan_configs DROP COLUMN IF EXISTS window_size_kb;
-ALTER TABLE xdp_wan_configs DROP COLUMN IF EXISTS src_ip;
-ALTER TABLE xdp_wan_configs DROP COLUMN IF EXISTS next_hop_ip;
-
-ALTER TABLE xdp_local_configs DROP COLUMN IF EXISTS dst_mac;
-
-ALTER TABLE xdp_profile_wans
-    ADD COLUMN IF NOT EXISTS bandwidth_weight_percent INTEGER NOT NULL DEFAULT 0;
-
-ALTER TABLE xdp_profiles DROP COLUMN IF EXISTS channel_bonding;
-ALTER TABLE xdp_profile_crypto_policies DROP COLUMN IF EXISTS src_cidr;
-ALTER TABLE xdp_profile_crypto_policies DROP COLUMN IF EXISTS src_port;
-ALTER TABLE xdp_profile_crypto_policies DROP COLUMN IF EXISTS dst_cidr;
-ALTER TABLE xdp_profile_crypto_policies DROP COLUMN IF EXISTS dst_port;
-
-ALTER TABLE xdp_profiles DROP COLUMN IF EXISTS channel_bonding_id;
-
-DROP TABLE IF EXISTS xdp_channel_bonding_wans CASCADE;
-DROP TABLE IF EXISTS xdp_channel_bondings CASCADE;

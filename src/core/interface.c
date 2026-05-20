@@ -1,4 +1,6 @@
 #include "../../inc/interface.h"
+#include "../../inc/config.h"
+#include "../../inc/forwarder.h"
 #include "../../inc/xdp_encrypt_maps.h"
 #include <poll.h>
 #include <sched.h>
@@ -13,6 +15,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 static int encrypt_ctrl_map_fds[MAX_INTERFACES];
 static int profile_meta_map_fds[MAX_INTERFACES];
@@ -268,11 +271,6 @@ have_enc:
         ok = 1;
     }
 
-    if (ok) {
-        fprintf(stderr,
-                "[XDP] profile-aware encrypt: profiles=%u require_filter=%d encrypt_entries=%u\n",
-                ctrl.profile_count, require_filter, enc_pos);
-    }
     return ok ? 0 : -1;
 }
 
@@ -592,6 +590,8 @@ int interface_init_wan(struct xsk_interface *iface,
     iface->ifindex = if_nametoindex(wan_cfg->ifname);
     strncpy(iface->ifname, wan_cfg->ifname, IF_NAMESIZE - 1);
     iface->ifname[IF_NAMESIZE - 1] = '\0';
+    memcpy(iface->src_mac, wan_cfg->src_mac, MAC_LEN);
+    memcpy(iface->dst_mac, wan_cfg->dst_mac, MAC_LEN);
 
     if (iface->ifindex == 0) {
         fprintf(stderr, "Interface %s not found\n", wan_cfg->ifname);
@@ -657,8 +657,7 @@ int interface_init_wan(struct xsk_interface *iface,
 int interface_init_wan_rx(struct xsk_interface *iface,
                           const struct wan_config *wan_cfg,
                           const char *bpf_file,
-                          uint16_t fake_ethertype_ipv4,
-                          uint16_t fake_ethertype_ipv6) {
+                          uint16_t fake_ethertype_ipv4) {
     int ret;
     struct bpf_object *wan_bpf_obj = NULL;
     struct bpf_program *prog;
@@ -669,6 +668,9 @@ int interface_init_wan_rx(struct xsk_interface *iface,
     iface->ifindex = if_nametoindex(wan_cfg->ifname);
     strncpy(iface->ifname, wan_cfg->ifname, IF_NAMESIZE - 1);
     iface->ifname[IF_NAMESIZE - 1] = '\0';
+    memcpy(iface->src_mac, wan_cfg->src_mac, MAC_LEN);
+    memcpy(iface->dst_mac, wan_cfg->dst_mac, MAC_LEN);
+
     if (iface->ifindex == 0) {
         fprintf(stderr, "WAN Interface %s not found\n", wan_cfg->ifname);
         return -1;
@@ -729,14 +731,25 @@ int interface_init_wan_rx(struct xsk_interface *iface,
             if (bpf_map_update_elem(wcfg_fd, &cfg_key, &fe, BPF_ANY) != 0)
                 fprintf(stderr, "[XDP] WAN wan_config_map update failed (fake4=0x%04x)\n",
                         (unsigned)fake_ethertype_ipv4);
-            else
-                fprintf(stderr, "[XDP] WAN %s: L2 redirect ethertype 0x%04x -> AF_XDP\n",
-                        iface->ifname, (unsigned)fake_ethertype_ipv4);
         } else {
             fprintf(stderr, "[XDP] WARN: wan_config_map missing in %s\n", bpf_file);
         }
     }
-    (void)fake_ethertype_ipv6;
+    map = bpf_object__find_map_by_name(wan_bpf_obj, "encrypt_ctrl_map");
+    int enc_ctrl_fd = map ? bpf_map__fd(map) : -1;
+    map = bpf_object__find_map_by_name(wan_bpf_obj, "profile_meta_map");
+    int pm_fd = map ? bpf_map__fd(map) : -1;
+    map = bpf_object__find_map_by_name(wan_bpf_obj, "encrypt_rules_map");
+    int ep_fd = map ? bpf_map__fd(map) : -1;
+    map = bpf_object__find_map_by_name(wan_bpf_obj, "ingress_profile_map");
+    int ip_fd = map ? bpf_map__fd(map) : -1;
+    if (enc_ctrl_fd >= 0 && pm_fd >= 0 && ep_fd >= 0)
+        register_encrypt_bundle(enc_ctrl_fd, pm_fd, ep_fd, ip_fd,
+                                iface->ifindex ? (unsigned int)iface->ifindex : 0U);
+    else if (enc_ctrl_fd >= 0 || pm_fd >= 0 || ep_fd >= 0)
+        fprintf(stderr,
+                "[XDP] WAN WARN: incomplete encrypt bundle (ctrl=%d meta=%d enc=%d)\n",
+                enc_ctrl_fd, pm_fd, ep_fd);
 
     size_t wan_umem_size = (size_t)wan_cfg->umem_mb * 1024 * 1024;
     iface->umem_size = wan_umem_size;
@@ -926,7 +939,8 @@ int interface_recv(struct xsk_interface *iface,
             fds[q].fd = xsk_socket__fd(iface->queues[q].xsk);
             fds[q].events = POLLIN;
         }
-        if (poll(fds, iface->queue_count, 1) <= 0)
+        int poll_ms = forwarder_should_stop() ? 100 : 1000;
+        if (poll(fds, iface->queue_count, poll_ms) <= 0)
             return 0;
 
         for (int q = 0; q < iface->queue_count && total_rcvd < max_pkts; q++) {
@@ -989,7 +1003,9 @@ void interface_recv_release(struct xsk_interface *iface,
 int interface_send(struct xsk_interface *iface,
                    void *pkt_data, uint32_t pkt_len) {
     uint32_t idx;
+#if !NE_USE_ARP_MAC_FORWARD
     struct ether_header *eth;
+#endif
 
     uint32_t comp_idx;
     int completed = xsk_ring_cons__peek(&iface->comp, iface->batch_size, &comp_idx);
@@ -1013,9 +1029,17 @@ int interface_send(struct xsk_interface *iface,
     void *tx_buf = (uint8_t *)iface->bufs + addr;
     memcpy(tx_buf, pkt_data, pkt_len);
 
+#if !NE_USE_ARP_MAC_FORWARD
     eth = (struct ether_header *)tx_buf;
-    memcpy(eth->ether_dhost, iface->dst_mac, MAC_LEN);
-    memcpy(eth->ether_shost, iface->src_mac, MAC_LEN);
+    if (iface->dst_mac[0] | iface->dst_mac[1] | iface->dst_mac[2] |
+        iface->dst_mac[3] | iface->dst_mac[4] | iface->dst_mac[5]) {
+        memcpy(eth->ether_dhost, iface->dst_mac, MAC_LEN);
+    }
+    if (iface->src_mac[0] | iface->src_mac[1] | iface->src_mac[2] |
+        iface->src_mac[3] | iface->src_mac[4] | iface->src_mac[5]) {
+        memcpy(eth->ether_shost, iface->src_mac, MAC_LEN);
+    }
+#endif
 
     xsk_ring_prod__tx_desc(&iface->tx, idx)->addr = addr;
     xsk_ring_prod__tx_desc(&iface->tx, idx)->len = pkt_len;
@@ -1033,7 +1057,9 @@ int interface_send_to_local(struct xsk_interface *iface,
                             const struct local_config *local_cfg,
                             void *pkt_data, uint32_t pkt_len) {
     uint32_t idx;
+#if !NE_USE_ARP_MAC_FORWARD
     struct ether_header *eth;
+#endif
 
     if (iface->queue_count == 0)
         return -1;
@@ -1063,8 +1089,8 @@ int interface_send_to_local(struct xsk_interface *iface,
     void *tx_buf = (uint8_t *)queue->bufs + addr;
     memcpy(tx_buf, pkt_data, pkt_len);
 
+#if !NE_USE_ARP_MAC_FORWARD
     eth = (struct ether_header *)tx_buf;
-
     if (local_cfg->dst_mac[0] | local_cfg->dst_mac[1] | local_cfg->dst_mac[2] |
         local_cfg->dst_mac[3] | local_cfg->dst_mac[4] | local_cfg->dst_mac[5]) {
         memcpy(eth->ether_dhost, local_cfg->dst_mac, MAC_LEN);
@@ -1073,6 +1099,7 @@ int interface_send_to_local(struct xsk_interface *iface,
         local_cfg->src_mac[3] | local_cfg->src_mac[4] | local_cfg->src_mac[5]) {
         memcpy(eth->ether_shost, local_cfg->src_mac, MAC_LEN);
     }
+#endif
 
     xsk_ring_prod__tx_desc(&queue->tx, idx)->addr = addr;
     xsk_ring_prod__tx_desc(&queue->tx, idx)->len = pkt_len;
@@ -1093,7 +1120,9 @@ void interface_print_stats(struct xsk_interface *iface) {
 int interface_send_batch(struct xsk_interface *iface,
                          void *pkt_data, uint32_t pkt_len) {
     uint32_t idx;
+#if !NE_USE_ARP_MAC_FORWARD
     struct ether_header *eth;
+#endif
     int ret = 0;
 
     pthread_mutex_lock(&iface->tx_lock);
@@ -1136,9 +1165,17 @@ int interface_send_batch(struct xsk_interface *iface,
     void *tx_buf = (uint8_t *)iface->bufs + addr;
     memcpy(tx_buf, pkt_data, pkt_len);
 
+#if !NE_USE_ARP_MAC_FORWARD
     eth = (struct ether_header *)tx_buf;
-    memcpy(eth->ether_dhost, iface->dst_mac, MAC_LEN);
-    memcpy(eth->ether_shost, iface->src_mac, MAC_LEN);
+    if (iface->dst_mac[0] | iface->dst_mac[1] | iface->dst_mac[2] |
+        iface->dst_mac[3] | iface->dst_mac[4] | iface->dst_mac[5]) {
+        memcpy(eth->ether_dhost, iface->dst_mac, MAC_LEN);
+    }
+    if (iface->src_mac[0] | iface->src_mac[1] | iface->src_mac[2] |
+        iface->src_mac[3] | iface->src_mac[4] | iface->src_mac[5]) {
+        memcpy(eth->ether_shost, iface->src_mac, MAC_LEN);
+    }
+#endif
 
     xsk_ring_prod__tx_desc(&iface->tx, idx)->addr = addr;
     xsk_ring_prod__tx_desc(&iface->tx, idx)->len = pkt_len;
@@ -1172,7 +1209,9 @@ int interface_send_to_local_batch(struct xsk_interface *iface,
                                   void *pkt_data, uint32_t pkt_len,
                                   int tx_queue) {
     uint32_t idx;
+#if !NE_USE_ARP_MAC_FORWARD
     struct ether_header *eth;
+#endif
 
     if (iface->queue_count == 0)
         return -1;
@@ -1217,6 +1256,7 @@ int interface_send_to_local_batch(struct xsk_interface *iface,
     void *tx_buf = (uint8_t *)queue->bufs + addr;
     memcpy(tx_buf, pkt_data, pkt_len);
 
+#if !NE_USE_ARP_MAC_FORWARD
     eth = (struct ether_header *)tx_buf;
     if (local_cfg->dst_mac[0] | local_cfg->dst_mac[1] | local_cfg->dst_mac[2] |
         local_cfg->dst_mac[3] | local_cfg->dst_mac[4] | local_cfg->dst_mac[5]) {
@@ -1226,6 +1266,7 @@ int interface_send_to_local_batch(struct xsk_interface *iface,
         local_cfg->src_mac[3] | local_cfg->src_mac[4] | local_cfg->src_mac[5]) {
         memcpy(eth->ether_shost, local_cfg->src_mac, MAC_LEN);
     }
+#endif
 
     xsk_ring_prod__tx_desc(&queue->tx, idx)->addr = addr;
     xsk_ring_prod__tx_desc(&queue->tx, idx)->len = pkt_len;
@@ -1273,7 +1314,8 @@ int interface_recv_single_queue(struct xsk_interface *iface, int queue_idx,
             .fd = xsk_socket__fd(queue->xsk),
             .events = POLLIN
         };
-        if (poll(&pfd, 1, 1) <= 0)
+        int poll_ms = forwarder_should_stop() ? 100 : 1000;
+        if (poll(&pfd, 1, poll_ms) <= 0)
             return 0;
 
         rcvd = xsk_ring_cons__peek(&queue->rx, max_pkts, &idx_rx);
@@ -1325,7 +1367,9 @@ int interface_send_batch_queue(struct xsk_interface *iface, int queue_idx,
 
     struct xsk_queue *queue = &iface->queues[queue_idx];
     uint32_t idx;
+#if !NE_USE_ARP_MAC_FORWARD
     struct ether_header *eth;
+#endif
     int ret = 0;
 
     pthread_mutex_lock(&queue->tx_lock);
@@ -1370,6 +1414,7 @@ int interface_send_batch_queue(struct xsk_interface *iface, int queue_idx,
         void *tx_buf = (uint8_t *)queue->bufs + addr;
         memcpy(tx_buf, pkt_data, pkt_len);
 
+#if !NE_USE_ARP_MAC_FORWARD
         eth = (struct ether_header *)tx_buf;
         int have_dst = (iface->dst_mac[0] | iface->dst_mac[1] | iface->dst_mac[2] |
                         iface->dst_mac[3] | iface->dst_mac[4] | iface->dst_mac[5]);
@@ -1380,6 +1425,7 @@ int interface_send_batch_queue(struct xsk_interface *iface, int queue_idx,
             memcpy(eth->ether_dhost, iface->dst_mac, MAC_LEN);
         if (have_src)
             memcpy(eth->ether_shost, iface->src_mac, MAC_LEN);
+#endif
 
         xsk_ring_prod__tx_desc(&queue->tx, idx)->addr = addr;
         xsk_ring_prod__tx_desc(&queue->tx, idx)->len = pkt_len;
@@ -1422,7 +1468,9 @@ int interface_send_to_local_batch_queue(struct xsk_interface *iface,
 
     struct xsk_queue *queue = &iface->queues[queue_idx];
     uint32_t idx;
+#if !NE_USE_ARP_MAC_FORWARD
     struct ether_header *eth;
+#endif
 
 #define LOCAL_TX_MAX_WAIT_LOOPS  10000
 
@@ -1465,15 +1513,17 @@ int interface_send_to_local_batch_queue(struct xsk_interface *iface,
         void *tx_buf = (uint8_t *)queue->bufs + addr;
         memcpy(tx_buf, pkt_data, pkt_len);
 
+#if !NE_USE_ARP_MAC_FORWARD
         eth = (struct ether_header *)tx_buf;
-    if (local_cfg->dst_mac[0] | local_cfg->dst_mac[1] | local_cfg->dst_mac[2] |
-        local_cfg->dst_mac[3] | local_cfg->dst_mac[4] | local_cfg->dst_mac[5]) {
-        memcpy(eth->ether_dhost, local_cfg->dst_mac, MAC_LEN);
-    }
-    if (local_cfg->src_mac[0] | local_cfg->src_mac[1] | local_cfg->src_mac[2] |
-        local_cfg->src_mac[3] | local_cfg->src_mac[4] | local_cfg->src_mac[5]) {
-        memcpy(eth->ether_shost, local_cfg->src_mac, MAC_LEN);
-    }
+        if (local_cfg->dst_mac[0] | local_cfg->dst_mac[1] | local_cfg->dst_mac[2] |
+            local_cfg->dst_mac[3] | local_cfg->dst_mac[4] | local_cfg->dst_mac[5]) {
+            memcpy(eth->ether_dhost, local_cfg->dst_mac, MAC_LEN);
+        }
+        if (local_cfg->src_mac[0] | local_cfg->src_mac[1] | local_cfg->src_mac[2] |
+            local_cfg->src_mac[3] | local_cfg->src_mac[4] | local_cfg->src_mac[5]) {
+            memcpy(eth->ether_shost, local_cfg->src_mac, MAC_LEN);
+        }
+#endif
 
         xsk_ring_prod__tx_desc(&queue->tx, idx)->addr = addr;
         xsk_ring_prod__tx_desc(&queue->tx, idx)->len = pkt_len;
