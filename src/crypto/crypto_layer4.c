@@ -1,6 +1,6 @@
-#include "../../inc/crypto_layer4.h"
-#include "../../inc/config.h"
-#include "../../inc/fragment.h"
+#include "../../inc/crypto/crypto_layer4.h"
+#include "../../inc/core/config.h"
+#include "../../inc/core/fragment.h"
 #include <string.h>
 
 #define L4_WIRE_PORT_LEN   4

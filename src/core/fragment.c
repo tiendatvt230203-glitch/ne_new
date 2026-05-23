@@ -1,10 +1,10 @@
 #define _POSIX_C_SOURCE 199309L
-#include "../../inc/fragment.h"
-#include "../../inc/packet_crypto.h"
-#include "../../inc/crypto_layer2.h"
-#include "../../inc/crypto_layer3.h"
-#include "../../inc/crypto_layer4.h"
-#include "../../inc/config.h"
+#include "../../inc/core/fragment.h"
+#include "../../inc/crypto/packet_crypto.h"
+#include "../../inc/crypto/crypto_layer2.h"
+#include "../../inc/crypto/crypto_layer3.h"
+#include "../../inc/crypto/crypto_layer4.h"
+#include "../../inc/core/config.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdatomic.h>

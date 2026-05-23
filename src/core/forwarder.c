@@ -1,15 +1,15 @@
-#include "../../inc/forwarder.h"
-#include "../../inc/packet_crypto.h"
-#include "../../inc/flow_table.h"
-#include "../../inc/config.h"
-#include "../../inc/crypto_layer2.h"
-#include "../../inc/crypto_layer3.h"
-#include "../../inc/crypto_layer4.h"
-#include "../../inc/wan_arp.h"
-#include "../../inc/bridge_mac.h"
-#include "../../inc/crypto_policy_utils.h"
-#include "../../inc/crypto_dispatch.h"
-#include "../../inc/fragment.h"
+#include "../../inc/core/forwarder.h"
+#include "../../inc/crypto/packet_crypto.h"
+#include "../../inc/core/flow_table.h"
+#include "../../inc/core/config.h"
+#include "../../inc/crypto/crypto_layer2.h"
+#include "../../inc/crypto/crypto_layer3.h"
+#include "../../inc/crypto/crypto_layer4.h"
+#include "../../inc/core/wan_arp.h"
+#include "../../inc/core/bridge_mac.h"
+#include "../../inc/crypto/crypto_policy_utils.h"
+#include "../../inc/crypto/crypto_dispatch.h"
+#include "../../inc/core/fragment.h"
 #include <poll.h>
 #include <pthread.h>
 #include <sched.h>
@@ -2369,6 +2369,13 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg) {
     }
     total_threads += 1;
 
+    if (config_wan_bridge_mode(cfg) && cfg->local_count > 0) {
+        if (bridge_mac_prepare(cfg) != 0) {
+            fprintf(stderr, "[BRIDGE-MAC] prepare failed\n");
+            goto err_locals;
+        }
+    }
+
     for (int i = 0; i < cfg->local_count; i++) {
         if (forwarder_should_stop())
             goto err_locals;
@@ -2385,12 +2392,8 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg) {
         fprintf(stderr, "[XDP] WARN: encrypt filter maps may be stale\n");
     }
 
-    if (config_wan_bridge_mode(cfg) && cfg->local_count > 0) {
-        if (bridge_mac_install(fwd) != 0) {
-            fprintf(stderr, "[BRIDGE-MAC] install failed\n");
-            goto err_locals;
-        }
-    }
+    if (config_wan_bridge_mode(cfg) && cfg->local_count > 0)
+        bridge_mac_install(fwd);
 
     for (int i = 0; i < fwd->local_count; i++) {
         if (forwarder_should_stop())

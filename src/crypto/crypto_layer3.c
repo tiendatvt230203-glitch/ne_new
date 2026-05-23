@@ -1,5 +1,5 @@
-#include "../../inc/crypto_layer3.h"
-#include "../../inc/config.h"
+#include "../../inc/crypto/crypto_layer3.h"
+#include "../../inc/core/config.h"
 #include <string.h>
 
 #define MIN_ETH_PKT        (ETH_HEADER_SIZE + 8)

@@ -1,5 +1,5 @@
-#include "../../inc/wan_arp.h"
-#include "../../inc/forwarder.h"
+#include "../../inc/core/wan_arp.h"
+#include "../../inc/core/forwarder.h"
 
 #include <stdio.h>
 #include <string.h>

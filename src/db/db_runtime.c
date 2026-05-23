@@ -1,7 +1,7 @@
-#include "../../inc/db_runtime.h"
+#include "../../inc/db/db_runtime.h"
 
-#include "../../inc/db_config.h"
-#include "../../inc/db_env.h"
+#include "../../inc/db/db_config.h"
+#include "../../inc/db/db_env.h"
 
 #include <libpq-fe.h>
 #include <stdio.h>

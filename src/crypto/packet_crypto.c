@@ -1,8 +1,8 @@
-#include "../../inc/packet_crypto.h"
-#include "../../inc/config.h"
-#include "../../inc/crypto_layer2.h"
-#include "../../inc/crypto_layer3.h"
-#include "../../inc/crypto_layer4.h"
+#include "../../inc/crypto/packet_crypto.h"
+#include "../../inc/core/config.h"
+#include "../../inc/crypto/crypto_layer2.h"
+#include "../../inc/crypto/crypto_layer3.h"
+#include "../../inc/crypto/crypto_layer4.h"
 #include <string.h>
 #include <stdio.h>
 #include <openssl/evp.h>

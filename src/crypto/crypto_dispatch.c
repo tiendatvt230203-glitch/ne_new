@@ -1,9 +1,9 @@
-#include "../../inc/crypto_dispatch.h"
+#include "../../inc/crypto/crypto_dispatch.h"
 
-#include "../../inc/crypto_policy_utils.h"
-#include "../../inc/crypto_layer2.h"
-#include "../../inc/crypto_layer3.h"
-#include "../../inc/crypto_layer4.h"
+#include "../../inc/crypto/crypto_policy_utils.h"
+#include "../../inc/crypto/crypto_layer2.h"
+#include "../../inc/crypto/crypto_layer3.h"
+#include "../../inc/crypto/crypto_layer4.h"
 
 #include <string.h>
 #include <unistd.h>

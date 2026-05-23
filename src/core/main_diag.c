@@ -2,7 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "config.h"
+#include "../../inc/core/config.h"
 
 static const char *policy_action_name(int action) {
     switch (action) {

@@ -21,14 +21,14 @@ INSERT INTO ne_policies (
     src_port, dst_port, method, nonce, encryption_key, created_by
 ) VALUES
 (
-    421, 30, 20, 'L2', 'udp',
+    421, 30, 2, 'L2', 'udp',
     ARRAY['192.168.9.2/32']::text[], FALSE,
     ARRAY['192.168.180.2/32']::text[], FALSE,
     ARRAY['ANY']::text[], ARRAY['ANY']::text[],
     'aes-gcm-128', 12, '00112233445566778899aabbccddeeff', 'seed'
 ),
 (
-    422, 30, 10, 'L2', 'tcp',
+    422, 30, 1, 'L2', 'tcp',
     ARRAY['192.168.9.2/32']::text[], FALSE,
     ARRAY['192.168.180.2/32']::text[], FALSE,
     ARRAY['ANY']::text[], ARRAY['22']::text[],

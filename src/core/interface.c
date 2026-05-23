@@ -1,7 +1,7 @@
-#include "../../inc/interface.h"
-#include "../../inc/config.h"
-#include "../../inc/forwarder.h"
-#include "../../inc/xdp_encrypt_maps.h"
+#include "../../inc/core/interface.h"
+#include "../../inc/core/config.h"
+#include "../../inc/core/forwarder.h"
+#include "../../inc/core/xdp_encrypt_maps.h"
 #include <poll.h>
 #include <sched.h>
 #include <net/ethernet.h>

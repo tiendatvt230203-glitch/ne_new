@@ -1,5 +1,5 @@
-#include "../../inc/crypto_layer2.h"
-#include "../../inc/config.h"
+#include "../../inc/crypto/crypto_layer2.h"
+#include "../../inc/core/config.h"
 #include <string.h>
 
 #define L2_FRAG_MAGIC      0x5B

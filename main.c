@@ -11,12 +11,12 @@
 #include <unistd.h>
 #include <pthread.h>
 
-#include "config.h"
-#include "db_env.h"
-#include "db_runtime.h"
-#include "forwarder.h"
-#include "interface.h"
-#include "main_diag.h"
+#include "inc/core/config.h"
+#include "inc/db/db_env.h"
+#include "inc/db/db_runtime.h"
+#include "inc/core/forwarder.h"
+#include "inc/core/interface.h"
+#include "inc/core/main_diag.h"
 
 #define NOTIFY_CHANNEL "xdp_start"
 #define MAX_ACTIVE_PROFILE_IDS 32

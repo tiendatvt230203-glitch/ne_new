@@ -1,7 +1,7 @@
 CC     = gcc
 CLANG  = clang
 
-CFLAGS = -D_GNU_SOURCE -Iinc -I./include -Wall -O2 $(shell pg_config --includedir 2>/dev/null | xargs -I{} echo -I{})
+CFLAGS = -D_GNU_SOURCE -I. -Iinc/core -Iinc/crypto -Iinc/db -I./include -Wall -O2 $(shell pg_config --includedir 2>/dev/null | xargs -I{} echo -I{})
 LDFLAGS = -Wl,-Bstatic -lxdp -lbpf -Wl,-Bdynamic -lelf -lz -lpthread -lssl -lcrypto -lpq
 
 BPF_CFLAGS     = -O2 -target bpf -g

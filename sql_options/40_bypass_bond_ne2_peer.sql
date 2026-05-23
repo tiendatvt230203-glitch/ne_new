@@ -26,7 +26,7 @@ INSERT INTO ne_policies (
     src_port, dst_port, method, nonce, encryption_key, created_by
 ) VALUES
 (
-    51, 40, 1, 'bypass', NULL,
+    51, 40, 1, 'bypass', 'any',
     ARRAY['192.168.182.2/32']::text[], FALSE,
     ARRAY['192.168.9.2/32']::text[], FALSE,
     ARRAY['ANY']::text[], ARRAY['ANY']::text[],
@@ -34,7 +34,7 @@ INSERT INTO ne_policies (
     'seed'
 ),
 (
-    53, 40, 2, 'bypass', NULL,
+    53, 40, 2, 'bypass', 'any',
     ARRAY['192.168.180.2/32']::text[], FALSE,
     ARRAY['192.168.10.2/32']::text[], FALSE,
     ARRAY['ANY']::text[], ARRAY['ANY']::text[],

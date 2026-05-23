@@ -1,5 +1,5 @@
-#include "../../inc/db_config.h"
-#include "../../inc/db_env.h"
+#include "../../inc/db/db_config.h"
+#include "../../inc/db/db_env.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -383,7 +383,7 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
         "COALESCE(array_to_string(src_port, ','), ''), "
         "COALESCE(array_to_string(dst_port, ','), ''), "
         "method::text, encryption_key, nonce "
-        "FROM ne_policies WHERE profile_id = $1 ORDER BY id ASC",
+        "FROM ne_policies WHERE profile_id = $1 ORDER BY priority ASC, id ASC",
         1, NULL, params, NULL, NULL, 0);
 
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
